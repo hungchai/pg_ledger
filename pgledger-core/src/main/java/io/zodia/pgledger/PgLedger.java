@@ -7,7 +7,6 @@ import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
-import io.zodia.pgledger.store.InMemoryLedgerStore;
 import io.zodia.pgledger.store.LedgerStore;
 import io.zodia.pgledger.store.LedgerViolation;
 import io.zodia.pgledger.store.PostgresLedgerStore;
@@ -40,11 +39,6 @@ public final class PgLedger implements AutoCloseable {
         this.reader = reader;
     }
 
-    public static PgLedger inMemory() {
-        InMemoryLedgerStore store = new InMemoryLedgerStore();
-        return new PgLedger(store, store);
-    }
-
     /**
      * Writes go to {@code writer}. Balance and journal queries go to {@code reader}.
      * The reader URL is required and is never copied from the writer.
@@ -56,6 +50,20 @@ public final class PgLedger implements AutoCloseable {
         PostgresLedgerStore writerStore = new PostgresLedgerStore(writer, true);
         PostgresLedgerStore readerStore = new PostgresLedgerStore(reader, false);
         return new PgLedger(writerStore, readerStore);
+    }
+
+    /**
+     * One JDBC DataSource for reads and writes. Schema migration is not run.
+     * Callers that use read/write splitting must force the write route around
+     * {@link #createBalanceType}, {@link #createAccount}, and {@link #post}
+     * before this method borrows a connection.
+     */
+    public static PgLedger routed(DataSource dataSource) {
+        if (dataSource == null) {
+            throw new IllegalArgumentException("dataSource is required");
+        }
+        PostgresLedgerStore store = new PostgresLedgerStore(dataSource, false);
+        return new PgLedger(store, store);
     }
 
     public static PgLedger postgres(String writerUrl, String readerUrl, String user, String password) {

@@ -1,0 +1,25 @@
+pgledger_replay:
+  query: |
+    SELECT CASE
+      WHEN pg_is_in_recovery() THEN COALESCE(EXTRACT(EPOCH FROM (clock_timestamp() - pg_last_xact_replay_timestamp())), 0)
+      ELSE COALESCE((SELECT EXTRACT(EPOCH FROM MAX(replay_lag)) FROM pg_stat_replication), 0)
+    END AS replay_lag_seconds
+  metrics:
+    - replay_lag_seconds:
+        usage: "GAUGE"
+        description: "Replica delay in seconds. Writer reports max replay_lag of connected standbys."
+
+pgledger_rows:
+  query: |
+    SELECT 'accounts'::text AS rel, count(*)::float8 AS n FROM pgledger_accounts
+    UNION ALL
+    SELECT 'transfers'::text, count(*)::float8 FROM pgledger_transfers
+    UNION ALL
+    SELECT 'entries'::text, count(*)::float8 FROM pgledger_entries
+  metrics:
+    - rel:
+        usage: "LABEL"
+        description: "Ledger table"
+    - n:
+        usage: "GAUGE"
+        description: "Row count"

@@ -11,6 +11,25 @@ Postgres ledger. Writes go to the writer. Balance and entry reads go to the read
 docker compose up -d
 ```
 
+The API is `http://localhost:8080`. Writes use the writer. Balance and journal reads use the reader. Header `X-Pgledger-Role` is `writer` or `reader`. A business rejection is HTTP 422.
+
+The API process is stateless. Any instance can take any request. Every instance needs `PGLEDGER_WRITER_JDBC_URL`, `PGLEDGER_READER_JDBC_URL`, `PGLEDGER_JDBC_USER`, and `PGLEDGER_JDBC_PASSWORD`. `PORT` defaults to 8080. Schema scripts run on the writer at startup and can run on every instance at the same time.
+
+```bash
+curl -s http://localhost:8080/health
+curl -s -X POST http://localhost:8080/api/v1/balance-types \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"AVAILABLE","name":"Available"}'
+curl -s -X POST http://localhost:8080/api/v1/accounts \
+  -H 'Content-Type: application/json' \
+  -d '{"accountId":"CLIENT_ACC_001","balanceType":"AVAILABLE","currency":"USD","allowNegativeBalance":false}'
+curl -s -X POST http://localhost:8080/api/v1/postings \
+  -H 'Content-Type: application/json' \
+  -d '{"fromAccountId":"LP_DESK","fromBalanceType":"AVAILABLE","toAccountId":"CLIENT_ACC_001","toBalanceType":"AVAILABLE","currency":"USD","amount":100}'
+curl -s 'http://localhost:8080/api/v1/balances?accountId=CLIENT_ACC_001&balanceType=AVAILABLE&currency=USD'
+curl -s 'http://localhost:8080/api/v1/journals?page=0&size=50'
+```
+
 One balance row is `(account_id, balance_type, currency)`. `pgledger_transfers` is the journal. `pgledger_entries` is the journal line. A transfer always has two entries. `pgledger_create_transfers` locks every balance row in sorted internal id order inside one database call, so several RFQ legs commit or roll back together.
 
 Run the statements below on the **writer**. Repeat creates fail if that balance type or account row already exists.

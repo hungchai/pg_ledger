@@ -20,6 +20,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.Timeout;
 import org.postgresql.ds.PGSimpleDataSource;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.web.context.WebServerApplicationContext;
+import org.springframework.context.ConfigurableApplicationContext;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
@@ -32,6 +35,7 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
@@ -106,7 +110,7 @@ class PgLedgerStressTest {
     private static DataSource writer;
     private static DataSource reader;
     private static PgLedger ledger;
-    private static PgLedgerServer server;
+    private static ConfigurableApplicationContext server;
     private static PgLedgerClient client;
     private static long deadlockBaseline;
 
@@ -114,10 +118,12 @@ class PgLedgerStressTest {
     static void up() throws Exception {
         String user = config("pgledger.user", "PGLEDGER_JDBC_USER", "pgledger");
         String password = config("pgledger.password", "PGLEDGER_JDBC_PASSWORD", "pgledger");
-        writer = dataSource(config("pgledger.writer.url", "PGLEDGER_WRITER_JDBC_URL",
-                "jdbc:postgresql://localhost:5432/pgledger"), user, password);
-        reader = dataSource(config("pgledger.reader.url", "PGLEDGER_READER_JDBC_URL",
-                "jdbc:postgresql://localhost:5433/pgledger"), user, password);
+        String writerUrl = config("pgledger.writer.url", "PGLEDGER_WRITER_JDBC_URL",
+                "jdbc:postgresql://localhost:5432/pgledger");
+        String readerUrl = config("pgledger.reader.url", "PGLEDGER_READER_JDBC_URL",
+                "jdbc:postgresql://localhost:5433/pgledger");
+        writer = dataSource(writerUrl, user, password);
+        reader = dataSource(readerUrl, user, password);
         try {
             assertFalse(queryBoolean(writer, "SELECT pg_is_in_recovery()"), "writer url is a replica");
             assertTrue(queryBoolean(reader, "SELECT pg_is_in_recovery()"), "reader url is not a replica");
@@ -125,9 +131,17 @@ class PgLedgerStressTest {
             throw new IllegalStateException("writer/reader not reachable; docker compose up -d", e);
         }
         ledger = PgLedger.postgres(writer, reader);
-        server = PgLedgerServer.start(ledger, 0);
+        SpringApplication application = new SpringApplication(PgLedgerServerMain.class);
+        application.setDefaultProperties(Map.of(
+                "server.port", "0",
+                "pgledger.writer-jdbc-url", writerUrl,
+                "pgledger.reader-jdbc-url", readerUrl,
+                "pgledger.jdbc-user", user,
+                "pgledger.jdbc-password", password));
+        server = application.run();
+        int port = ((WebServerApplicationContext) server).getWebServer().getPort();
         client = new PgLedgerClient(new PgLedgerClientConfig(
-                URI.create("http://127.0.0.1:" + server.port()),
+                URI.create("http://127.0.0.1:" + port),
                 Duration.ofSeconds(5),
                 Duration.ofSeconds(60),
                 0));

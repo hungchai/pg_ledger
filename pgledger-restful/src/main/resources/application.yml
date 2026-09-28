@@ -1,0 +1,33 @@
+server:
+  port: ${PORT:8080}
+  error:
+    include-message: never
+    include-stacktrace: never
+    whitelabel:
+      enabled: false
+  tomcat:
+    max-http-form-post-size: 1MB
+    max-swallow-size: 1MB
+
+spring:
+  main:
+    banner-mode: off
+  threads:
+    virtual:
+      enabled: true
+  mvc:
+    throw-exception-if-no-handler-found: true
+  web:
+    resources:
+      add-mappings: false
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    generator:
+      write-bigdecimal-as-plain: true
+
+pgledger:
+  writer-jdbc-url: ${PGLEDGER_WRITER_JDBC_URL:}
+  reader-jdbc-url: ${PGLEDGER_READER_JDBC_URL:}
+  jdbc-user: ${PGLEDGER_JDBC_USER:}
+  jdbc-password: ${PGLEDGER_JDBC_PASSWORD:}

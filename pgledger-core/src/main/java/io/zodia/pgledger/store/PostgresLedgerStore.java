@@ -24,6 +24,8 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Writes are one {@code SELECT pgledger_create_account} or {@code SELECT pgledger_create_transfer}.
@@ -127,12 +129,32 @@ public final class PostgresLedgerStore implements LedgerStore {
             ORDER BY page.created_at DESC NULLS LAST, page.id DESC NULLS LAST, e.id
             """;
 
+    private static final int MIGRATION_ATTEMPTS = 30;
+
     private final DataSource dataSource;
 
     public PostgresLedgerStore(DataSource dataSource, boolean migrate) {
         this.dataSource = dataSource;
         if (migrate) {
-            migrate();
+            migrate(dataSource);
+        }
+    }
+
+    /**
+     * Applies {@code db/V001} and {@code db/V002} on this DataSource.
+     * Scripts are {@code IF NOT EXISTS} / {@code CREATE OR REPLACE}.
+     * Concurrent startups retry catalog races and ignore "already exists".
+     * There is no leader lock.
+     */
+    public static void migrate(DataSource dataSource) {
+        if (dataSource == null) {
+            throw new IllegalArgumentException("writer is required");
+        }
+        for (int file = 0; file < SCHEMA.length; file++) {
+            List<String> statements = SqlScripts.statements(loadSchema(SCHEMA[file]));
+            for (int i = 0; i < statements.size(); i++) {
+                executeIdempotent(dataSource, statements.get(i));
+            }
         }
     }
 
@@ -303,18 +325,52 @@ public final class PostgresLedgerStore implements LedgerStore {
     public void close() {
     }
 
-    private void migrate() {
-        try (Connection conn = dataSource.getConnection();
-             Statement statement = conn.createStatement()) {
-            for (int file = 0; file < SCHEMA.length; file++) {
-                List<String> statements = SqlScripts.statements(loadSchema(SCHEMA[file]));
-                for (int i = 0; i < statements.size(); i++) {
-                    statement.execute(statements.get(i));
+    private static void executeIdempotent(DataSource dataSource, String sql) {
+        SQLException last = null;
+        for (int attempt = 1; attempt <= MIGRATION_ATTEMPTS; attempt++) {
+            try (Connection conn = dataSource.getConnection();
+                 Statement statement = conn.createStatement()) {
+                conn.setAutoCommit(true);
+                statement.execute(sql);
+                return;
+            } catch (SQLException e) {
+                if (alreadyApplied(e)) {
+                    return;
                 }
+                if (!concurrentDdl(e) || attempt == MIGRATION_ATTEMPTS) {
+                    throw new LedgerException("schema migration failed", e);
+                }
+                last = e;
+                LockSupport.parkNanos(backoffNanos(attempt));
             }
-        } catch (SQLException e) {
-            throw new LedgerException("schema migration failed", e);
         }
+        throw new LedgerException("schema migration failed", last);
+    }
+
+    private static boolean alreadyApplied(SQLException e) {
+        String state = e.getSQLState();
+        if ("42P07".equals(state) || "42710".equals(state) || "42723".equals(state)) {
+            return true;
+        }
+        String message = e.getMessage();
+        return message != null && message.contains("already exists");
+    }
+
+    private static boolean concurrentDdl(SQLException e) {
+        String state = e.getSQLState();
+        if ("40P01".equals(state) || "40001".equals(state) || "55P03".equals(state) || "23505".equals(state)) {
+            return true;
+        }
+        String message = e.getMessage();
+        return message != null && message.contains("tuple concurrently updated");
+    }
+
+    private static long backoffNanos(int attempt) {
+        long millis = 20L * attempt;
+        if (millis > 200L) {
+            millis = 200L;
+        }
+        return TimeUnit.MILLISECONDS.toNanos(millis);
     }
 
     private <T> T write(Sql<T> work) {

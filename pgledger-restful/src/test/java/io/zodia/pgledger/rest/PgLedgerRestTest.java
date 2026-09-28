@@ -1,7 +1,7 @@
 package io.zodia.pgledger.rest;
 
-import io.zodia.pgledger.PgLedger;
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.BalanceType;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
@@ -10,76 +10,140 @@ import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.client.PgLedgerClient;
 import io.zodia.pgledger.client.PgLedgerClientConfig;
 import io.zodia.pgledger.client.PgLedgerClientException;
+import org.apache.shardingsphere.infra.hint.HintManager;
 import org.junit.jupiter.api.Test;
+import org.postgresql.ds.PGSimpleDataSource;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 
+import javax.sql.DataSource;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
+@SpringBootTest(
+        classes = PgLedgerServerMain.class,
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = {
+                "pgledger.writer-jdbc-url=jdbc:postgresql://localhost:5432/pgledger",
+                "pgledger.reader-jdbc-url=jdbc:postgresql://localhost:5433/pgledger",
+                "pgledger.jdbc-user=pgledger",
+                "pgledger.jdbc-password=pgledger"
+        })
 class PgLedgerRestTest {
+    private static final String WRITER_URL = "jdbc:postgresql://localhost:5432/pgledger";
+    private static final String READER_URL = "jdbc:postgresql://localhost:5433/pgledger";
+    private static final String DB_USER = "pgledger";
+    private static final String DB_PASSWORD = "pgledger";
+    private static final long CATCH_UP_NS = 15_000_000_000L;
+    private static final AtomicLong IDS = new AtomicLong();
+
+    @LocalServerPort
+    private int port;
+
+    @Autowired
+    private DataSource dataSource;
+
+    @Test
+    void readsHitReplicaAndWritesHitPrimary() throws Exception {
+        assertTrue(recovery(false));
+        assertFalse(recovery(true));
+    }
+
     @Test
     void fiveRoutesUseWriterAndReader() throws Exception {
-        try (PgLedger ledger = PgLedger.inMemory();
-             PgLedgerServer server = PgLedgerServer.start(ledger, 0);
-             PgLedgerClient client = client(server.port())) {
+        try (Nodes nodes = new Nodes();
+             PgLedgerClient client = client(port)) {
             HttpClient http = HttpClient.newHttpClient();
-            HttpResponse<String> health = http.send(HttpRequest.newBuilder(base(server).resolve("/health"))
+            HttpResponse<String> health = http.send(HttpRequest.newBuilder(base(port).resolve("/health"))
                     .timeout(Duration.ofSeconds(2))
                     .GET()
                     .build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(200, health.statusCode());
             assertFalse(health.headers().firstValue(PgLedgerServer.ROLE_HEADER).isPresent());
 
-            client.createBalanceType(new CreateBalanceType("AVAILABLE", "Available", null));
+            String prefix = id("REST");
+            String available = prefix + "A";
+            String locked = prefix + "L";
+            String company = prefix + "CO";
+            String clientId = prefix + "C";
+            client.createBalanceType(new CreateBalanceType(available, "Available", null));
             assertEquals(200, client.status());
             assertEquals(PgLedgerServer.WRITER, client.role());
-            client.createBalanceType(new CreateBalanceType("LOCKED", "Locked", null));
-            assertEquals(2, client.balanceTypes().size());
+            client.createBalanceType(new CreateBalanceType(locked, "Locked", null));
+            nodes.awaitCatchUp();
+            List<BalanceType> types = client.balanceTypes();
             assertEquals(PgLedgerServer.READER, client.role());
+            assertEquals(1, countCode(types, available));
+            assertEquals(1, countCode(types, locked));
 
-            Account company = client.createAccount(account("COMPANY", "AVAILABLE", "USD", true, true));
-            assertEquals("COMPANY", company.accountId());
+            Account companyRow = client.createAccount(account(company, available, "USD", true, true));
+            assertEquals(company, companyRow.accountId());
             assertEquals(200, client.status());
             assertEquals(PgLedgerServer.WRITER, client.role());
-            client.createAccount(account("CLIENT_ACC_001", "AVAILABLE", "USD", false, true));
-            client.createAccount(account("CLIENT_ACC_001", "LOCKED", "USD", false, true));
+            client.createAccount(account(clientId, available, "USD", false, true));
+            client.createAccount(account(clientId, locked, "USD", false, true));
 
-            Transfer funded = client.post(posting("COMPANY", "AVAILABLE", "CLIENT_ACC_001", "AVAILABLE", "USD", "10"));
-            assertEquals("CLIENT_ACC_001", funded.toAccountId());
+            Transfer funded = client.post(posting(company, available, clientId, available, "USD", "10"));
+            assertEquals(clientId, funded.toAccountId());
             assertEquals(PgLedgerServer.WRITER, client.role());
+            nodes.awaitCatchUp();
 
-            List<Account> balances = client.balances("CLIENT_ACC_001");
+            List<Account> balances = client.balances(clientId);
             assertEquals(2, balances.size());
             assertEquals(PgLedgerServer.READER, client.role());
 
-            Account available = client.balance("CLIENT_ACC_001", "AVAILABLE", "USD");
-            assertEquals(0, new BigDecimal("10").compareTo(available.balance()));
+            Account availableRow = client.balance(clientId, available, "USD");
+            assertEquals(0, new BigDecimal("10").compareTo(availableRow.balance()));
             assertEquals(PgLedgerServer.READER, client.role());
 
-            JournalPage journals = client.journals(0, 50);
-            assertEquals(1L, journals.total());
-            assertFalse(journals.hasNext());
-            assertEquals(1, journals.transfers().size());
-            assertEquals(PgLedgerServer.READER, client.role());
+            boolean found = false;
+            for (int page = 0; page < 10 && !found; page++) {
+                JournalPage journals = client.journals(page, 50);
+                assertEquals(PgLedgerServer.READER, client.role());
+                if (page == 0) {
+                    assertEquals(journals.total() > journals.transfers().size(), journals.hasNext());
+                }
+                for (int i = 0; i < journals.transfers().size(); i++) {
+                    Transfer transfer = journals.transfers().get(i);
+                    if (company.equals(transfer.fromAccountId()) && clientId.equals(transfer.toAccountId())) {
+                        found = true;
+                        assertEquals(0, new BigDecimal("10").compareTo(transfer.amount()));
+                        assertEquals(2, transfer.entries().size());
+                    }
+                }
+                if (!journals.hasNext()) {
+                    break;
+                }
+            }
+            assertTrue(found);
 
             PgLedgerClientException rejected = assertThrows(PgLedgerClientException.class,
-                    () -> client.post(posting("CLIENT_ACC_001", "AVAILABLE", "COMPANY", "AVAILABLE", "USD", "20")));
+                    () -> client.post(posting(clientId, available, company, available, "USD", "20")));
             assertEquals(422, rejected.status());
             assertEquals(PgLedgerServer.WRITER, client.role());
             assertTrue(rejected.getMessage().contains("does not allow negative balance"));
-            assertEquals(0, new BigDecimal("10").compareTo(client.balance("CLIENT_ACC_001", "AVAILABLE", "USD").balance()));
+            assertEquals(0, new BigDecimal("10").compareTo(client.balance(clientId, available, "USD").balance()));
 
-            assertNull(client.balance("CLIENT_ACC_001", "AVAILABLE", "GBP"));
+            assertNull(client.balance(clientId, available, "GBP"));
             assertEquals(404, client.status());
             assertEquals(PgLedgerServer.READER, client.role());
             http.close();
@@ -88,13 +152,11 @@ class PgLedgerRestTest {
 
     @Test
     void badRequestsAndRemovedRoutes() throws Exception {
-        try (PgLedger ledger = PgLedger.inMemory();
-             PgLedgerServer server = PgLedgerServer.start(ledger, 0)) {
-            HttpClient http = HttpClient.newBuilder()
+        try (HttpClient http = HttpClient.newBuilder()
                     .version(HttpClient.Version.HTTP_1_1)
                     .connectTimeout(Duration.ofSeconds(2))
-                    .build();
-            URI base = base(server);
+                    .build()) {
+            URI base = base(port);
             HttpResponse<String> bad = http.send(HttpRequest.newBuilder(base.resolve("/api/v1/postings"))
                     .timeout(Duration.ofSeconds(2))
                     .header("Content-Type", "application/json")
@@ -128,12 +190,11 @@ class PgLedgerRestTest {
             assertEquals(PgLedgerServer.READER, defaults.headers().firstValue(PgLedgerServer.ROLE_HEADER).orElse(null));
             assertTrue(defaults.body().contains("\"size\":50"));
             assertTrue(defaults.body().contains("\"page\":0"));
-            http.close();
         }
     }
 
-    private static URI base(PgLedgerServer server) {
-        return URI.create("http://127.0.0.1:" + server.port());
+    private static URI base(int port) {
+        return URI.create("http://127.0.0.1:" + port);
     }
 
     private static PgLedgerClient client(int port) {
@@ -144,6 +205,16 @@ class PgLedgerRestTest {
                 0));
     }
 
+    private static int countCode(List<BalanceType> types, String code) {
+        int n = 0;
+        for (int i = 0; i < types.size(); i++) {
+            if (code.equals(types.get(i).code())) {
+                n++;
+            }
+        }
+        return n;
+    }
+
     private static CreateAccount account(String accountId, String balanceType, String currency,
                                          boolean allowNegative, boolean allowPositive) {
         return new CreateAccount(accountId, balanceType, currency, accountId, allowNegative, allowPositive, null);
@@ -152,5 +223,107 @@ class PgLedgerRestTest {
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
                                    String currency, String amount) {
         return new Posting(fromAccount, fromType, toAccount, toType, currency, new BigDecimal(amount), null);
+    }
+
+    private static String id(String prefix) {
+        return prefix + Long.toUnsignedString(IDS.incrementAndGet(), 36)
+                + Long.toUnsignedString(System.nanoTime(), 36);
+    }
+
+    private boolean recovery(boolean writeRoute) throws SQLException {
+        if (writeRoute) {
+            try (HintManager hint = HintManager.getInstance()) {
+                hint.setWriteRouteOnly();
+                return queryRecovery(dataSource);
+            }
+        }
+        return queryRecovery(dataSource);
+    }
+
+    private static boolean queryRecovery(DataSource dataSource) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             Statement statement = conn.createStatement();
+             ResultSet rs = statement.executeQuery("SELECT pg_is_in_recovery()")) {
+            if (!rs.next()) {
+                throw new IllegalStateException("pg_is_in_recovery returned no row");
+            }
+            return rs.getBoolean(1);
+        }
+    }
+
+    private static final class Nodes implements AutoCloseable {
+        private final DataSource writer;
+        private final DataSource reader;
+
+        private Nodes() throws SQLException {
+            writer = dataSource(WRITER_URL);
+            reader = dataSource(READER_URL);
+            if (queryBoolean(writer, "SELECT pg_is_in_recovery()")) {
+                throw new IllegalStateException("writer url is a replica");
+            }
+            if (!queryBoolean(reader, "SELECT pg_is_in_recovery()")) {
+                throw new IllegalStateException("reader url is not a replica");
+            }
+        }
+
+        private void awaitCatchUp() throws Exception {
+            long start = System.nanoTime();
+            String lsn = queryText(writer, "SELECT pg_current_wal_lsn()::text");
+            while (System.nanoTime() - start < CATCH_UP_NS) {
+                if (replayed(reader, lsn)) {
+                    return;
+                }
+                Thread.sleep(20L);
+            }
+            fail("reader did not replay " + lsn);
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    private static boolean replayed(DataSource dataSource, String lsn) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("""
+                     SELECT pg_is_in_recovery()
+                        AND coalesce(pg_last_wal_replay_lsn() >= ?::pg_lsn, false)
+                     """)) {
+            ps.setString(1, lsn);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
+    private static String queryText(DataSource dataSource, String sql) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             Statement statement = conn.createStatement();
+             ResultSet rs = statement.executeQuery(sql)) {
+            if (!rs.next()) {
+                throw new IllegalStateException(sql);
+            }
+            return rs.getString(1);
+        }
+    }
+
+    private static boolean queryBoolean(DataSource dataSource, String sql) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             Statement statement = conn.createStatement();
+             ResultSet rs = statement.executeQuery(sql)) {
+            if (!rs.next()) {
+                throw new IllegalStateException(sql);
+            }
+            return rs.getBoolean(1);
+        }
+    }
+
+    private static PGSimpleDataSource dataSource(String url) {
+        PGSimpleDataSource dataSource = new PGSimpleDataSource();
+        dataSource.setURL(url);
+        dataSource.setUser(DB_USER);
+        dataSource.setPassword(DB_PASSWORD);
+        dataSource.setConnectTimeout(5);
+        return dataSource;
     }
 }

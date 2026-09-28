@@ -1,6 +1,7 @@
 plugins {
     java
-    application
+    id("org.springframework.boot") version "3.4.5"
+    id("io.spring.dependency-management") version "1.1.7"
 }
 
 group = "io.zodia"
@@ -12,19 +13,18 @@ java {
     }
 }
 
-application {
-    mainClass.set("io.zodia.pgledger.rest.PgLedgerServerMain")
-}
-
 repositories {
     mavenCentral()
 }
 
 dependencies {
     implementation(project(":pgledger-core"))
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.apache.shardingsphere:shardingsphere-jdbc:5.5.2")
+    implementation("com.zaxxer:HikariCP")
+    runtimeOnly("org.postgresql:postgresql")
     testImplementation(project(":pgledger-client-sdk"))
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
-    testImplementation("org.postgresql:postgresql:42.7.7")
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
 }
 
 tasks.withType<JavaCompile> {
