@@ -49,7 +49,7 @@ final class LedgerExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     ResponseEntity<byte[]> failure(Exception exception) {
-        LOG.error("pgledger {}", exception.toString());
+        LOG.error("pgledger request failed", exception);
         return HttpResponses.of(500, null, HttpResponses.SERVER_ERROR);
     }
 }

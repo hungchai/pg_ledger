@@ -90,27 +90,19 @@ public final class PostgresLedgerStore implements LedgerStore {
              WHERE account_id = ?
              ORDER BY balance_type, currency
             """;
+    private static final String JOURNAL_COUNT = "SELECT count(*) FROM pgledger_transfers";
     private static final String JOURNALS = """
-            WITH total AS (
-                SELECT count(*)::bigint AS total FROM pgledger_transfers
-            ), page AS (
-                SELECT id, from_account_id, to_account_id, amount, created_at, event_at, metadata
-                FROM pgledger_transfers
-                ORDER BY created_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            )
             SELECT
-                total.total,
-                page.id AS transfer_id,
+                t.id AS transfer_id,
                 fa.account_id AS from_account_id,
                 fa.balance_type AS from_balance_type,
                 ta.account_id AS to_account_id,
                 ta.balance_type AS to_balance_type,
                 fa.currency AS currency,
-                page.amount AS transfer_amount,
-                page.created_at AS transfer_created_at,
-                page.event_at,
-                page.metadata::text AS transfer_metadata,
+                t.amount AS transfer_amount,
+                t.created_at AS transfer_created_at,
+                t.event_at,
+                t.metadata::text AS transfer_metadata,
                 e.id AS entry_id,
                 ea.account_id AS entry_account_id,
                 ea.balance_type AS entry_balance_type,
@@ -120,13 +112,17 @@ public final class PostgresLedgerStore implements LedgerStore {
                 e.account_current_balance,
                 e.account_version,
                 e.created_at AS entry_created_at
-            FROM total
-            LEFT JOIN page ON TRUE
-            LEFT JOIN pgledger_accounts fa ON fa.id = page.from_account_id
-            LEFT JOIN pgledger_accounts ta ON ta.id = page.to_account_id
-            LEFT JOIN pgledger_entries e ON e.transfer_id = page.id
+            FROM pgledger_transfers t
+            JOIN pgledger_accounts fa ON fa.id = t.from_account_id
+            JOIN pgledger_accounts ta ON ta.id = t.to_account_id
+            LEFT JOIN pgledger_entries e ON e.transfer_id = t.id
             LEFT JOIN pgledger_accounts ea ON ea.id = e.account_id
-            ORDER BY page.created_at DESC NULLS LAST, page.id DESC NULLS LAST, e.id
+            WHERE t.id IN (
+                SELECT id FROM pgledger_transfers
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+            )
+            ORDER BY t.created_at DESC, t.id DESC, e.id
             """;
 
     private static final int MIGRATION_ATTEMPTS = 30;
@@ -282,20 +278,16 @@ public final class PostgresLedgerStore implements LedgerStore {
     @Override
     public JournalPage journals(int page, int size) {
         return read(conn -> {
+            long total = journalCount(conn);
+            long offset = (long) page * (long) size;
             try (PreparedStatement ps = conn.prepareStatement(JOURNALS)) {
-                long offset = (long) page * (long) size;
                 ps.setInt(1, size);
                 ps.setLong(2, offset);
                 try (ResultSet rs = ps.executeQuery()) {
-                    long total = 0L;
                     LinkedHashMap<String, ArrayList<Entry>> entries = new LinkedHashMap<>();
                     LinkedHashMap<String, Transfer> transfers = new LinkedHashMap<>();
                     while (rs.next()) {
-                        total = rs.getLong("total");
                         String transferId = rs.getString("transfer_id");
-                        if (transferId == null) {
-                            continue;
-                        }
                         if (!transfers.containsKey(transferId)) {
                             transfers.put(transferId, transfer(rs, transferId));
                         }
@@ -319,6 +311,16 @@ public final class PostgresLedgerStore implements LedgerStore {
                 }
             }
         });
+    }
+
+    private static long journalCount(Connection conn) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(JOURNAL_COUNT);
+             ResultSet rs = ps.executeQuery()) {
+            if (!rs.next()) {
+                throw new LedgerException("journal count returned no row");
+            }
+            return rs.getLong(1);
+        }
     }
 
     @Override

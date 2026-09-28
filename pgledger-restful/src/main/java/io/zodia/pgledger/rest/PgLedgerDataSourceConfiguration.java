@@ -7,9 +7,10 @@ import io.zodia.pgledger.store.PostgresLedgerStore;
 import org.apache.shardingsphere.driver.api.ShardingSphereDataSourceFactory;
 import org.apache.shardingsphere.infra.algorithm.core.config.AlgorithmConfiguration;
 import org.apache.shardingsphere.infra.config.rule.RuleConfiguration;
-import org.apache.shardingsphere.readwritesplitting.api.ReadwriteSplittingRuleConfiguration;
-import org.apache.shardingsphere.readwritesplitting.api.rule.ReadwriteSplittingDataSourceGroupRuleConfiguration;
-import org.apache.shardingsphere.readwritesplitting.api.strategy.StaticReadwriteSplittingStrategyConfiguration;
+import org.apache.shardingsphere.readwritesplitting.config.ReadwriteSplittingRuleConfiguration;
+import org.apache.shardingsphere.readwritesplitting.config.rule.ReadwriteSplittingDataSourceGroupRuleConfiguration;
+import org.apache.shardingsphere.readwritesplitting.transaction.TransactionalReadQueryStrategy;
+import org.apache.shardingsphere.single.config.SingleRuleConfiguration;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -58,15 +59,14 @@ class PgLedgerDataSourceConfiguration {
         HashMap<String, DataSource> sources = new HashMap<>(2);
         sources.put("writer", writer);
         sources.put("reader", reader);
-        StaticReadwriteSplittingStrategyConfiguration strategy =
-                new StaticReadwriteSplittingStrategyConfiguration("writer", List.of("reader"));
-        ReadwriteSplittingDataSourceGroupRuleConfiguration group =
-                new ReadwriteSplittingDataSourceGroupRuleConfiguration("pgledger", strategy, "round_robin", "DYNAMIC");
+        ReadwriteSplittingDataSourceGroupRuleConfiguration group = new ReadwriteSplittingDataSourceGroupRuleConfiguration(
+                "pgledger", "writer", List.of("reader"), TransactionalReadQueryStrategy.DYNAMIC, "round_robin");
         Map<String, AlgorithmConfiguration> loadBalancers = Map.of(
                 "round_robin", new AlgorithmConfiguration("ROUND_ROBIN", new Properties()));
         ReadwriteSplittingRuleConfiguration rule =
                 new ReadwriteSplittingRuleConfiguration(List.of(group), loadBalancers);
-        List<RuleConfiguration> rules = List.of(rule);
+        SingleRuleConfiguration single = new SingleRuleConfiguration(List.of("*.*"), "pgledger");
+        List<RuleConfiguration> rules = List.of(rule, single);
         Properties props = new Properties();
         props.setProperty("sql-show", "false");
         props.setProperty("check-table-metadata-enabled", "false");
