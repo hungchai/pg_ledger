@@ -81,7 +81,7 @@ Seeded rows, `name` equal to `code`: `1 LIQUID`, `2 PENDING_INCOMING`, `3 PENDIN
 | `code` | Unique. |
 | `scale` | Required decimal places for that currency. |
 
-Seeded rows: `1 USD` scale 2, `2 EUR` scale 2.
+Seeded rows: `1 USD` scale 2, `2 EUR` scale 2, `3 BTC` scale 8, `4 ETH` scale 18, `5 USDT` scale 6.
 
 `pgledger_accounts.currency_id` stores this id. Indexed. Not a foreign key. Account create and posting reject a code that is not in this table.
 

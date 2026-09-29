@@ -27,12 +27,16 @@ DECLARE
     deposit_from TEXT;
     available_type INT;
     locked_type INT;
+    liquid_type INT;
 BEGIN
     SELECT COALESCE(array_agg(id), ARRAY[]::TEXT[])
     INTO smoke_ids
     FROM pgledger_accounts
     WHERE account_id IN ('SMOKE_CLIENT', 'SMOKE_COMPANY')
-       OR account_id LIKE 'BANK-%-SMOKE_%';
+       OR account_id LIKE 'BANK-%-SMOKE_%'
+       OR account_id LIKE 'BANK-BTC-LIQUID-%'
+       OR account_id LIKE 'BANK-ETH-LIQUID-%'
+       OR account_id LIKE 'BANK-USDT-LIQUID-%';
 
     DELETE FROM pgledger_entries WHERE account_id = ANY(smoke_ids);
     DELETE FROM pgledger_transfers
@@ -66,11 +70,16 @@ BEGIN
     IF (SELECT id FROM pgledger_balance_types WHERE code = 'LIQUID') <> 1 THEN
         RAISE EXCEPTION 'LIQUID id is not 1';
     END IF;
-    IF (SELECT count(*) FROM pgledger_currencies WHERE code IN ('USD', 'EUR') AND scale = 2) <> 2 THEN
+    IF (
+        SELECT count(*)
+        FROM pgledger_currencies
+        WHERE (code = 'USD' AND id = 1 AND scale = 2)
+           OR (code = 'EUR' AND id = 2 AND scale = 2)
+           OR (code = 'BTC' AND id = 3 AND scale = 8)
+           OR (code = 'ETH' AND id = 4 AND scale = 18)
+           OR (code = 'USDT' AND id = 5 AND scale = 6)
+    ) <> 5 THEN
         RAISE EXCEPTION 'currencies not seeded';
-    END IF;
-    IF (SELECT id FROM pgledger_currencies WHERE code = 'USD') <> 1 THEN
-        RAISE EXCEPTION 'USD id is not 1';
     END IF;
 
     IF EXISTS (
@@ -561,6 +570,66 @@ BEGIN
         'SMOKE_COMPANY', available_type, 'SMOKE_CLIENT', available_type, 'SMOKE_CCY', 1,
         NULL, NULL, 'smoke-ccy-1');
     DELETE FROM pgledger_currencies WHERE code = 'SMOKE_CCY';
+
+    SELECT id INTO liquid_type FROM pgledger_balance_types WHERE code = 'LIQUID';
+    IF pgledger_ensure_bank_pool('BTC', 'LIQUID', liquid_type, 2, FALSE) <> 2
+        OR pgledger_ensure_bank_pool('ETH', 'LIQUID', liquid_type, 2, FALSE) <> 2
+        OR pgledger_ensure_bank_pool('USDT', 'LIQUID', liquid_type, 2, FALSE) <> 2 THEN
+        RAISE EXCEPTION 'crypto bank pool size is not 2';
+    END IF;
+    IF (
+        SELECT count(*)
+        FROM pgledger_accounts_view
+        WHERE account_class = 'BANK'
+          AND balance_type = 'LIQUID'
+          AND currency IN ('BTC', 'ETH', 'USDT')
+    ) <> 6 THEN
+        RAISE EXCEPTION 'expected 6 crypto BANK accounts';
+    END IF;
+
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client BTC', 'BTC', FALSE, TRUE, NULL);
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client ETH', 'ETH', FALSE, TRUE, NULL);
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client USDT', 'USDT', FALSE, TRUE, NULL);
+
+    PERFORM * FROM pgledger_create_transfer(
+        'BANK', liquid_type, 'SMOKE_CLIENT', liquid_type, 'BTC', 0.12345678,
+        NULL, NULL, 'smoke-btc-1', 'DEPOSIT');
+    PERFORM * FROM pgledger_create_transfer(
+        'BANK', liquid_type, 'SMOKE_CLIENT', liquid_type, 'ETH', 1.234567890123456789,
+        NULL, NULL, 'smoke-eth-1', 'DEPOSIT');
+    PERFORM * FROM pgledger_create_transfer(
+        'BANK', liquid_type, 'SMOKE_CLIENT', liquid_type, 'USDT', 100.123456,
+        NULL, NULL, 'smoke-usdt-1', 'DEPOSIT');
+
+    SELECT balance INTO available_balance
+    FROM pgledger_accounts_view
+    WHERE account_id = 'SMOKE_CLIENT' AND balance_type = 'LIQUID' AND currency = 'BTC';
+    SELECT balance INTO locked_balance
+    FROM pgledger_accounts_view
+    WHERE account_id = 'SMOKE_CLIENT' AND balance_type = 'LIQUID' AND currency = 'ETH';
+    SELECT balance INTO company_balance
+    FROM pgledger_accounts_view
+    WHERE account_id = 'SMOKE_CLIENT' AND balance_type = 'LIQUID' AND currency = 'USDT';
+    IF available_balance <> 0.12345678
+        OR locked_balance <> 1.234567890123456789
+        OR company_balance <> 100.123456 THEN
+        RAISE EXCEPTION 'crypto balances btc=% eth=% usdt=%', available_balance, locked_balance, company_balance;
+    END IF;
+
+    SELECT COALESCE(SUM(balance), 0) INTO bank_balance
+    FROM pgledger_accounts_view
+    WHERE account_class = 'BANK' AND balance_type = 'LIQUID' AND currency = 'BTC';
+    IF bank_balance <> -0.12345678 THEN
+        RAISE EXCEPTION 'BTC bank position %, expected -0.12345678', bank_balance;
+    END IF;
+    SELECT fa.account_id INTO deposit_from
+    FROM pgledger_transfers_view t
+    JOIN pgledger_accounts_view fa ON fa.id = t.from_account_id
+    WHERE t.request_id = 'smoke-btc-1'
+      AND fa.account_id = pgledger_bank_account_id('BTC', 'LIQUID', pgledger_bank_shard('smoke-btc-1', 2));
+    IF deposit_from IS NULL THEN
+        RAISE EXCEPTION 'BTC deposit did not debit a LIQUID shard';
+    END IF;
 
     RAISE NOTICE 'smoke test passed';
 END $$;

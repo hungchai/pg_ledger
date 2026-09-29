@@ -162,7 +162,10 @@ CREATE TABLE IF NOT EXISTS pgledger_currencies (
 INSERT INTO pgledger_currencies (id, code, scale)
 VALUES
     (1, 'USD', 2),
-    (2, 'EUR', 2)
+    (2, 'EUR', 2),
+    (3, 'BTC', 8),
+    (4, 'ETH', 18),
+    (5, 'USDT', 6)
 ON CONFLICT (code) DO NOTHING;
 
 SELECT setval(
