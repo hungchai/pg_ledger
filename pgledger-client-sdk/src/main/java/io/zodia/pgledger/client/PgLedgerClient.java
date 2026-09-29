@@ -2,8 +2,10 @@ package io.zodia.pgledger.client;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
+import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
+import io.zodia.pgledger.api.LedgerApi.DeleteAccount;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
@@ -73,6 +75,19 @@ public final class PgLedgerClient implements AutoCloseable {
 
     public Transfer post(Posting posting) {
         return read(ok(exchange("POST", "/api/v1/postings", LedgerJson.writeBytes(posting))), Transfer.class);
+    }
+
+    public Transfer deposit(CashMovement movement) {
+        return read(ok(exchange("POST", "/api/v1/deposits", LedgerJson.writeBytes(movement))), Transfer.class);
+    }
+
+    public Transfer withdraw(CashMovement movement) {
+        return read(ok(exchange("POST", "/api/v1/withdrawals", LedgerJson.writeBytes(movement))), Transfer.class);
+    }
+
+    public Account deleteAccount(String accountId, String balanceType, String currency) {
+        DeleteAccount command = new DeleteAccount(accountId, balanceType, currency);
+        return read(ok(exchange("POST", "/api/v1/accounts/delete", LedgerJson.writeBytes(command))), Account.class);
     }
 
     public List<Account> balances(String accountId) {

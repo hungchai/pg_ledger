@@ -915,7 +915,7 @@ class PgLedgerStressTest {
     }
 
     private static CreateAccount account(String accountId, String balanceType, boolean allowNegative) {
-        return new CreateAccount(accountId, balanceType, USD, accountId, allowNegative, true, null);
+        return new CreateAccount(accountId, balanceType, USD, accountId, allowNegative, true, null, null);
     }
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,

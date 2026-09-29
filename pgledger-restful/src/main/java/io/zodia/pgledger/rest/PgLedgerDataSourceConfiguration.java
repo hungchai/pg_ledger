@@ -51,8 +51,11 @@ class PgLedgerDataSourceConfiguration {
     }
 
     @Bean(destroyMethod = "close")
-    PgLedger pgLedger(@Qualifier("dataSource") DataSource dataSource) {
-        return PgLedger.routed(dataSource);
+    PgLedger pgLedger(@Qualifier("dataSource") DataSource dataSource, PgLedgerProperties properties) {
+        int poolSize = properties.bankPoolSize() == null
+                ? PgLedger.DEFAULT_BANK_POOL_SIZE
+                : properties.bankPoolSize().intValue();
+        return PgLedger.routed(dataSource, poolSize);
     }
 
     private static DataSource readWriteSplitting(DataSource writer, DataSource reader) throws SQLException {

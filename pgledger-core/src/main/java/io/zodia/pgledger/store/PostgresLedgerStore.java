@@ -43,10 +43,30 @@ public final class PostgresLedgerStore implements LedgerStore {
     private static final String ACCOUNT_COLUMNS = """
             id, account_id, balance_type, name, currency, balance, version,
             allow_negative_balance, allow_positive_balance, metadata::text AS metadata,
-            created_at, updated_at
+            created_at, updated_at, account_class, deleted
             """;
     private static final String CREATE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
-            + " FROM pgledger_create_account(?, ?, ?, ?, ?, ?, CAST(? AS jsonb))";
+            + " FROM pgledger_create_account(?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?)";
+    private static final String ENSURE_BANK_POOL = "SELECT pgledger_ensure_bank_pool(?, ?, ?, ?)";
+    private static final String POST_CASH = """
+            SELECT id FROM pgledger_post_cash(?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+            """;
+    private static final String DELETE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
+            + " FROM pgledger_delete_account(?, ?, ?)";
+    private static final String BANK_POSITION = "SELECT pgledger_bank_position(?, ?)";
+    private static final String BANK_SHARDS = """
+            SELECT
+                a.id, a.account_id, a.balance_type, a.name, a.currency, a.balance, a.version,
+                a.allow_negative_balance, a.allow_positive_balance, a.metadata::text AS metadata,
+                a.created_at, a.updated_at, a.account_class, a.deleted
+            FROM pgledger_bank_shards s
+            JOIN pgledger_accounts a
+              ON a.account_id = s.account_id
+             AND a.balance_type = s.balance_type
+             AND a.currency = s.currency
+            WHERE s.balance_type = ? AND s.currency = ?
+            ORDER BY s.shard
+            """;
     // The function insert is its own statement. Joining pgledger_entries in that
     // same statement sees a snapshot from before the insert and returns no row.
     private static final String CREATE_TRANSFER = """
@@ -200,6 +220,11 @@ public final class PostgresLedgerStore implements LedgerStore {
                 ps.setBoolean(5, flag(command.allowNegativeBalance()));
                 ps.setBoolean(6, flag(command.allowPositiveBalance()));
                 setJson(ps, 7, command.metadata());
+                if (command.accountClass() == null) {
+                    ps.setNull(8, Types.VARCHAR);
+                } else {
+                    ps.setString(8, command.accountClass());
+                }
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new LedgerException("pgledger_create_account returned no row");
@@ -229,14 +254,97 @@ public final class PostgresLedgerStore implements LedgerStore {
                     transferId = rs.getString(1);
                 }
             }
-            try (PreparedStatement ps = conn.prepareStatement(LOAD_TRANSFER)) {
-                ps.setString(1, transferId);
+            return loadTransfer(conn, transferId);
+        });
+    }
+
+    @Override
+    public int ensureBankPool(String balanceType, String currency, int poolSize, boolean keepExisting) {
+        return write(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(ENSURE_BANK_POOL)) {
+                ps.setString(1, currency);
+                ps.setString(2, balanceType);
+                ps.setInt(3, poolSize);
+                ps.setBoolean(4, keepExisting);
                 try (ResultSet rs = ps.executeQuery()) {
-                    Transfer transfer = oneTransfer(rs);
-                    if (transfer == null) {
-                        throw new LedgerException("pgledger_create_transfer returned no row");
+                    if (!rs.next()) {
+                        throw new LedgerException("pgledger_ensure_bank_pool returned no row");
                     }
-                    return transfer;
+                    return rs.getInt(1);
+                }
+            }
+        });
+    }
+
+    @Override
+    public Transfer postCash(String direction, String requestId, String accountId, String balanceType,
+                             String currency, java.math.BigDecimal amount, int poolSize) {
+        return write(conn -> {
+            String transferId;
+            try (PreparedStatement ps = conn.prepareStatement(POST_CASH)) {
+                ps.setString(1, requestId);
+                ps.setString(2, direction);
+                ps.setString(3, accountId);
+                ps.setString(4, balanceType);
+                ps.setString(5, currency);
+                ps.setBigDecimal(6, amount);
+                ps.setInt(7, poolSize);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new LedgerException("pgledger_post_cash returned no row");
+                    }
+                    transferId = rs.getString(1);
+                }
+            }
+            return loadTransfer(conn, transferId);
+        });
+    }
+
+    @Override
+    public Account deleteAccount(String accountId, String balanceType, String currency) {
+        return write(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(DELETE_ACCOUNT)) {
+                ps.setString(1, accountId);
+                ps.setString(2, balanceType);
+                ps.setString(3, currency);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new LedgerException("pgledger_delete_account returned no row");
+                    }
+                    return account(rs);
+                }
+            }
+        });
+    }
+
+    @Override
+    public java.math.BigDecimal bankPosition(String balanceType, String currency) {
+        return read(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(BANK_POSITION)) {
+                ps.setString(1, balanceType);
+                ps.setString(2, currency);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new LedgerException("pgledger_bank_position returned no row");
+                    }
+                    return rs.getBigDecimal(1);
+                }
+            }
+        });
+    }
+
+    @Override
+    public List<Account> bankShards(String balanceType, String currency) {
+        return read(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(BANK_SHARDS)) {
+                ps.setString(1, balanceType);
+                ps.setString(2, currency);
+                try (ResultSet rs = ps.executeQuery()) {
+                    ArrayList<Account> rows = new ArrayList<>();
+                    while (rs.next()) {
+                        rows.add(account(rs));
+                    }
+                    return List.copyOf(rows);
                 }
             }
         });
@@ -467,7 +575,22 @@ public final class PostgresLedgerStore implements LedgerStore {
                 rs.getBoolean("allow_positive_balance"),
                 LedgerJson.map(rs.getString("metadata")),
                 instant(rs, "created_at"),
-                instant(rs, "updated_at"));
+                instant(rs, "updated_at"),
+                rs.getString("account_class"),
+                rs.getBoolean("deleted"));
+    }
+
+    private static Transfer loadTransfer(Connection conn, String transferId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(LOAD_TRANSFER)) {
+            ps.setString(1, transferId);
+            try (ResultSet rs = ps.executeQuery()) {
+                Transfer transfer = oneTransfer(rs);
+                if (transfer == null) {
+                    throw new LedgerException("pgledger_create_transfer returned no row");
+                }
+                return transfer;
+            }
+        }
     }
 
     private static Transfer oneTransfer(ResultSet rs) throws SQLException {

@@ -2,6 +2,7 @@ package io.zodia.pgledger;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
+import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
@@ -196,7 +197,7 @@ class PgLedgerTest {
                     () -> ledger.post(posting(company, available, client, available, "USD", "0")));
             assertTrue(amount.getMessage().contains("must be positive"));
             LedgerViolation blank = assertThrows(LedgerViolation.class,
-                    () -> ledger.createAccount(new CreateAccount("  ", available, "USD", null, false, true, null)));
+                    () -> ledger.createAccount(new CreateAccount("  ", available, "USD", null, false, true, null, null)));
             assertEquals("account_id, balance_type, and currency are required", blank.getMessage());
         }
     }
@@ -268,11 +269,280 @@ class PgLedgerTest {
             String available = accountId + "A";
             ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
             Account created = ledger.createAccount(new CreateAccount(
-                    accountId, available, "USD", "  ", null, null, Map.of("desk", "fx")));
+                    accountId, available, "USD", "  ", null, null, Map.of("desk", "fx"), null));
             assertEquals(accountId, created.name());
             assertTrue(created.allowNegativeBalance());
             assertTrue(created.allowPositiveBalance());
+            assertEquals("CLIENT", created.accountClass());
+            assertFalse(created.deleted());
             assertEquals("fx", created.metadata().get("desk"));
+
+            Account bank = ledger.createAccount(new CreateAccount(
+                    accountId + "B", available, "USD", null, false, false, null, "bank"));
+            assertEquals("BANK", bank.accountClass());
+            assertTrue(bank.allowNegativeBalance());
+            assertTrue(bank.allowPositiveBalance());
+            LedgerViolation badClass = assertThrows(LedgerViolation.class,
+                    () -> ledger.createAccount(new CreateAccount(
+                            accountId + "X", available, "USD", null, false, true, null, "HOT")));
+            assertTrue(badClass.getMessage().contains("account_class"));
+
+            try (Connection conn = dataSource(WRITER_URL).getConnection();
+                 PreparedStatement ps = conn.prepareStatement("""
+                         INSERT INTO pgledger_accounts (
+                             account_id, balance_type, name, currency,
+                             allow_negative_balance, allow_positive_balance, created_at, updated_at)
+                         VALUES (?, ?, 'legacy', 'USD', false, true, now(), now())
+                         RETURNING account_class, deleted
+                         """)) {
+                ps.setString(1, accountId + "LEGACY");
+                ps.setString(2, available);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("CLIENT", rs.getString(1));
+                    assertFalse(rs.getBoolean(2));
+                }
+            }
+        }
+    }
+
+    @Test
+    void depositCreditsClientAndDebitsOneBankShard() throws Exception {
+        try (Nodes nodes = new Nodes()) {
+            PgLedger ledger = nodes.ledger;
+            String type = id("DEP") + "A";
+            String client = id("DEPC");
+            ledger.createBalanceType(new CreateBalanceType(type, "Available", null));
+            ledger.createAccount(account(client, type, "USD", false, true));
+            BigDecimal amount = new BigDecimal("30");
+            Transfer deposit = ledger.deposit(cash(id("DREQ"), client, type, amount));
+            assertEquals(client, deposit.toAccountId());
+            assertTrue(deposit.fromAccountId().startsWith("bankpool." + type + ".USD."));
+            assertEquals(2, deposit.entries().size());
+            assertEquals(0, amount.negate().compareTo(deposit.entries().get(0).amount()));
+            assertEquals(0, amount.compareTo(deposit.entries().get(1).amount()));
+            assertEquals(shardOf(deposit.metadata()), bankShard(deposit.metadata().get("requestId").toString(), 8));
+
+            nodes.awaitCatchUp();
+            List<Account> shards = ledger.bankShards(type, "USD");
+            assertEquals(PgLedger.DEFAULT_BANK_POOL_SIZE, shards.size());
+            int debited = 0;
+            for (int i = 0; i < shards.size(); i++) {
+                Account shard = shards.get(i);
+                assertEquals("BANK", shard.accountClass());
+                assertTrue(shard.allowNegativeBalance());
+                assertTrue(shard.allowPositiveBalance());
+                if (shard.accountId().equals(deposit.fromAccountId())) {
+                    debited++;
+                    assertEquals(0, amount.negate().compareTo(shard.balance()));
+                    assertTrue(shard.balance().signum() < 0);
+                } else {
+                    assertEquals(0, BigDecimal.ZERO.compareTo(shard.balance()));
+                }
+            }
+            assertEquals(1, debited);
+            assertEquals(0, amount.compareTo(ledger.balance(client, type, "USD").balance()));
+            assertEquals(0, amount.negate().compareTo(ledger.bankPosition(type, "USD")));
+
+            Transfer withdrawal = ledger.withdraw(cash(id("WREQ"), client, type, amount));
+            assertEquals(client, withdrawal.fromAccountId());
+            assertTrue(withdrawal.toAccountId().startsWith("bankpool." + type + ".USD."));
+            nodes.awaitCatchUp();
+            assertEquals(0, BigDecimal.ZERO.compareTo(ledger.balance(client, type, "USD").balance()));
+            assertEquals(0, BigDecimal.ZERO.compareTo(ledger.bankPosition(type, "USD")));
+            assertEquals(0, BigDecimal.ZERO.compareTo(sum(ledger.bankShards(type, "USD"))));
+
+            LedgerViolation floor = assertThrows(LedgerViolation.class,
+                    () -> ledger.withdraw(cash(id("WREQ2"), client, type, BigDecimal.ONE)));
+            assertTrue(floor.getMessage().contains("does not allow negative balance"));
+            nodes.awaitCatchUp();
+            assertEquals(0, BigDecimal.ZERO.compareTo(ledger.balance(client, type, "USD").balance()));
+            assertEquals(0, BigDecimal.ZERO.compareTo(ledger.bankPosition(type, "USD")));
+        }
+    }
+
+    @Test
+    void depositsCanHitDifferentShardsAndReplayDoesNotDoublePost() throws Exception {
+        try (Nodes nodes = new Nodes()) {
+            PgLedger ledger = nodes.ledger;
+            String type = id("SH") + "A";
+            String client = id("SHC");
+            ledger.createBalanceType(new CreateBalanceType(type, "Available", null));
+            ledger.createAccount(account(client, type, "USD", false, true));
+            assertEquals(8, ledger.ensureBankPool(type, "USD", 8));
+            LedgerViolation resized = assertThrows(LedgerViolation.class,
+                    () -> ledger.ensureBankPool(type, "USD", 4));
+            assertTrue(resized.getMessage().contains("bank pool size"));
+
+            String[] ids = requestPair(8, false);
+            BigDecimal amount = new BigDecimal("10");
+            Transfer first = ledger.deposit(cash(ids[0], client, type, amount));
+            Transfer second = ledger.deposit(cash(ids[1], client, type, amount));
+            assertFalse(first.fromAccountId().equals(second.fromAccountId()));
+            assertFalse(first.id().equals(second.id()));
+            nodes.awaitCatchUp();
+            assertEquals(2, nonzero(ledger.bankShards(type, "USD")));
+            assertEquals(0, amount.add(amount).compareTo(ledger.balance(client, type, "USD").balance()));
+            assertEquals(0, amount.add(amount).negate().compareTo(ledger.bankPosition(type, "USD")));
+
+            Transfer replay = ledger.deposit(cash(ids[0], client, type, amount));
+            assertEquals(first.id(), replay.id());
+            nodes.awaitCatchUp();
+            assertEquals(0, amount.add(amount).compareTo(ledger.balance(client, type, "USD").balance()));
+            LedgerViolation reused = assertThrows(LedgerViolation.class,
+                    () -> ledger.deposit(cash(ids[0], client, type, new BigDecimal("11"))));
+            assertTrue(reused.getMessage().contains("request id already used"));
+            assertEquals(0, amount.add(amount).compareTo(ledger.balance(client, type, "USD").balance()));
+
+            CyclicBarrier start = new CyclicBarrier(2);
+            CashMovement same = cash(ids[0], client, type, amount);
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+            try {
+                Future<Transfer> left = pool.submit(() -> {
+                    start.await();
+                    return ledger.deposit(same);
+                });
+                Future<Transfer> right = pool.submit(() -> {
+                    start.await();
+                    return ledger.deposit(same);
+                });
+                assertEquals(first.id(), left.get(30, TimeUnit.SECONDS).id());
+                assertEquals(first.id(), right.get(30, TimeUnit.SECONDS).id());
+            } finally {
+                pool.shutdownNow();
+            }
+            nodes.awaitCatchUp();
+            assertEquals(0, amount.add(amount).compareTo(ledger.balance(client, type, "USD").balance()));
+        }
+    }
+
+    @Test
+    void deletedBankShardIsNotChosenAndDeletedClientRejectsDeposit() throws Exception {
+        try (Nodes nodes = new Nodes()) {
+            PgLedger ledger = nodes.ledger;
+            String type = id("DEL") + "A";
+            String client = id("DELC");
+            ledger.createBalanceType(new CreateBalanceType(type, "Available", null));
+            Account clientRow = ledger.createAccount(account(client, type, "USD", false, true));
+            assertEquals("CLIENT", clientRow.accountClass());
+            assertEquals(2, ledger.ensureBankPool(type, "USD", 2));
+            nodes.awaitCatchUp();
+            List<Account> before = ledger.bankShards(type, "USD");
+            assertEquals(2, before.size());
+            Account shard0 = before.get(0);
+            Account shard1 = before.get(1);
+            String aimedAtDeleted = requestForShard(2, 0);
+
+            ledger.deleteAccount(shard0.accountId(), type, "USD");
+            BigDecimal amount = new BigDecimal("7");
+            Transfer deposit = ledger.deposit(cash(aimedAtDeleted, client, type, amount));
+            assertEquals(shard1.accountId(), deposit.fromAccountId());
+            assertFalse(shard0.accountId().equals(deposit.fromAccountId()));
+            for (int i = 0; i < 7; i++) {
+                Transfer more = ledger.deposit(cash(id("MORE"), client, type, amount));
+                assertEquals(shard1.accountId(), more.fromAccountId());
+            }
+            nodes.awaitCatchUp();
+            List<Account> after = ledger.bankShards(type, "USD");
+            assertTrue(after.get(0).deleted());
+            assertFalse(after.get(1).deleted());
+            assertEquals(0, BigDecimal.ZERO.compareTo(after.get(0).balance()));
+            assertEquals(0, amount.multiply(new BigDecimal("8")).negate().compareTo(after.get(1).balance()));
+            assertEquals(shard1.accountId(), after.get(1).accountId());
+
+            LedgerViolation named = assertThrows(LedgerViolation.class,
+                    () -> ledger.post(posting(shard0.accountId(), type, client, type, "USD", "1")));
+            assertTrue(named.getMessage().contains("deleted"));
+
+            Transfer original = deposit;
+            ledger.deleteAccount(client, type, "USD");
+            Transfer replay = ledger.deposit(cash(aimedAtDeleted, client, type, amount));
+            assertEquals(original.id(), replay.id());
+            LedgerViolation rejected = assertThrows(LedgerViolation.class,
+                    () -> ledger.deposit(cash(id("NEW"), client, type, amount)));
+            assertTrue(rejected.getMessage().contains("deleted"));
+            LedgerViolation posted = assertThrows(LedgerViolation.class,
+                    () -> ledger.post(posting(shard1.accountId(), type, client, type, "USD", "1")));
+            assertTrue(posted.getMessage().contains("deleted"));
+            nodes.awaitCatchUp();
+            Account still = ledger.balance(client, type, "USD");
+            assertTrue(still.deleted());
+            assertEquals(0, amount.multiply(new BigDecimal("8")).compareTo(still.balance()));
+            assertTrue(journalHas(ledger, original.id()));
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void concurrentDepositOnOneShardWaitsAndBalances() throws Exception {
+        try (Nodes nodes = new Nodes()) {
+            PgLedger ledger = nodes.ledger;
+            String type = id("WAIT") + "A";
+            String client = id("WAITC");
+            ledger.createBalanceType(new CreateBalanceType(type, "Available", null));
+            ledger.createAccount(account(client, type, "USD", false, true));
+            assertEquals(8, ledger.ensureBankPool(type, "USD", 8));
+            String requestId = id("HOLD");
+            int shard = bankShard(requestId, 8);
+            BigDecimal amount = new BigDecimal("4");
+            DataSource writer = dataSource(WRITER_URL);
+            try (Connection hold = writer.getConnection()) {
+                hold.setAutoCommit(false);
+                try (PreparedStatement ps = hold.prepareStatement("""
+                        SELECT a.id
+                        FROM pgledger_bank_shards s
+                        JOIN pgledger_accounts a
+                          ON a.account_id = s.account_id
+                         AND a.balance_type = s.balance_type
+                         AND a.currency = s.currency
+                        WHERE s.balance_type = ? AND s.currency = ? AND s.shard = ?
+                        FOR UPDATE
+                        """)) {
+                    ps.setString(1, type);
+                    ps.setString(2, "USD");
+                    ps.setInt(3, shard);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        assertTrue(rs.next());
+                    }
+                }
+                ExecutorService pool = Executors.newSingleThreadExecutor();
+                try {
+                    Future<Transfer> posted = pool.submit(() -> ledger.deposit(cash(requestId, client, type, amount)));
+                    assertTrue(awaitLock(writer, "pgledger_post_cash"), "deposit did not wait on the bank shard");
+                    assertFalse(posted.isDone());
+                    hold.commit();
+                    Transfer transfer = posted.get(30, TimeUnit.SECONDS);
+                    assertEquals(client, transfer.toAccountId());
+                    assertEquals(shard, shardOf(transfer.metadata()));
+                } finally {
+                    pool.shutdownNow();
+                }
+            }
+
+            String[] same = requestPairOnShard(8, shard);
+            CyclicBarrier start = new CyclicBarrier(2);
+            ExecutorService pool = Executors.newFixedThreadPool(2);
+            try {
+                Future<Transfer> left = pool.submit(() -> {
+                    start.await();
+                    return ledger.deposit(cash(same[0], client, type, amount));
+                });
+                Future<Transfer> right = pool.submit(() -> {
+                    start.await();
+                    return ledger.deposit(cash(same[1], client, type, amount));
+                });
+                assertEquals(shard, shardOf(left.get(30, TimeUnit.SECONDS).metadata()));
+                assertEquals(shard, shardOf(right.get(30, TimeUnit.SECONDS).metadata()));
+            } finally {
+                pool.shutdownNow();
+            }
+            nodes.awaitCatchUp();
+            BigDecimal total = amount.multiply(new BigDecimal("3"));
+            assertEquals(0, total.compareTo(ledger.balance(client, type, "USD").balance()));
+            List<Account> shards = ledger.bankShards(type, "USD");
+            assertEquals(0, total.negate().compareTo(shards.get(shard).balance()));
+            assertEquals(1, nonzero(shards));
+            assertEquals(0, total.negate().compareTo(ledger.bankPosition(type, "USD")));
         }
     }
 
@@ -325,7 +595,15 @@ class PgLedgerTest {
         assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_balance_type")));
         assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_account")));
         assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_transfer")));
+        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_post_cash")));
+        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_delete_account")));
         assertTrue(functionStatements.stream().noneMatch(sql -> sql.contains("pgledger_post(")));
+        String lowered = functionsText(functionStatements);
+        assertFalse(lowered.contains("skip locked"));
+        assertFalse(lowered.contains("for update limit"));
+        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("account_class") && sql.contains("deleted")));
+        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("pgledger_bank_shards")));
+        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("pgledger_cash_requests")));
         for (int i = 0; i < functionStatements.size(); i++) {
             String sql = functionStatements.get(i);
             assertEquals(0, count(sql, "$$") % 2, sql);
@@ -362,7 +640,141 @@ class PgLedgerTest {
 
     private static CreateAccount account(String accountId, String balanceType, String currency,
                                          boolean allowNegative, boolean allowPositive) {
-        return new CreateAccount(accountId, balanceType, currency, accountId, allowNegative, allowPositive, null);
+        return new CreateAccount(accountId, balanceType, currency, accountId, allowNegative, allowPositive, null, null);
+    }
+
+    private static CashMovement cash(String requestId, String accountId, String balanceType, BigDecimal amount) {
+        return new CashMovement(requestId, accountId, balanceType, "USD", amount);
+    }
+
+    private static int bankShard(String requestId, int poolSize) throws SQLException {
+        try (Connection conn = dataSource(WRITER_URL).getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT pgledger_bank_shard(?, ?)")) {
+            ps.setString(1, requestId);
+            ps.setInt(2, poolSize);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    throw new IllegalStateException("shard");
+                }
+                return rs.getInt(1);
+            }
+        }
+    }
+
+    private static String[] requestPair(int poolSize, boolean sameShard) throws SQLException {
+        String first = id("PAIR");
+        int shard = bankShard(first, poolSize);
+        for (int i = 0; i < 4096; i++) {
+            String next = id("PAIR");
+            int other = bankShard(next, poolSize);
+            if (sameShard == (other == shard)) {
+                return new String[] {first, next};
+            }
+        }
+        fail("request ids");
+        return new String[0];
+    }
+
+    private static String[] requestPairOnShard(int poolSize, int shard) throws SQLException {
+        String[] ids = new String[2];
+        int found = 0;
+        for (int i = 0; i < 8192 && found < 2; i++) {
+            String requestId = id("SAME");
+            if (bankShard(requestId, poolSize) == shard) {
+                ids[found++] = requestId;
+            }
+        }
+        if (found < 2) {
+            fail("request ids");
+        }
+        return ids;
+    }
+
+    private static String requestForShard(int poolSize, int shard) throws SQLException {
+        for (int i = 0; i < 4096; i++) {
+            String requestId = id("AIM");
+            if (bankShard(requestId, poolSize) == shard) {
+                return requestId;
+            }
+        }
+        fail("request id");
+        return "";
+    }
+
+    private static int shardOf(java.util.Map<String, Object> metadata) {
+        Object value = metadata.get("bankShard");
+        assertTrue(value instanceof Number);
+        return ((Number) value).intValue();
+    }
+
+    private static int nonzero(List<Account> shards) {
+        int n = 0;
+        for (int i = 0; i < shards.size(); i++) {
+            if (shards.get(i).balance().signum() != 0) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static BigDecimal sum(List<Account> shards) {
+        BigDecimal total = BigDecimal.ZERO;
+        for (int i = 0; i < shards.size(); i++) {
+            total = total.add(shards.get(i).balance());
+        }
+        return total;
+    }
+
+    private static boolean journalHas(PgLedger ledger, String transferId) {
+        for (int page = 0; page < 40; page++) {
+            JournalPage journalPage = ledger.journals(page, 50);
+            for (int i = 0; i < journalPage.transfers().size(); i++) {
+                Transfer transfer = journalPage.transfers().get(i);
+                if (transferId.equals(transfer.id())) {
+                    return transfer.entries().size() == 2;
+                }
+            }
+            if (!journalPage.hasNext()) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static boolean awaitLock(DataSource dataSource, String querySnippet) throws Exception {
+        long start = System.nanoTime();
+        while (System.nanoTime() - start < 15_000_000_000L) {
+            if (waiting(dataSource, querySnippet)) {
+                return true;
+            }
+            Thread.sleep(20L);
+        }
+        return false;
+    }
+
+    private static boolean waiting(DataSource dataSource, String querySnippet) throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("""
+                     SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE wait_event_type = 'Lock'
+                           AND query LIKE ?
+                           AND pid <> pg_backend_pid()
+                     )
+                     """)) {
+            ps.setString(1, "%" + querySnippet + "%");
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
+    private static String functionsText(List<String> statements) {
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < statements.size(); i++) {
+            text.append(statements.get(i).toLowerCase(java.util.Locale.ROOT)).append('\n');
+        }
+        return text.toString();
     }
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
