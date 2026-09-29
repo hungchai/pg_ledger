@@ -260,7 +260,7 @@ class PgLedgerRestTest {
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
                                    String currency, String amount) {
-        return new Posting(fromAccount, fromType, toAccount, toType, currency, new BigDecimal(amount), null);
+        return new Posting(fromAccount, fromType, toAccount, toType, currency, new BigDecimal(amount), id("REQ"), null);
     }
 
     private static String id(String prefix) {

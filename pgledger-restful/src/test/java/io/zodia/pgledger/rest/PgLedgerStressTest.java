@@ -920,8 +920,12 @@ class PgLedgerStressTest {
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
                                    BigDecimal amount) {
-        return new Posting(fromAccount, fromType, toAccount, toType, USD, amount, null);
+        return new Posting(
+                fromAccount, fromType, toAccount, toType, USD, amount,
+                suffix() + Integer.toUnsignedString(REQUESTS.incrementAndGet(), 36), null);
     }
+
+    private static final AtomicInteger REQUESTS = new AtomicInteger();
 
     private static String suffix() {
         return Long.toUnsignedString(System.nanoTime(), 36);

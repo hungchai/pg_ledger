@@ -81,9 +81,22 @@ BEGIN
     END;
 
     PERFORM * FROM pgledger_create_transfer(
-        'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 100, NULL, NULL);
+        'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 100, NULL, NULL, 'smoke-xfer-1');
     PERFORM * FROM pgledger_create_transfer(
-        'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_LOCKED', 'USD', 40, NULL, NULL);
+        'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_LOCKED', 'USD', 40, NULL, NULL, 'smoke-xfer-2');
+    PERFORM * FROM pgledger_create_transfer(
+        'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 100, NULL, NULL, 'smoke-xfer-1');
+
+    BEGIN
+        PERFORM * FROM pgledger_create_transfer(
+            'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 101, NULL, NULL, 'smoke-xfer-1');
+        RAISE EXCEPTION 'expected reused request id to fail';
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF SQLERRM NOT LIKE '%request id already used%' THEN
+                RAISE;
+            END IF;
+    END;
 
     SELECT balance, version INTO available_balance, available_version
     FROM pgledger_accounts
@@ -194,9 +207,9 @@ BEGIN
         SELECT 1
         FROM pgledger_transfers t
         WHERE (t.from_account_id = ANY(smoke_ids) OR t.to_account_id = ANY(smoke_ids))
-          AND (t.biz_type IS DISTINCT FROM 'TRANSFER' OR t.request_id IS NOT NULL OR t.biz_reference IS NOT NULL)
+          AND (t.biz_type IS DISTINCT FROM 'TRANSFER' OR t.request_id IS NULL OR t.biz_reference IS NOT NULL)
     ) THEN
-        RAISE EXCEPTION 'pairwise posting must be TRANSFER with null request_id and biz_reference';
+        RAISE EXCEPTION 'pairwise posting must be TRANSFER with a request_id and a null biz_reference';
     END IF;
 
     SELECT id INTO deposit_id

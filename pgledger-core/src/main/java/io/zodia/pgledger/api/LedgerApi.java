@@ -52,7 +52,8 @@ public final class LedgerApi {
             String toBalanceType,
             String currency,
             BigDecimal amount,
-            Map<String, Object> metadata) {
+            String requestId,
+            String bizReference) {
     }
 
     public record Account(
@@ -94,9 +95,9 @@ public final class LedgerApi {
             BigDecimal amount,
             Instant createdAt,
             Instant eventAt,
-            Map<String, Object> metadata,
             String requestId,
             String bizType,
+            String bizReference,
             List<Entry> entries) {
     }
 

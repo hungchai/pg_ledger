@@ -71,7 +71,7 @@ public final class PostgresLedgerStore implements LedgerStore {
     // The function insert is its own statement. Joining pgledger_entries in that
     // same statement sees a snapshot from before the insert and returns no row.
     private static final String CREATE_TRANSFER = """
-            SELECT id FROM pgledger_create_transfer(?, ?, ?, ?, ?, ?, NULL, CAST(? AS jsonb))
+            SELECT id FROM pgledger_create_transfer(?, ?, ?, ?, ?, ?, NULL, ?, ?)
             """;
     private static final String LOAD_TRANSFER = """
             SELECT
@@ -84,7 +84,7 @@ public final class PostgresLedgerStore implements LedgerStore {
                 t.amount AS transfer_amount,
                 t.created_at AS transfer_created_at,
                 t.event_at,
-                t.metadata::text AS transfer_metadata,
+                t.biz_reference,
                 t.request_id,
                 t.biz_type,
                 e.id AS entry_id,
@@ -125,7 +125,7 @@ public final class PostgresLedgerStore implements LedgerStore {
                 t.amount AS transfer_amount,
                 t.created_at AS transfer_created_at,
                 t.event_at,
-                t.metadata::text AS transfer_metadata,
+                t.biz_reference,
                 t.request_id,
                 t.biz_type,
                 e.id AS entry_id,
@@ -251,7 +251,8 @@ public final class PostgresLedgerStore implements LedgerStore {
                 ps.setString(4, posting.toBalanceType());
                 ps.setString(5, posting.currency());
                 ps.setBigDecimal(6, posting.amount());
-                setJson(ps, 7, posting.metadata());
+                ps.setString(7, posting.bizReference());
+                ps.setString(8, posting.requestId());
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new LedgerException("pgledger_create_transfer returned no row");
@@ -624,9 +625,9 @@ public final class PostgresLedgerStore implements LedgerStore {
                 rs.getBigDecimal("transfer_amount"),
                 instant(rs, "transfer_created_at"),
                 instant(rs, "event_at"),
-                LedgerJson.map(rs.getString("transfer_metadata")),
                 rs.getString("request_id"),
                 rs.getString("biz_type"),
+                rs.getString("biz_reference"),
                 List.of());
     }
 
@@ -641,9 +642,9 @@ public final class PostgresLedgerStore implements LedgerStore {
                 transfer.amount(),
                 transfer.createdAt(),
                 transfer.eventAt(),
-                transfer.metadata(),
                 transfer.requestId(),
                 transfer.bizType(),
+                transfer.bizReference(),
                 entries);
     }
 

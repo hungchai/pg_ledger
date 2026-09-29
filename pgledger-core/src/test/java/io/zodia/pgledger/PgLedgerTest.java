@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -133,7 +134,14 @@ class PgLedgerTest {
             assertEquals(company, funded.fromAccountId());
             assertEquals(client, funded.toAccountId());
             assertEquals("TRANSFER", funded.bizType());
-            assertNull(funded.requestId());
+            assertNotNull(funded.requestId());
+            Transfer replay = ledger.post(new Posting(
+                    company, available, client, available, "USD", new BigDecimal("100"), funded.requestId(), null));
+            assertEquals(funded.id(), replay.id());
+            LedgerViolation reused = assertThrows(LedgerViolation.class,
+                    () -> ledger.post(new Posting(
+                            company, available, client, available, "USD", new BigDecimal("101"), funded.requestId(), null)));
+            assertTrue(reused.getMessage().contains("request id already used"));
             assertEquals(2, funded.entries().size());
             assertEquals(0, new BigDecimal("-100").compareTo(funded.entries().get(0).amount()));
             assertEquals(0, new BigDecimal("100").compareTo(funded.entries().get(1).amount()));
@@ -177,7 +185,7 @@ class PgLedgerTest {
 
             LedgerViolation currency = assertThrows(LedgerViolation.class,
                     () -> ledger.post(new Posting(
-                            client, available, sink, available, "EUR", BigDecimal.ONE, null)));
+                            client, available, sink, available, "EUR", BigDecimal.ONE, id("REQ"), null)));
             assertTrue(currency.getMessage().contains("Cannot transfer between different currencies"));
 
             LedgerViolation missing = assertThrows(LedgerViolation.class,
@@ -322,7 +330,7 @@ class PgLedgerTest {
             assertEquals(2, deposit.entries().size());
             assertEquals(0, amount.negate().compareTo(deposit.entries().get(0).amount()));
             assertEquals(0, amount.compareTo(deposit.entries().get(1).amount()));
-            assertEquals(shardOf(deposit.metadata()), bankShard(deposit.metadata().get("requestId").toString(), 8));
+            assertEquals(shardOf(deposit.fromAccountId()), bankShard(deposit.requestId(), 8));
 
             nodes.awaitCatchUp();
             List<Account> shards = ledger.bankShards(type, "USD");
@@ -515,7 +523,7 @@ class PgLedgerTest {
                     hold.commit();
                     Transfer transfer = posted.get(30, TimeUnit.SECONDS);
                     assertEquals(client, transfer.toAccountId());
-                    assertEquals(shard, shardOf(transfer.metadata()));
+                    assertEquals(shard, shardOf(transfer.fromAccountId()));
                 } finally {
                     pool.shutdownNow();
                 }
@@ -533,8 +541,8 @@ class PgLedgerTest {
                     start.await();
                     return ledger.deposit(cash(same[1], client, type, amount));
                 });
-                assertEquals(shard, shardOf(left.get(30, TimeUnit.SECONDS).metadata()));
-                assertEquals(shard, shardOf(right.get(30, TimeUnit.SECONDS).metadata()));
+                assertEquals(shard, shardOf(left.get(30, TimeUnit.SECONDS).fromAccountId()));
+                assertEquals(shard, shardOf(right.get(30, TimeUnit.SECONDS).fromAccountId()));
             } finally {
                 pool.shutdownNow();
             }
@@ -680,10 +688,9 @@ class PgLedgerTest {
         return "";
     }
 
-    private static int shardOf(java.util.Map<String, Object> metadata) {
-        Object value = metadata.get("bankShard");
-        assertTrue(value instanceof Number);
-        return ((Number) value).intValue();
+    private static int shardOf(String accountId) {
+        int dash = accountId.lastIndexOf('-');
+        return Integer.parseInt(accountId.substring(dash + 1));
     }
 
     private static int nonzero(List<Account> shards) {
@@ -750,7 +757,7 @@ class PgLedgerTest {
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
                                    String currency, String amount) {
-        return new Posting(fromAccount, fromType, toAccount, toType, currency, new BigDecimal(amount), null);
+        return new Posting(fromAccount, fromType, toAccount, toType, currency, new BigDecimal(amount), id("REQ"), null);
     }
 
     private static String id(String prefix) {

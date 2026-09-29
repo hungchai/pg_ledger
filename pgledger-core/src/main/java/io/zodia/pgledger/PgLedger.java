@@ -168,10 +168,14 @@ public final class PgLedger implements AutoCloseable {
                 || blank(posting.currency())) {
             throw new LedgerViolation("account_id, balance_type, and currency are required");
         }
+        if (blank(posting.requestId())) {
+            throw new LedgerViolation("request_id is required");
+        }
         BigDecimal amount = posting.amount();
         if (amount == null || amount.signum() <= 0) {
             throw new LedgerViolation("Amount (" + (amount == null ? "null" : amount.toPlainString()) + ") must be positive");
         }
+        String bizReference = posting.bizReference();
         return writer.post(new Posting(
                 posting.fromAccountId().strip(),
                 posting.fromBalanceType().strip(),
@@ -179,7 +183,8 @@ public final class PgLedger implements AutoCloseable {
                 posting.toBalanceType().strip(),
                 posting.currency().strip(),
                 amount,
-                posting.metadata()));
+                posting.requestId().strip(),
+                bizReference == null || bizReference.isBlank() ? null : bizReference.strip()));
     }
 
     public List<Account> balances(String accountId) {

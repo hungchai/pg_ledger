@@ -189,6 +189,15 @@ DECLARE
     v_request_id TEXT;
     v_biz_type TEXT;
     v_biz_reference TEXT;
+    v_existing_id TEXT;
+    v_existing_amount NUMERIC;
+    v_existing_biz TEXT;
+    v_from_account TEXT;
+    v_to_account TEXT;
+    v_from_type TEXT;
+    v_to_type TEXT;
+    v_from_currency TEXT;
+    v_to_currency TEXT;
 BEGIN
     IF p_transfer_requests IS NULL THEN
         RETURN;
@@ -202,6 +211,37 @@ BEGIN
     v_request_id := NULLIF(btrim(p_request_id), '');
     IF v_request_id IS NOT NULL AND COALESCE(array_length(p_transfer_requests, 1), 0) <> 1 THEN
         RAISE EXCEPTION 'request_id applies to one transfer';
+    END IF;
+
+    -- One request_id is one transfer. A repeat returns that row and does not post again.
+    IF v_request_id IS NOT NULL THEN
+        PERFORM pg_advisory_xact_lock(hashtextextended(v_request_id, 0));
+        req := p_transfer_requests[1];
+        SELECT t.id, t.amount, t.biz_type,
+               fa.account_id, fa.balance_type, fa.currency,
+               ta.account_id, ta.balance_type, ta.currency
+        INTO v_existing_id, v_existing_amount, v_existing_biz,
+             v_from_account, v_from_type, v_from_currency,
+             v_to_account, v_to_type, v_to_currency
+        FROM pgledger_transfers t
+        JOIN pgledger_accounts fa ON fa.id = t.from_account_id
+        JOIN pgledger_accounts ta ON ta.id = t.to_account_id
+        WHERE t.request_id = v_request_id;
+        IF FOUND THEN
+            IF v_existing_amount IS DISTINCT FROM req.amount
+                OR v_existing_biz IS DISTINCT FROM v_biz_type
+                OR v_from_account IS DISTINCT FROM btrim(req.from_account_id)
+                OR v_from_type IS DISTINCT FROM btrim(req.from_balance_type)
+                OR v_from_currency IS DISTINCT FROM btrim(req.currency)
+                OR v_to_account IS DISTINCT FROM btrim(req.to_account_id)
+                OR v_to_type IS DISTINCT FROM btrim(req.to_balance_type)
+                OR v_to_currency IS DISTINCT FROM btrim(req.currency) THEN
+                RAISE EXCEPTION 'request id already used';
+            END IF;
+            RETURN QUERY
+            SELECT * FROM pgledger_transfers_view WHERE id = v_existing_id;
+            RETURN;
+        END IF;
     END IF;
 
     FOREACH req IN ARRAY p_transfer_requests LOOP
@@ -341,6 +381,9 @@ CREATE OR REPLACE FUNCTION pgledger_create_transfer(
 RETURNS SETOF pgledger_transfers_view
 AS $$
 BEGIN
+    IF NULLIF(btrim(p_request_id), '') IS NULL THEN
+        RAISE EXCEPTION 'request_id is required';
+    END IF;
     RETURN QUERY
     SELECT * FROM pgledger_create_transfers(
         p_transfer_requests => ARRAY[(
