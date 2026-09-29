@@ -298,10 +298,6 @@ public final class RegistryCache implements AutoCloseable {
             return new Snapshot(accountClasses, List.copyOf(rows), bizTypes, currencies);
         }
 
-        private List<BalanceType> balanceTypes() {
-            return balanceTypes;
-        }
-
         private BalanceType balanceTypeByCode(String code) {
             for (int i = 0; i < balanceTypes.size(); i++) {
                 if (code.equals(balanceTypes.get(i).code())) {
