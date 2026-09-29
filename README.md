@@ -40,7 +40,7 @@ One balance row is `(account_id, balance_type, currency)`. `pgledger_transfers` 
 
 `account_class` is `CLIENT`, `COMPANY`, `BANK`, `NOSTRO`, `SUSPENSE`, or `CONTROL`. Existing rows default to `CLIENT`. `deleted` is a soft delete (`false` by default). A deleted row stays in the journal. New transfers skip it.
 
-A deposit is one `pgledger_transfers` row from a BANK account to the client, with `biz_type` `DEPOSIT`. A withdrawal is the reverse, with `biz_type` `WITHDRAWAL`. A pairwise posting sets `biz_type` `TRANSFER`. The business type is stored on the transfer and is not inferred from which side is the bank. Shard account ids are `BANK-{currency}-{balanceType}-{n}` for `n` in `0 .. poolSize-1` (default 8, `PGLEDGER_BANK_POOL_SIZE`). The shard is `hash(requestId) % poolSize`. That account and the client are locked in sorted internal id order. `request_id` is the unique idempotency key on `pgledger_transfers`. Every `pgledger_create_transfer` call requires one. The same `request_id` returns the original transfer and does not post again. `biz_reference` is the caller's business reference and is not unique. BANK shards may be negative. The bank position is the sum of the BANK rows for that balance type and currency. Soft-delete is `POST /api/v1/accounts/delete`.
+A deposit is one `pgledger_transfers` row from a BANK account to the client, with `biz_type` `DEPOSIT`. A withdrawal is the reverse, with `biz_type` `WITHDRAWAL`. A pairwise posting sets `biz_type` `TRANSFER`. The business type is stored on the transfer and is not inferred from which side is the bank. Shard account ids are `BANK-{currency}-{balanceType}-{n}` for `n` in `0 .. poolSize-1` (default 8, `PGLEDGER_BANK_POOL_SIZE`). The shard is `hash(requestId) % poolSize`. That account and the client are locked in sorted internal id order. `request_id` is a `VARCHAR` idempotency key on `pgledger_transfers`. One call stores that same value on every leg. A repeat returns those rows and does not post again. `biz_reference` is the caller's business reference and is not unique. BANK shards may be negative. The bank position is the sum of the BANK rows for that balance type and currency. Soft-delete is `POST /api/v1/accounts/delete`.
 
 Run the statements below on the **writer**. Repeat creates fail if that balance type or account row already exists.
 
@@ -114,10 +114,13 @@ SELECT * FROM pgledger_create_transfer(
 One call, two fills against the same LP. The first leg holds client 1 funds on `LOCKED`. The second leg pays the LP from client 2.
 
 ```sql
-SELECT * FROM pgledger_create_transfers(ARRAY[
-    ('CLIENT_ACC_001', 'AVAILABLE', 'CLIENT_ACC_001', 'LOCKED', 'USD', 40),
-    ('CLIENT_ACC_002', 'AVAILABLE', 'LP_DESK', 'AVAILABLE', 'USD', 25)
-]::transfer_request[]);
+SELECT * FROM pgledger_create_transfers(
+    p_transfer_requests => ARRAY[
+        ('CLIENT_ACC_001', 'AVAILABLE', 'CLIENT_ACC_001', 'LOCKED', 'USD', 40),
+        ('CLIENT_ACC_002', 'AVAILABLE', 'LP_DESK', 'AVAILABLE', 'USD', 25)
+    ]::transfer_request[],
+    p_request_id => 'rfq-1'
+);
 ```
 
 ## Get balance

@@ -189,7 +189,6 @@ DECLARE
     v_request_id TEXT;
     v_biz_type TEXT;
     v_biz_reference TEXT;
-    v_existing_id TEXT;
     v_existing_amount NUMERIC;
     v_existing_biz TEXT;
     v_from_account TEXT;
@@ -198,6 +197,9 @@ DECLARE
     v_to_type TEXT;
     v_from_currency TEXT;
     v_to_currency TEXT;
+    v_existing_ids TEXT[];
+    v_count INT;
+    v_ord INT;
 BEGIN
     IF p_transfer_requests IS NULL THEN
         RETURN;
@@ -209,25 +211,36 @@ BEGIN
         RAISE EXCEPTION 'biz_type must be TRANSFER, DEPOSIT, or WITHDRAWAL';
     END IF;
     v_request_id := NULLIF(btrim(p_request_id), '');
-    IF v_request_id IS NOT NULL AND COALESCE(array_length(p_transfer_requests, 1), 0) <> 1 THEN
-        RAISE EXCEPTION 'request_id applies to one transfer';
+    IF v_request_id IS NULL THEN
+        RAISE EXCEPTION 'request_id is required';
+    END IF;
+    IF COALESCE(array_length(p_transfer_requests, 1), 0) < 1 THEN
+        RETURN;
     END IF;
 
-    -- One request_id is one transfer. A repeat returns that row and does not post again.
-    IF v_request_id IS NOT NULL THEN
-        PERFORM pg_advisory_xact_lock(hashtextextended(v_request_id, 0));
-        req := p_transfer_requests[1];
-        SELECT t.id, t.amount, t.biz_type,
-               fa.account_id, fa.balance_type, fa.currency,
-               ta.account_id, ta.balance_type, ta.currency
-        INTO v_existing_id, v_existing_amount, v_existing_biz,
-             v_from_account, v_from_type, v_from_currency,
-             v_to_account, v_to_type, v_to_currency
-        FROM pgledger_transfers t
-        JOIN pgledger_accounts fa ON fa.id = t.from_account_id
-        JOIN pgledger_accounts ta ON ta.id = t.to_account_id
-        WHERE t.request_id = v_request_id;
-        IF FOUND THEN
+    -- Every leg of this call stores the same request_id. A repeat returns those rows.
+    PERFORM pg_advisory_xact_lock(hashtextextended(v_request_id, 0));
+    SELECT COALESCE(array_agg(id ORDER BY id), ARRAY[]::TEXT[])
+    INTO v_existing_ids
+    FROM pgledger_transfers
+    WHERE request_id = v_request_id;
+    v_count := COALESCE(array_length(v_existing_ids, 1), 0);
+    IF v_count > 0 THEN
+        IF v_count <> array_length(p_transfer_requests, 1) THEN
+            RAISE EXCEPTION 'request id already used';
+        END IF;
+        FOR v_ord IN 1 .. v_count LOOP
+            req := p_transfer_requests[v_ord];
+            SELECT t.amount, t.biz_type,
+                   fa.account_id, fa.balance_type, fa.currency,
+                   ta.account_id, ta.balance_type, ta.currency
+            INTO v_existing_amount, v_existing_biz,
+                 v_from_account, v_from_type, v_from_currency,
+                 v_to_account, v_to_type, v_to_currency
+            FROM pgledger_transfers t
+            JOIN pgledger_accounts fa ON fa.id = t.from_account_id
+            JOIN pgledger_accounts ta ON ta.id = t.to_account_id
+            WHERE t.id = v_existing_ids[v_ord];
             IF v_existing_amount IS DISTINCT FROM req.amount
                 OR v_existing_biz IS DISTINCT FROM v_biz_type
                 OR v_from_account IS DISTINCT FROM btrim(req.from_account_id)
@@ -238,10 +251,12 @@ BEGIN
                 OR v_to_currency IS DISTINCT FROM btrim(req.currency) THEN
                 RAISE EXCEPTION 'request id already used';
             END IF;
-            RETURN QUERY
-            SELECT * FROM pgledger_transfers_view WHERE id = v_existing_id;
-            RETURN;
-        END IF;
+        END LOOP;
+        RETURN QUERY
+        SELECT * FROM pgledger_transfers_view
+        WHERE id = ANY(v_existing_ids)
+        ORDER BY id;
+        RETURN;
     END IF;
 
     FOREACH req IN ARRAY p_transfer_requests LOOP
@@ -402,12 +417,18 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION pgledger_create_transfers(VARIADIC transfer_requests transfer_request[])
+CREATE OR REPLACE FUNCTION pgledger_create_transfers(
+    p_request_id TEXT,
+    VARIADIC transfer_requests transfer_request[]
+)
 RETURNS SETOF pgledger_transfers_view
 AS $$
 BEGIN
     RETURN QUERY
-    SELECT * FROM pgledger_create_transfers(p_transfer_requests => transfer_requests);
+    SELECT * FROM pgledger_create_transfers(
+        p_transfer_requests => transfer_requests,
+        p_request_id => p_request_id
+    );
 END;
 $$ LANGUAGE plpgsql;
 

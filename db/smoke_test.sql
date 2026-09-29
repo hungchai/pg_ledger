@@ -121,7 +121,7 @@ BEGIN
 
     BEGIN
         PERFORM * FROM pgledger_create_transfer(
-            'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'USD', 100, NULL, NULL);
+            'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'USD', 100, NULL, NULL, 'smoke-neg');
         RAISE EXCEPTION 'expected negative balance to fail';
     EXCEPTION
         WHEN OTHERS THEN
@@ -139,7 +139,7 @@ BEGIN
 
     BEGIN
         PERFORM * FROM pgledger_create_transfer(
-            'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'EUR', 1, NULL, NULL);
+            'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'EUR', 1, NULL, NULL, 'smoke-fx');
         RAISE EXCEPTION 'expected currency mismatch to fail';
     EXCEPTION
         WHEN OTHERS THEN
@@ -150,7 +150,7 @@ BEGIN
 
     BEGIN
         PERFORM * FROM pgledger_create_transfer(
-            'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 1, NULL, NULL);
+            'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 1, NULL, NULL, 'smoke-same');
         RAISE EXCEPTION 'expected same-row transfer to fail';
     EXCEPTION
         WHEN OTHERS THEN
@@ -211,6 +211,52 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'pairwise posting must be TRANSFER with a request_id and a null biz_reference';
     END IF;
+
+    PERFORM * FROM pgledger_create_transfers(
+        ARRAY[
+            ('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_LOCKED', 'USD', 5),
+            ('SMOKE_CLIENT', 'SMOKE_LOCKED', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 5)
+        ]::transfer_request[],
+        NULL, NULL, 'smoke-batch-1'
+    );
+    PERFORM * FROM pgledger_create_transfers(
+        ARRAY[
+            ('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_LOCKED', 'USD', 5),
+            ('SMOKE_CLIENT', 'SMOKE_LOCKED', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 5)
+        ]::transfer_request[],
+        NULL, NULL, 'smoke-batch-1'
+    );
+    SELECT count(*) INTO transfer_count
+    FROM pgledger_transfers
+    WHERE request_id = 'smoke-batch-1';
+    IF transfer_count <> 2 THEN
+        RAISE EXCEPTION 'batch request_id rows %, expected 2', transfer_count;
+    END IF;
+    SELECT balance INTO available_balance
+    FROM pgledger_accounts
+    WHERE account_id = 'SMOKE_CLIENT' AND balance_type = 'SMOKE_AVAILABLE' AND currency = 'USD';
+    SELECT balance INTO locked_balance
+    FROM pgledger_accounts
+    WHERE account_id = 'SMOKE_CLIENT' AND balance_type = 'SMOKE_LOCKED' AND currency = 'USD';
+    IF available_balance <> 60 OR locked_balance <> 40 THEN
+        RAISE EXCEPTION 'batch replay changed balances available=% locked=%', available_balance, locked_balance;
+    END IF;
+
+    BEGIN
+        PERFORM * FROM pgledger_create_transfers(
+            ARRAY[
+                ('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_LOCKED', 'USD', 5),
+                ('SMOKE_CLIENT', 'SMOKE_LOCKED', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 6)
+            ]::transfer_request[],
+            NULL, NULL, 'smoke-batch-1'
+        );
+        RAISE EXCEPTION 'expected reused batch request id to fail';
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF SQLERRM NOT LIKE '%request id already used%' THEN
+                RAISE;
+            END IF;
+    END;
 
     SELECT id INTO deposit_id
     FROM pgledger_post_cash(

@@ -132,16 +132,16 @@ CREATE TABLE IF NOT EXISTS pgledger_transfers (
     amount NUMERIC NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     event_at TIMESTAMPTZ NOT NULL,
-    request_id TEXT,
+    request_id VARCHAR,
     biz_type TEXT NOT NULL,
     biz_reference TEXT,
     CHECK (amount > 0 AND from_account_id != to_account_id),
     CONSTRAINT pgledger_transfers_biz_type_chk CHECK (
         biz_type IN ('TRANSFER', 'DEPOSIT', 'WITHDRAWAL')
-    ),
-    CONSTRAINT pgledger_transfers_request_id_key UNIQUE (request_id)
+    )
 );
 
+CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_idx ON pgledger_transfers (request_id);
 CREATE INDEX IF NOT EXISTS pgledger_transfers_from_account_id_idx ON pgledger_transfers (from_account_id);
 CREATE INDEX IF NOT EXISTS pgledger_transfers_to_account_id_idx ON pgledger_transfers (to_account_id);
 CREATE INDEX IF NOT EXISTS pgledger_transfers_event_at_idx ON pgledger_transfers (event_at);
