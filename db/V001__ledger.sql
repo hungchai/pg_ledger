@@ -113,7 +113,12 @@ CREATE TABLE IF NOT EXISTS pgledger_accounts (
     metadata JSONB,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
-    UNIQUE (account_id, balance_type, currency)
+    account_class TEXT NOT NULL DEFAULT 'CLIENT',
+    deleted BOOLEAN NOT NULL DEFAULT false,
+    UNIQUE (account_id, balance_type, currency),
+    CONSTRAINT pgledger_accounts_account_class_chk CHECK (
+        account_class IN ('CLIENT', 'COMPANY', 'BANK', 'NOSTRO', 'SUSPENSE', 'CONTROL')
+    )
 );
 
 CREATE INDEX IF NOT EXISTS pgledger_accounts_account_id_idx ON pgledger_accounts (account_id);
@@ -148,6 +153,59 @@ CREATE TABLE IF NOT EXISTS pgledger_entries (
 CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries (account_id);
 CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries (transfer_id);
 
+-- Existing databases already have pgledger_accounts. New columns append, matching CREATE TABLE order.
+ALTER TABLE pgledger_accounts ADD COLUMN IF NOT EXISTS account_class TEXT NOT NULL DEFAULT 'CLIENT';
+ALTER TABLE pgledger_accounts ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false;
+
+DO $class$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'pgledger_accounts_account_class_chk'
+    ) THEN
+        ALTER TABLE pgledger_accounts
+            ADD CONSTRAINT pgledger_accounts_account_class_chk
+            CHECK (account_class IN ('CLIENT', 'COMPANY', 'BANK', 'NOSTRO', 'SUSPENSE', 'CONTROL'));
+    END IF;
+END
+$class$;
+
+-- One pool per (balance_type, currency). Shard rows are BANK accounts. Soft-deleted
+-- shards stay here so old transfers still resolve. The picker ignores them.
+CREATE TABLE IF NOT EXISTS pgledger_bank_pools (
+    currency TEXT NOT NULL,
+    balance_type TEXT NOT NULL REFERENCES pgledger_balance_types (code),
+    pool_size INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (currency, balance_type),
+    CHECK (pool_size >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS pgledger_bank_shards (
+    currency TEXT NOT NULL,
+    balance_type TEXT NOT NULL,
+    shard INT NOT NULL,
+    account_id TEXT NOT NULL,
+    PRIMARY KEY (currency, balance_type, shard),
+    CHECK (shard >= 0),
+    UNIQUE (account_id, balance_type, currency),
+    FOREIGN KEY (account_id, balance_type, currency)
+        REFERENCES pgledger_accounts (account_id, balance_type, currency)
+);
+
+CREATE TABLE IF NOT EXISTS pgledger_cash_requests (
+    request_id TEXT PRIMARY KEY,
+    transfer_id TEXT NOT NULL REFERENCES pgledger_transfers (id),
+    direction TEXT NOT NULL,
+    client_account_id TEXT NOT NULL,
+    balance_type TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    amount NUMERIC NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    CHECK (direction IN ('DEPOSIT', 'WITHDRAWAL')),
+    CHECK (amount > 0)
+);
+
 CREATE OR REPLACE VIEW pgledger_balance_types_view AS
 SELECT
     code,
@@ -170,7 +228,9 @@ SELECT
     allow_positive_balance,
     metadata,
     created_at,
-    updated_at
+    updated_at,
+    account_class,
+    deleted
 FROM pgledger_accounts;
 
 CREATE OR REPLACE VIEW pgledger_transfers_view AS

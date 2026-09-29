@@ -2,6 +2,7 @@ package io.zodia.pgledger.rest;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
+import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
@@ -151,6 +152,41 @@ class PgLedgerRestTest {
     }
 
     @Test
+    void depositReplayAndDeletedClient() throws Exception {
+        try (Nodes nodes = new Nodes();
+             PgLedgerClient http = client(port)) {
+            String prefix = id("CASH");
+            String type = prefix + "A";
+            String clientId = prefix + "C";
+            http.createBalanceType(new CreateBalanceType(type, "Available", null));
+            assertEquals(PgLedgerServer.WRITER, http.role());
+            http.createAccount(account(clientId, type, "USD", false, true));
+            BigDecimal amount = new BigDecimal("12");
+            Transfer first = http.deposit(new CashMovement(prefix + "R1", clientId, type, "USD", amount));
+            assertEquals(200, http.status());
+            assertEquals(PgLedgerServer.WRITER, http.role());
+            assertEquals(clientId, first.toAccountId());
+            assertTrue(first.fromAccountId().startsWith("bankpool." + type + ".USD."));
+            Transfer again = http.deposit(new CashMovement(prefix + "R1", clientId, type, "USD", amount));
+            assertEquals(first.id(), again.id());
+            nodes.awaitCatchUp();
+            assertEquals(0, amount.compareTo(http.balance(clientId, type, "USD").balance()));
+
+            Account deleted = http.deleteAccount(clientId, type, "USD");
+            assertTrue(deleted.deleted());
+            assertEquals(PgLedgerServer.WRITER, http.role());
+            PgLedgerClientException rejected = assertThrows(PgLedgerClientException.class,
+                    () -> http.deposit(new CashMovement(prefix + "R2", clientId, type, "USD", BigDecimal.ONE)));
+            assertEquals(422, rejected.status());
+            assertTrue(rejected.getMessage().contains("deleted"));
+            nodes.awaitCatchUp();
+            Account still = http.balance(clientId, type, "USD");
+            assertTrue(still.deleted());
+            assertEquals(0, amount.compareTo(still.balance()));
+        }
+    }
+
+    @Test
     void badRequestsAndRemovedRoutes() throws Exception {
         try (HttpClient http = HttpClient.newBuilder()
                     .version(HttpClient.Version.HTTP_1_1)
@@ -217,7 +253,7 @@ class PgLedgerRestTest {
 
     private static CreateAccount account(String accountId, String balanceType, String currency,
                                          boolean allowNegative, boolean allowPositive) {
-        return new CreateAccount(accountId, balanceType, currency, accountId, allowNegative, allowPositive, null);
+        return new CreateAccount(accountId, balanceType, currency, accountId, allowNegative, allowPositive, null, null);
     }
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,

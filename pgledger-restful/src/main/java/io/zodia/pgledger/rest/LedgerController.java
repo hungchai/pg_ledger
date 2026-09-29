@@ -2,8 +2,10 @@ package io.zodia.pgledger.rest;
 
 import io.zodia.pgledger.PgLedger;
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
+import io.zodia.pgledger.api.LedgerApi.DeleteAccount;
 import io.zodia.pgledger.api.LedgerApi.Posting;
 import io.zodia.pgledger.store.LedgerJson;
 import org.springframework.http.ResponseEntity;
@@ -58,6 +60,27 @@ final class LedgerController {
         Posting posting = read(body, Posting.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.post(posting))));
+    }
+
+    @PostMapping("/api/v1/deposits")
+    ResponseEntity<byte[]> deposit(@RequestBody(required = false) byte[] body) {
+        CashMovement movement = read(body, CashMovement.class);
+        return HttpResponses.of(200, PgLedgerServer.WRITER,
+                LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.deposit(movement))));
+    }
+
+    @PostMapping("/api/v1/withdrawals")
+    ResponseEntity<byte[]> withdraw(@RequestBody(required = false) byte[] body) {
+        CashMovement movement = read(body, CashMovement.class);
+        return HttpResponses.of(200, PgLedgerServer.WRITER,
+                LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.withdraw(movement))));
+    }
+
+    @PostMapping("/api/v1/accounts/delete")
+    ResponseEntity<byte[]> deleteAccount(@RequestBody(required = false) byte[] body) {
+        DeleteAccount command = read(body, DeleteAccount.class);
+        return HttpResponses.of(200, PgLedgerServer.WRITER, LedgerJson.writeBytes(WriteRoutes.onWriter(
+                () -> ledger.deleteAccount(command.accountId(), command.balanceType(), command.currency()))));
     }
 
     @GetMapping("/api/v1/balances")

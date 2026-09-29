@@ -7,5 +7,6 @@ public record PgLedgerProperties(
         String writerJdbcUrl,
         String readerJdbcUrl,
         String jdbcUser,
-        String jdbcPassword) {
+        String jdbcPassword,
+        Integer bankPoolSize) {
 }

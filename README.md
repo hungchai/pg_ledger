@@ -26,11 +26,21 @@ curl -s -X POST http://localhost:8080/api/v1/accounts \
 curl -s -X POST http://localhost:8080/api/v1/postings \
   -H 'Content-Type: application/json' \
   -d '{"fromAccountId":"LP_DESK","fromBalanceType":"AVAILABLE","toAccountId":"CLIENT_ACC_001","toBalanceType":"AVAILABLE","currency":"USD","amount":100}'
+curl -s -X POST http://localhost:8080/api/v1/deposits \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"dep-1","accountId":"CLIENT_ACC_001","balanceType":"AVAILABLE","currency":"USD","amount":100}'
+curl -s -X POST http://localhost:8080/api/v1/withdrawals \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"wd-1","accountId":"CLIENT_ACC_001","balanceType":"AVAILABLE","currency":"USD","amount":40}'
 curl -s 'http://localhost:8080/api/v1/balances?accountId=CLIENT_ACC_001&balanceType=AVAILABLE&currency=USD'
 curl -s 'http://localhost:8080/api/v1/journals?page=0&size=50'
 ```
 
 One balance row is `(account_id, balance_type, currency)`. `pgledger_transfers` is the journal. `pgledger_entries` is the journal line. A transfer always has two entries. `pgledger_create_transfers` locks every balance row in sorted internal id order inside one database call, so several RFQ legs commit or roll back together.
+
+`account_class` is `CLIENT`, `COMPANY`, `BANK`, `NOSTRO`, `SUSPENSE`, or `CONTROL`. Existing rows default to `CLIENT`. `deleted` is a soft delete (`false` by default). A deleted row stays in the journal. New transfers and the bank-pool picker skip it.
+
+A deposit is one transfer from a BANK shard to the client. A withdrawal is the reverse. Shards are a pool per balance type and currency (default 8, `PGLEDGER_BANK_POOL_SIZE`). The shard is `hash(requestId)` among shards that are not deleted, then that row and the client are locked in sorted id order. The same `requestId` returns the original transfer. BANK shards may be negative. The bank position is the sum of the pool. Soft-delete is `POST /api/v1/accounts/delete`.
 
 Run the statements below on the **writer**. Repeat creates fail if that balance type or account row already exists.
 

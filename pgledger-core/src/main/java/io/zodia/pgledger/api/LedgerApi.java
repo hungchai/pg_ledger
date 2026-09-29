@@ -30,7 +30,19 @@ public final class LedgerApi {
             String name,
             Boolean allowNegativeBalance,
             Boolean allowPositiveBalance,
-            Map<String, Object> metadata) {
+            Map<String, Object> metadata,
+            String accountClass) {
+    }
+
+    public record DeleteAccount(String accountId, String balanceType, String currency) {
+    }
+
+    public record CashMovement(
+            String requestId,
+            String accountId,
+            String balanceType,
+            String currency,
+            BigDecimal amount) {
     }
 
     public record Posting(
@@ -55,7 +67,9 @@ public final class LedgerApi {
             boolean allowPositiveBalance,
             Map<String, Object> metadata,
             Instant createdAt,
-            Instant updatedAt) {
+            Instant updatedAt,
+            String accountClass,
+            boolean deleted) {
     }
 
     public record Entry(
