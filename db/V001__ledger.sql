@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS pgledger_transfers (
     amount NUMERIC NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     event_at TIMESTAMPTZ NOT NULL,
-    request_id VARCHAR,
+    request_id TEXT,
     biz_type TEXT NOT NULL,
     biz_reference TEXT,
     CHECK (amount > 0 AND from_account_id != to_account_id),
