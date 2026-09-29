@@ -11,7 +11,7 @@ server:
 
 spring:
   main:
-    banner-mode: off
+    banner-mode: console
   threads:
     virtual:
       enabled: true
