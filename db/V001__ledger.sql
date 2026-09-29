@@ -153,22 +153,6 @@ CREATE TABLE IF NOT EXISTS pgledger_entries (
 CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries (account_id);
 CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries (transfer_id);
 
--- Existing databases already have pgledger_accounts. New columns append, matching CREATE TABLE order.
-ALTER TABLE pgledger_accounts ADD COLUMN IF NOT EXISTS account_class TEXT NOT NULL DEFAULT 'CLIENT';
-ALTER TABLE pgledger_accounts ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false;
-
-DO $class$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'pgledger_accounts_account_class_chk'
-    ) THEN
-        ALTER TABLE pgledger_accounts
-            ADD CONSTRAINT pgledger_accounts_account_class_chk
-            CHECK (account_class IN ('CLIENT', 'COMPANY', 'BANK', 'NOSTRO', 'SUSPENSE', 'CONTROL'));
-    END IF;
-END
-$class$;
-
 -- One pool per (balance_type, currency). Shard rows are BANK accounts. Soft-deleted
 -- shards stay here so old transfers still resolve. The picker ignores them.
 CREATE TABLE IF NOT EXISTS pgledger_bank_pools (
