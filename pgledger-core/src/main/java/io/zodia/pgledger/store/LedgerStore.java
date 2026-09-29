@@ -20,7 +20,7 @@ public interface LedgerStore extends AutoCloseable {
 
     Transfer post(Posting posting);
 
-    int ensureBankPool(String balanceType, String currency, int poolSize, boolean keepExisting);
+    int ensureBankPool(String balanceTypeCode, int balanceTypeId, String currency, int poolSize, boolean keepExisting);
 
     Account deleteAccount(String accountId, String balanceType, String currency);
 

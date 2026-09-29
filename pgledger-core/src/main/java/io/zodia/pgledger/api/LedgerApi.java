@@ -16,6 +16,7 @@ public final class LedgerApi {
     }
 
     public record BalanceType(
+            int id,
             String code,
             String name,
             String description,
@@ -89,7 +90,7 @@ public final class LedgerApi {
     public record Entry(
             String id,
             String accountId,
-            String balanceType,
+            int balanceType,
             String currency,
             BigDecimal amount,
             BigDecimal previousBalance,
@@ -101,9 +102,9 @@ public final class LedgerApi {
     public record Transfer(
             String id,
             String fromAccountId,
-            String fromBalanceType,
+            int fromBalanceType,
             String toAccountId,
-            String toBalanceType,
+            int toBalanceType,
             String currency,
             BigDecimal amount,
             Instant createdAt,

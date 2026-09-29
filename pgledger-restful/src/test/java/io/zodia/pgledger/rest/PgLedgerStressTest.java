@@ -71,19 +71,22 @@ class PgLedgerStressTest {
     private static final long MAX_LAG_MS = Long.getLong("pgledger.stress.maxLagMs", 15_000L);
     private static final int POSTS = Integer.getInteger("pgledger.stress.posts", 20);
     private static final String SUM_BROKEN = """
-            SELECT currency, sum(balance) AS balance
-            FROM pgledger_accounts
-            GROUP BY currency
-            HAVING sum(balance) <> 0
+            SELECT c.code AS currency, sum(a.balance) AS balance
+            FROM pgledger_accounts a
+            JOIN pgledger_currencies c ON c.id = a.currency_id
+            GROUP BY c.code
+            HAVING sum(a.balance) <> 0
             """;
     private static final String ROW_BROKEN = """
-            SELECT a.account_id, a.balance_type, a.currency, a.balance, a.version,
+            SELECT a.account_id, bt.code AS balance_type, c.code AS currency, a.balance, a.version,
                    count(e.id) AS entries,
                    coalesce(max(e.account_version), 0) AS max_version,
                    coalesce(sum(e.amount), 0) AS moved
             FROM pgledger_accounts a
+            JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+            JOIN pgledger_currencies c ON c.id = a.currency_id
             LEFT JOIN pgledger_entries e ON e.account_id = a.id
-            GROUP BY a.id
+            GROUP BY a.id, bt.code, c.code
             HAVING a.version <> count(e.id)
                 OR a.version <> coalesce(max(e.account_version), 0)
                 OR a.balance <> coalesce(sum(e.amount), 0)
@@ -96,9 +99,11 @@ class PgLedgerStressTest {
             HAVING count(e.id) <> 2 OR coalesce(sum(e.amount), 0) <> 0
             """;
     private static final String NEGATIVE = """
-            SELECT account_id, balance_type, currency, balance
-            FROM pgledger_accounts
-            WHERE NOT allow_negative_balance AND balance < 0
+            SELECT a.account_id, bt.code AS balance_type, c.code AS currency, a.balance
+            FROM pgledger_accounts a
+            JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+            JOIN pgledger_currencies c ON c.id = a.currency_id
+            WHERE NOT a.allow_negative_balance AND a.balance < 0
             """;
     private static final String ENTRY_CHAIN = """
             SELECT id, account_previous_balance, amount, account_current_balance, account_version
@@ -496,13 +501,15 @@ class PgLedgerStressTest {
         assertNoRows(writer, """
                 SELECT s.account_id, s.balance AS source_balance, d.balance AS dest_balance
                 FROM pgledger_accounts s
+                JOIN pgledger_balance_types sbt ON sbt.id = s.balance_type_id
+                JOIN pgledger_currencies sc ON sc.id = s.currency_id
                 JOIN pgledger_accounts d
                   ON d.account_id = regexp_replace(s.account_id, '_S([0-9]+)$', '_D\\1')
-                 AND d.balance_type = s.balance_type
-                 AND d.currency = s.currency
+                 AND d.balance_type_id = s.balance_type_id
+                 AND d.currency_id = s.currency_id
                 WHERE s.account_id LIKE '%s'
-                  AND s.balance_type = '%s'
-                  AND s.currency = '%s'
+                  AND sbt.code = '%s'
+                  AND sc.code = '%s'
                   AND (s.balance + d.balance <> %d %s)
                 """.formatted(prefix + "S%", AVAILABLE, USD, posts, balanceCheck), "pair conservation " + prefix);
     }
@@ -804,8 +811,11 @@ class PgLedgerStressTest {
     private static BigDecimal writerBalance(String accountId, String balanceType) throws SQLException {
         try (Connection conn = writer.getConnection();
              PreparedStatement ps = conn.prepareStatement("""
-                     SELECT balance FROM pgledger_accounts
-                     WHERE account_id = ? AND balance_type = ? AND currency = ?
+                     SELECT a.balance
+                     FROM pgledger_accounts a
+                     JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+                     JOIN pgledger_currencies c ON c.id = a.currency_id
+                     WHERE a.account_id = ? AND bt.code = ? AND c.code = ?
                      """)) {
             ps.setString(1, accountId);
             ps.setString(2, balanceType);

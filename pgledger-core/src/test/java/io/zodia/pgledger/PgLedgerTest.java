@@ -124,8 +124,8 @@ class PgLedgerTest {
             String locked = prefix + "L";
             String client = prefix + "C";
             String company = prefix + "CO";
-            ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
-            ledger.createBalanceType(new CreateBalanceType(locked, "Locked", null));
+            BalanceType availableType = ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
+            BalanceType lockedType = ledger.createBalanceType(new CreateBalanceType(locked, "Locked", null));
             ledger.createAccount(account(client, available, "USD", false, true));
             ledger.createAccount(account(client, locked, "USD", false, true));
             ledger.createAccount(account(company, available, "USD", true, true));
@@ -149,8 +149,8 @@ class PgLedgerTest {
             assertEquals(1L, funded.entries().get(1).version());
 
             Transfer held = ledger.post(posting(client, available, client, locked, "USD", "40"));
-            assertEquals(available, held.fromBalanceType());
-            assertEquals(locked, held.toBalanceType());
+            assertEquals(availableType.id(), held.fromBalanceType());
+            assertEquals(lockedType.id(), held.toBalanceType());
             nodes.awaitCatchUp();
             assertEquals(0, new BigDecimal("60").compareTo(ledger.balance(client, available, "USD").balance()));
             assertEquals(0, new BigDecimal("40").compareTo(ledger.balance(client, locked, "USD").balance()));
@@ -298,10 +298,18 @@ class PgLedgerTest {
             try (Connection conn = dataSource(WRITER_URL).getConnection();
                  PreparedStatement ps = conn.prepareStatement("""
                          INSERT INTO pgledger_accounts (
-                             account_id, balance_type, name, currency,
+                             account_id, balance_type_id, name, currency_id,
                              allow_negative_balance, allow_positive_balance, created_at, updated_at)
-                         VALUES (?, ?, 'legacy', 'USD', false, true, now(), now())
-                         RETURNING account_class, deleted
+                         VALUES (
+                             ?,
+                             (SELECT id FROM pgledger_balance_types WHERE code = ?),
+                             'legacy',
+                             (SELECT id FROM pgledger_currencies WHERE code = 'USD'),
+                             false, true, now(), now())
+                         RETURNING (
+                             SELECT code FROM pgledger_account_classes
+                             WHERE id = pgledger_accounts.account_class_id
+                         ), deleted
                          """)) {
                 ps.setString(1, accountId + "LEGACY");
                 ps.setString(2, available);
@@ -499,10 +507,12 @@ class PgLedgerTest {
             try (Connection hold = writer.getConnection()) {
                 hold.setAutoCommit(false);
                 try (PreparedStatement ps = hold.prepareStatement("""
-                        SELECT id
-                        FROM pgledger_accounts
-                        WHERE account_id = ? AND balance_type = ? AND currency = ?
-                        FOR UPDATE
+                        SELECT a.id
+                        FROM pgledger_accounts a
+                        JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+                        JOIN pgledger_currencies c ON c.id = a.currency_id
+                        WHERE a.account_id = ? AND bt.code = ? AND c.code = ?
+                        FOR UPDATE OF a
                         """)) {
                     ps.setString(1, "BANK-USD-" + type + "-" + shard);
                     ps.setString(2, type);

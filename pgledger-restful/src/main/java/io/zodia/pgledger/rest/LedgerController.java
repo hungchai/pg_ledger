@@ -57,21 +57,21 @@ final class LedgerController {
 
     @PostMapping("/api/v1/postings")
     ResponseEntity<byte[]> post(@RequestBody(required = false) byte[] body) {
-        Posting posting = read(body, Posting.class);
+        Posting posting = read(LedgerJson.numbersAsText(body, "fromBalanceType", "toBalanceType"), Posting.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.post(posting))));
     }
 
     @PostMapping("/api/v1/deposits")
     ResponseEntity<byte[]> deposit(@RequestBody(required = false) byte[] body) {
-        CashMovement movement = read(body, CashMovement.class);
+        CashMovement movement = read(LedgerJson.numbersAsText(body, "balanceType"), CashMovement.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.deposit(movement))));
     }
 
     @PostMapping("/api/v1/withdrawals")
     ResponseEntity<byte[]> withdraw(@RequestBody(required = false) byte[] body) {
-        CashMovement movement = read(body, CashMovement.class);
+        CashMovement movement = read(LedgerJson.numbersAsText(body, "balanceType"), CashMovement.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.withdraw(movement))));
     }
