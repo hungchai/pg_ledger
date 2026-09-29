@@ -134,6 +134,8 @@ class PgLedgerTest {
             Transfer funded = ledger.post(posting(company, available, client, available, "USD", "100"));
             assertEquals(company, funded.fromAccountId());
             assertEquals(client, funded.toAccountId());
+            assertEquals("TRANSFER", funded.bizType());
+            assertNull(funded.requestId());
             assertEquals(2, funded.entries().size());
             assertEquals(0, new BigDecimal("-100").compareTo(funded.entries().get(0).amount()));
             assertEquals(0, new BigDecimal("100").compareTo(funded.entries().get(1).amount()));
@@ -317,7 +319,8 @@ class PgLedgerTest {
             BigDecimal amount = new BigDecimal("30");
             Transfer deposit = ledger.deposit(cash(id("DREQ"), client, type, amount));
             assertEquals(client, deposit.toAccountId());
-            assertTrue(deposit.fromAccountId().startsWith("bankpool." + type + ".USD."));
+            assertEquals("DEPOSIT", deposit.bizType());
+            assertTrue(deposit.fromAccountId().startsWith("BANK-USD-" + type + "-"));
             assertEquals(2, deposit.entries().size());
             assertEquals(0, amount.negate().compareTo(deposit.entries().get(0).amount()));
             assertEquals(0, amount.compareTo(deposit.entries().get(1).amount()));
@@ -346,7 +349,8 @@ class PgLedgerTest {
 
             Transfer withdrawal = ledger.withdraw(cash(id("WREQ"), client, type, amount));
             assertEquals(client, withdrawal.fromAccountId());
-            assertTrue(withdrawal.toAccountId().startsWith("bankpool." + type + ".USD."));
+            assertEquals("WITHDRAWAL", withdrawal.bizType());
+            assertTrue(withdrawal.toAccountId().startsWith("BANK-USD-" + type + "-"));
             nodes.awaitCatchUp();
             assertEquals(0, BigDecimal.ZERO.compareTo(ledger.balance(client, type, "USD").balance()));
             assertEquals(0, BigDecimal.ZERO.compareTo(ledger.bankPosition(type, "USD")));

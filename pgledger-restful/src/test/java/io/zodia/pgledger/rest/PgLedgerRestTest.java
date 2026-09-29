@@ -166,7 +166,9 @@ class PgLedgerRestTest {
             assertEquals(200, http.status());
             assertEquals(PgLedgerServer.WRITER, http.role());
             assertEquals(clientId, first.toAccountId());
-            assertTrue(first.fromAccountId().startsWith("bankpool." + type + ".USD."));
+            assertEquals("DEPOSIT", first.bizType());
+            assertEquals(prefix + "R1", first.requestId());
+            assertTrue(first.fromAccountId().startsWith("BANK-USD-" + type + "-"));
             Transfer again = http.deposit(new CashMovement(prefix + "R1", clientId, type, "USD", amount));
             assertEquals(first.id(), again.id());
             nodes.awaitCatchUp();

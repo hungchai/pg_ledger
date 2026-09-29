@@ -38,9 +38,9 @@ curl -s 'http://localhost:8080/api/v1/journals?page=0&size=50'
 
 One balance row is `(account_id, balance_type, currency)`. `pgledger_transfers` is the journal. `pgledger_entries` is the journal line. A transfer always has two entries. `pgledger_create_transfers` locks every balance row in sorted internal id order inside one database call, so several RFQ legs commit or roll back together.
 
-`account_class` is `CLIENT`, `COMPANY`, `BANK`, `NOSTRO`, `SUSPENSE`, or `CONTROL`. Existing rows default to `CLIENT`. `deleted` is a soft delete (`false` by default). A deleted row stays in the journal. New transfers and the bank-pool picker skip it.
+`account_class` is `CLIENT`, `COMPANY`, `BANK`, `NOSTRO`, `SUSPENSE`, or `CONTROL`. Existing rows default to `CLIENT`. `deleted` is a soft delete (`false` by default). A deleted row stays in the journal. New transfers skip it.
 
-A deposit is one transfer from a BANK shard to the client. A withdrawal is the reverse. Shards are a pool per balance type and currency (default 8, `PGLEDGER_BANK_POOL_SIZE`). The shard is `hash(requestId)` among shards that are not deleted, then that row and the client are locked in sorted id order. The same `requestId` returns the original transfer. BANK shards may be negative. The bank position is the sum of the pool. Soft-delete is `POST /api/v1/accounts/delete`.
+A deposit is one `pgledger_transfers` row from a BANK account to the client, with `biz_type` `DEPOSIT`. A withdrawal is the reverse, with `biz_type` `WITHDRAWAL`. A pairwise posting sets `biz_type` `TRANSFER`. The business type is stored on the transfer and is not inferred from which side is the bank. Shard account ids are `BANK-{currency}-{balanceType}-{n}` for `n` in `0 .. poolSize-1` (default 8, `PGLEDGER_BANK_POOL_SIZE`). The shard is `hash(requestId) % poolSize`. That account and the client are locked in sorted internal id order. `request_id` is unique and nullable on `pgledger_transfers`. The same cash `requestId` returns the original transfer. BANK shards may be negative. The bank position is the sum of the BANK rows for that balance type and currency. Soft-delete is `POST /api/v1/accounts/delete`.
 
 Run the statements below on the **writer**. Repeat creates fail if that balance type or account row already exists.
 

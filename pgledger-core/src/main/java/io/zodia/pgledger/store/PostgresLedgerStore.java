@@ -59,13 +59,14 @@ public final class PostgresLedgerStore implements LedgerStore {
                 a.id, a.account_id, a.balance_type, a.name, a.currency, a.balance, a.version,
                 a.allow_negative_balance, a.allow_positive_balance, a.metadata::text AS metadata,
                 a.created_at, a.updated_at, a.account_class, a.deleted
-            FROM pgledger_bank_shards s
-            JOIN pgledger_accounts a
-              ON a.account_id = s.account_id
-             AND a.balance_type = s.balance_type
-             AND a.currency = s.currency
-            WHERE s.balance_type = ? AND s.currency = ?
-            ORDER BY s.shard
+            FROM pgledger_accounts a
+            WHERE a.account_class = 'BANK'
+              AND a.balance_type = ?
+              AND a.currency = ?
+              AND left(a.account_id, char_length('BANK-' || a.currency || '-' || a.balance_type || '-'))
+                  = 'BANK-' || a.currency || '-' || a.balance_type || '-'
+              AND substring(a.account_id FROM char_length('BANK-' || a.currency || '-' || a.balance_type || '-') + 1) ~ '^[0-9]+$'
+            ORDER BY substring(a.account_id FROM char_length('BANK-' || a.currency || '-' || a.balance_type || '-') + 1)::int
             """;
     // The function insert is its own statement. Joining pgledger_entries in that
     // same statement sees a snapshot from before the insert and returns no row.
@@ -84,6 +85,8 @@ public final class PostgresLedgerStore implements LedgerStore {
                 t.created_at AS transfer_created_at,
                 t.event_at,
                 t.metadata::text AS transfer_metadata,
+                t.request_id,
+                t.biz_type,
                 e.id AS entry_id,
                 ea.account_id AS entry_account_id,
                 ea.balance_type AS entry_balance_type,
@@ -123,6 +126,8 @@ public final class PostgresLedgerStore implements LedgerStore {
                 t.created_at AS transfer_created_at,
                 t.event_at,
                 t.metadata::text AS transfer_metadata,
+                t.request_id,
+                t.biz_type,
                 e.id AS entry_id,
                 ea.account_id AS entry_account_id,
                 ea.balance_type AS entry_balance_type,
@@ -620,6 +625,8 @@ public final class PostgresLedgerStore implements LedgerStore {
                 instant(rs, "transfer_created_at"),
                 instant(rs, "event_at"),
                 LedgerJson.map(rs.getString("transfer_metadata")),
+                rs.getString("request_id"),
+                rs.getString("biz_type"),
                 List.of());
     }
 
@@ -635,6 +642,8 @@ public final class PostgresLedgerStore implements LedgerStore {
                 transfer.createdAt(),
                 transfer.eventAt(),
                 transfer.metadata(),
+                transfer.requestId(),
+                transfer.bizType(),
                 entries);
     }
 

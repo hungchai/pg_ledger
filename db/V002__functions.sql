@@ -164,10 +164,17 @@ EXCEPTION
 END;
 $$ LANGUAGE plpgsql;
 
+DROP FUNCTION IF EXISTS pgledger_post_cash(TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC, TIMESTAMPTZ, JSONB, INT);
+DROP FUNCTION IF EXISTS pgledger_create_transfer(TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC, TIMESTAMPTZ, JSONB);
+DROP FUNCTION IF EXISTS pgledger_create_transfers(VARIADIC transfer_request[]);
+DROP FUNCTION IF EXISTS pgledger_create_transfers(transfer_request[], TIMESTAMPTZ, JSONB);
+
 CREATE OR REPLACE FUNCTION pgledger_create_transfers(
     p_transfer_requests transfer_request[],
     p_event_at TIMESTAMPTZ DEFAULT NULL,
-    p_metadata JSONB DEFAULT NULL
+    p_biz_reference TEXT DEFAULT NULL,
+    p_request_id TEXT DEFAULT NULL,
+    p_biz_type TEXT DEFAULT 'TRANSFER'
 )
 RETURNS SETOF pgledger_transfers_view
 AS $$
@@ -179,9 +186,22 @@ DECLARE
     locked_id TEXT;
     transfer_id TEXT;
     transfer_ids TEXT[] := '{}';
+    v_request_id TEXT;
+    v_biz_type TEXT;
+    v_biz_reference TEXT;
 BEGIN
     IF p_transfer_requests IS NULL THEN
         RETURN;
+    END IF;
+
+    v_biz_reference := NULLIF(btrim(p_biz_reference), '');
+    v_biz_type := upper(btrim(COALESCE(p_biz_type, 'TRANSFER')));
+    IF v_biz_type NOT IN ('TRANSFER', 'DEPOSIT', 'WITHDRAWAL') THEN
+        RAISE EXCEPTION 'biz_type must be TRANSFER, DEPOSIT, or WITHDRAWAL';
+    END IF;
+    v_request_id := NULLIF(btrim(p_request_id), '');
+    IF v_request_id IS NOT NULL AND COALESCE(array_length(p_transfer_requests, 1), 0) <> 1 THEN
+        RAISE EXCEPTION 'request_id applies to one transfer';
     END IF;
 
     FOREACH req IN ARRAY p_transfer_requests LOOP
@@ -270,8 +290,13 @@ BEGIN
             RAISE EXCEPTION 'Cannot transfer between different currencies (% and %)', from_row.currency, to_row.currency;
         END IF;
 
-        INSERT INTO pgledger_transfers (from_account_id, to_account_id, amount, created_at, event_at, metadata)
-        VALUES (from_row.id, to_row.id, req.amount, now(), coalesce(p_event_at, now()), p_metadata)
+        INSERT INTO pgledger_transfers (
+            from_account_id, to_account_id, amount, created_at, event_at, request_id, biz_type, biz_reference
+        )
+        VALUES (
+            from_row.id, to_row.id, req.amount, now(), coalesce(p_event_at, now()),
+            v_request_id, v_biz_type, v_biz_reference
+        )
         RETURNING pgledger_transfers.id INTO transfer_id;
 
         transfer_ids := array_append(transfer_ids, transfer_id);
@@ -309,7 +334,9 @@ CREATE OR REPLACE FUNCTION pgledger_create_transfer(
     p_currency TEXT,
     p_amount NUMERIC,
     p_event_at TIMESTAMPTZ DEFAULT NULL,
-    p_metadata JSONB DEFAULT NULL
+    p_biz_reference TEXT DEFAULT NULL,
+    p_request_id TEXT DEFAULT NULL,
+    p_biz_type TEXT DEFAULT 'TRANSFER'
 )
 RETURNS SETOF pgledger_transfers_view
 AS $$
@@ -325,7 +352,9 @@ BEGIN
             p_amount
         )::transfer_request],
         p_event_at => p_event_at,
-        p_metadata => p_metadata
+        p_biz_reference => p_biz_reference,
+        p_request_id => p_request_id,
+        p_biz_type => p_biz_type
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -352,6 +381,18 @@ AS $$
     END
 $$ LANGUAGE sql IMMUTABLE;
 
+-- Shard account id is BANK-{currency}-{balanceType}-{n}.
+CREATE OR REPLACE FUNCTION pgledger_bank_account_id(
+    p_currency TEXT,
+    p_balance_type TEXT,
+    p_shard INT
+) RETURNS TEXT
+AS $$
+    SELECT 'BANK-' || p_currency || '-' || p_balance_type || '-' || p_shard::text
+$$ LANGUAGE sql IMMUTABLE;
+
+-- Creates missing BANK rows for n in 0 .. pool_size-1. Both balance signs are allowed.
+-- An existing pool keeps its size when p_keep_existing is true.
 CREATE OR REPLACE FUNCTION pgledger_ensure_bank_pool(
     p_currency TEXT,
     p_balance_type TEXT,
@@ -363,7 +404,9 @@ AS $$
 DECLARE
     v_currency TEXT;
     v_balance_type TEXT;
+    v_prefix TEXT;
     v_size INT;
+    v_max INT;
     v_existing INT;
     v_shard INT;
     v_account_id TEXT;
@@ -381,35 +424,32 @@ BEGIN
         RAISE EXCEPTION 'balance type not found: %', v_balance_type;
     END IF;
 
-    SELECT pool_size INTO v_existing
-    FROM pgledger_bank_pools
-    WHERE currency = v_currency AND balance_type = v_balance_type;
-    IF FOUND THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended('bank:' || v_currency || ':' || v_balance_type, 0));
+
+    v_prefix := pgledger_bank_account_id(v_currency, v_balance_type, 0);
+    v_prefix := left(v_prefix, char_length(v_prefix) - 1);
+    SELECT MAX(substring(account_id FROM char_length(v_prefix) + 1)::int)
+    INTO v_max
+    FROM pgledger_accounts
+    WHERE currency = v_currency
+      AND balance_type = v_balance_type
+      AND account_class = 'BANK'
+      AND left(account_id, char_length(v_prefix)) = v_prefix
+      AND substring(account_id FROM char_length(v_prefix) + 1) ~ '^[0-9]+$';
+
+    IF v_max IS NOT NULL THEN
+        v_existing := v_max + 1;
         IF v_existing <> v_size AND NOT COALESCE(p_keep_existing, FALSE) THEN
             RAISE EXCEPTION 'bank pool size is % (balance_type=%, currency=%)',
                 v_existing, v_balance_type, v_currency;
         END IF;
-        RETURN v_existing;
-    END IF;
-
-    INSERT INTO pgledger_bank_pools (currency, balance_type, pool_size, created_at, updated_at)
-    VALUES (v_currency, v_balance_type, v_size, now(), now())
-    ON CONFLICT (currency, balance_type) DO NOTHING;
-
-    SELECT pool_size INTO v_existing
-    FROM pgledger_bank_pools
-    WHERE currency = v_currency AND balance_type = v_balance_type
-    FOR UPDATE;
-    IF v_existing <> v_size THEN
         IF COALESCE(p_keep_existing, FALSE) THEN
-            RETURN v_existing;
+            v_size := v_existing;
         END IF;
-        RAISE EXCEPTION 'bank pool size is % (balance_type=%, currency=%)',
-            v_existing, v_balance_type, v_currency;
     END IF;
 
-    FOR v_shard IN 0..v_existing - 1 LOOP
-        v_account_id := 'bankpool.' || v_balance_type || '.' || v_currency || '.' || v_shard;
+    FOR v_shard IN 0..v_size - 1 LOOP
+        v_account_id := pgledger_bank_account_id(v_currency, v_balance_type, v_shard);
         IF NOT EXISTS (
             SELECT 1 FROM pgledger_accounts
             WHERE account_id = v_account_id
@@ -417,31 +457,25 @@ BEGIN
               AND currency = v_currency
         ) THEN
             PERFORM pgledger_create_account(
-                v_account_id, v_balance_type, 'bank shard ' || v_shard, v_currency,
+                v_account_id, v_balance_type, 'BANK ' || v_shard, v_currency,
                 TRUE, TRUE, jsonb_build_object('shard', v_shard), 'BANK'
             );
         END IF;
-        INSERT INTO pgledger_bank_shards (currency, balance_type, shard, account_id)
-        VALUES (v_currency, v_balance_type, v_shard, v_account_id)
-        ON CONFLICT (currency, balance_type, shard) DO NOTHING;
     END LOOP;
 
-    RETURN v_existing;
+    RETURN v_size;
 END;
 $$ LANGUAGE plpgsql;
 
--- Sum of every shard row, including a soft-deleted shard that still holds a balance.
+-- Sum of BANK rows for this balance type and currency, including a soft-deleted row that still holds a balance.
 CREATE OR REPLACE FUNCTION pgledger_bank_position(p_balance_type TEXT, p_currency TEXT)
 RETURNS NUMERIC
 AS $$
-    SELECT COALESCE(SUM(a.balance), 0)
-    FROM pgledger_bank_shards s
-    JOIN pgledger_accounts a
-      ON a.account_id = s.account_id
-     AND a.balance_type = s.balance_type
-     AND a.currency = s.currency
-    WHERE s.balance_type = p_balance_type
-      AND s.currency = p_currency
+    SELECT COALESCE(SUM(balance), 0)
+    FROM pgledger_accounts
+    WHERE account_class = 'BANK'
+      AND balance_type = btrim(p_balance_type)
+      AND currency = btrim(p_currency)
 $$ LANGUAGE sql STABLE;
 
 CREATE OR REPLACE FUNCTION pgledger_delete_account(
@@ -487,11 +521,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Deposit is one transfer, live bank shard -> client. Withdrawal is the reverse.
--- The shard is hash(request_id) among rows with deleted = false, then
--- pgledger_create_transfer locks that bank id and the client id in sorted order
--- (WHERE id = chosen FOR UPDATE). The picker does not skip a locked shard and
--- does not take the first pool row. A repeated request_id returns the original transfer.
+-- A cash post is one pgledger_transfers row. biz_type is the passed direction.
+-- It is not inferred from which account is BANK.
+-- n is hash(request_id) mod pool size. The counterparty is BANK-{currency}-{balanceType}-{n}.
+-- pgledger_create_transfer locks that row and the client in sorted internal id order and waits.
+-- A repeated request_id returns that transfer and does not post again.
 CREATE OR REPLACE FUNCTION pgledger_post_cash(
     p_request_id TEXT,
     p_direction TEXT,
@@ -500,7 +534,7 @@ CREATE OR REPLACE FUNCTION pgledger_post_cash(
     p_currency TEXT,
     p_amount NUMERIC,
     p_event_at TIMESTAMPTZ DEFAULT NULL,
-    p_metadata JSONB DEFAULT NULL,
+    p_biz_reference TEXT DEFAULT NULL,
     p_pool_size INT DEFAULT 8
 )
 RETURNS SETOF pgledger_transfers_view
@@ -512,15 +546,22 @@ DECLARE
     v_balance_type TEXT;
     v_currency TEXT;
     v_pool_size INT;
-    v_active INT;
     v_ord INT;
     v_bank_account_id TEXT;
-    v_physical_shard INT;
+    v_bank_class TEXT;
+    v_bank_deleted BOOLEAN;
     v_from TEXT;
     v_to TEXT;
-    v_existing pgledger_cash_requests;
+    v_existing_id TEXT;
+    v_existing_amount NUMERIC;
+    v_existing_biz TEXT;
+    v_from_account TEXT;
+    v_to_account TEXT;
+    v_from_type TEXT;
+    v_to_type TEXT;
+    v_from_currency TEXT;
+    v_to_currency TEXT;
     v_transfer_id TEXT;
-    v_meta JSONB;
 BEGIN
     v_request_id := btrim(p_request_id);
     IF v_request_id IS NULL OR v_request_id = '' THEN
@@ -544,64 +585,49 @@ BEGIN
     -- Same request id waits here until the in-flight post commits or rolls back.
     PERFORM pg_advisory_xact_lock(hashtextextended(v_request_id, 0));
 
-    SELECT * INTO v_existing
-    FROM pgledger_cash_requests
-    WHERE request_id = v_request_id;
+    SELECT t.id, t.amount, t.biz_type,
+           fa.account_id, fa.balance_type, fa.currency,
+           ta.account_id, ta.balance_type, ta.currency
+    INTO v_existing_id, v_existing_amount, v_existing_biz,
+         v_from_account, v_from_type, v_from_currency,
+         v_to_account, v_to_type, v_to_currency
+    FROM pgledger_transfers t
+    JOIN pgledger_accounts fa ON fa.id = t.from_account_id
+    JOIN pgledger_accounts ta ON ta.id = t.to_account_id
+    WHERE t.request_id = v_request_id;
     IF FOUND THEN
-        IF v_existing.direction <> v_direction
-            OR v_existing.client_account_id <> v_client
-            OR v_existing.balance_type <> v_balance_type
-            OR v_existing.currency <> v_currency
-            OR v_existing.amount <> p_amount THEN
+        IF v_existing_biz IS DISTINCT FROM v_direction
+            OR v_existing_amount IS DISTINCT FROM p_amount
+            OR v_from_type IS DISTINCT FROM v_balance_type
+            OR v_to_type IS DISTINCT FROM v_balance_type
+            OR v_from_currency IS DISTINCT FROM v_currency
+            OR v_to_currency IS DISTINCT FROM v_currency
+            OR (v_direction = 'DEPOSIT' AND v_to_account IS DISTINCT FROM v_client)
+            OR (v_direction = 'WITHDRAWAL' AND v_from_account IS DISTINCT FROM v_client) THEN
             RAISE EXCEPTION 'request id already used';
         END IF;
         RETURN QUERY
-        SELECT * FROM pgledger_transfers_view WHERE id = v_existing.transfer_id;
+        SELECT * FROM pgledger_transfers_view WHERE id = v_existing_id;
         RETURN;
     END IF;
 
-    SELECT pool_size INTO v_pool_size
-    FROM pgledger_bank_pools
-    WHERE currency = v_currency AND balance_type = v_balance_type;
-    IF NOT FOUND THEN
-        v_pool_size := pgledger_ensure_bank_pool(v_currency, v_balance_type, COALESCE(p_pool_size, 8), TRUE);
-    END IF;
+    v_pool_size := pgledger_ensure_bank_pool(v_currency, v_balance_type, COALESCE(p_pool_size, 8), TRUE);
+    v_ord := pgledger_bank_shard(v_request_id, v_pool_size);
+    v_bank_account_id := pgledger_bank_account_id(v_currency, v_balance_type, v_ord);
 
-    SELECT count(*) INTO v_active
-    FROM pgledger_bank_shards s
-    JOIN pgledger_accounts a
-      ON a.account_id = s.account_id
-     AND a.balance_type = s.balance_type
-     AND a.currency = s.currency
-    WHERE s.currency = v_currency
-      AND s.balance_type = v_balance_type
-      AND NOT a.deleted;
-    IF v_active < 1 THEN
-        RAISE EXCEPTION 'bank pool has no active shard (balance_type=%, currency=%)',
-            v_balance_type, v_currency;
-    END IF;
-
-    v_ord := pgledger_bank_shard(v_request_id, v_active);
-
-    -- One live shard, by ordinal. The row lock happens later, inside the transfer.
-    SELECT picked.account_id, picked.shard
-    INTO v_bank_account_id, v_physical_shard
-    FROM (
-        SELECT s.account_id, s.shard,
-               (row_number() OVER (ORDER BY s.shard) - 1)::int AS ord
-        FROM pgledger_bank_shards s
-        JOIN pgledger_accounts a
-          ON a.account_id = s.account_id
-         AND a.balance_type = s.balance_type
-         AND a.currency = s.currency
-        WHERE s.currency = v_currency
-          AND s.balance_type = v_balance_type
-          AND NOT a.deleted
-    ) picked
-    WHERE picked.ord = v_ord;
-    IF NOT FOUND THEN
+    SELECT account_class, deleted
+    INTO v_bank_class, v_bank_deleted
+    FROM pgledger_accounts
+    WHERE account_id = v_bank_account_id
+      AND balance_type = v_balance_type
+      AND currency = v_currency;
+    IF NOT FOUND OR v_bank_class IS DISTINCT FROM 'BANK' THEN
         RAISE EXCEPTION 'bank shard not found (balance_type=%, currency=%, shard=%)',
             v_balance_type, v_currency, v_ord;
+    END IF;
+    IF v_bank_deleted THEN
+        RAISE EXCEPTION 'Account is deleted (account_id=%, balance_type=%, currency=%)',
+            v_bank_account_id, v_balance_type, v_currency;
     END IF;
 
     IF v_direction = 'DEPOSIT' THEN
@@ -612,21 +638,10 @@ BEGIN
         v_to := v_bank_account_id;
     END IF;
 
-    v_meta := COALESCE(p_metadata, '{}'::jsonb) || jsonb_build_object(
-        'requestId', v_request_id,
-        'direction', v_direction,
-        'bankShard', v_physical_shard
-    );
-
     SELECT id INTO v_transfer_id
     FROM pgledger_create_transfer(
-        v_from, v_balance_type, v_to, v_balance_type, v_currency, p_amount, p_event_at, v_meta
-    );
-
-    INSERT INTO pgledger_cash_requests (
-        request_id, transfer_id, direction, client_account_id, balance_type, currency, amount, created_at
-    ) VALUES (
-        v_request_id, v_transfer_id, v_direction, v_client, v_balance_type, v_currency, p_amount, now()
+        v_from, v_balance_type, v_to, v_balance_type, v_currency, p_amount,
+        p_event_at, p_biz_reference, v_request_id, v_direction
     );
 
     RETURN QUERY

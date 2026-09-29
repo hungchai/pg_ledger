@@ -95,6 +95,8 @@ public final class LedgerApi {
             Instant createdAt,
             Instant eventAt,
             Map<String, Object> metadata,
+            String requestId,
+            String bizType,
             List<Entry> entries) {
     }
 

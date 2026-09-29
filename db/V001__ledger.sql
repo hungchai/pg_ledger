@@ -130,8 +130,14 @@ CREATE TABLE IF NOT EXISTS pgledger_transfers (
     amount NUMERIC NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     event_at TIMESTAMPTZ NOT NULL,
-    metadata JSONB,
-    CHECK (amount > 0 AND from_account_id != to_account_id)
+    request_id TEXT,
+    biz_type TEXT NOT NULL,
+    biz_reference TEXT,
+    CHECK (amount > 0 AND from_account_id != to_account_id),
+    CONSTRAINT pgledger_transfers_biz_type_chk CHECK (
+        biz_type IN ('TRANSFER', 'DEPOSIT', 'WITHDRAWAL')
+    ),
+    CONSTRAINT pgledger_transfers_request_id_key UNIQUE (request_id)
 );
 
 CREATE INDEX IF NOT EXISTS pgledger_transfers_from_account_id_idx ON pgledger_transfers (from_account_id);
@@ -152,43 +158,6 @@ CREATE TABLE IF NOT EXISTS pgledger_entries (
 
 CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries (account_id);
 CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries (transfer_id);
-
--- One pool per (balance_type, currency). Shard rows are BANK accounts. Soft-deleted
--- shards stay here so old transfers still resolve. The picker ignores them.
-CREATE TABLE IF NOT EXISTS pgledger_bank_pools (
-    currency TEXT NOT NULL,
-    balance_type TEXT NOT NULL REFERENCES pgledger_balance_types (code),
-    pool_size INT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (currency, balance_type),
-    CHECK (pool_size >= 1)
-);
-
-CREATE TABLE IF NOT EXISTS pgledger_bank_shards (
-    currency TEXT NOT NULL,
-    balance_type TEXT NOT NULL,
-    shard INT NOT NULL,
-    account_id TEXT NOT NULL,
-    PRIMARY KEY (currency, balance_type, shard),
-    CHECK (shard >= 0),
-    UNIQUE (account_id, balance_type, currency),
-    FOREIGN KEY (account_id, balance_type, currency)
-        REFERENCES pgledger_accounts (account_id, balance_type, currency)
-);
-
-CREATE TABLE IF NOT EXISTS pgledger_cash_requests (
-    request_id TEXT PRIMARY KEY,
-    transfer_id TEXT NOT NULL REFERENCES pgledger_transfers (id),
-    direction TEXT NOT NULL,
-    client_account_id TEXT NOT NULL,
-    balance_type TEXT NOT NULL,
-    currency TEXT NOT NULL,
-    amount NUMERIC NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL,
-    CHECK (direction IN ('DEPOSIT', 'WITHDRAWAL')),
-    CHECK (amount > 0)
-);
 
 CREATE OR REPLACE VIEW pgledger_balance_types_view AS
 SELECT
@@ -225,7 +194,9 @@ SELECT
     amount,
     created_at,
     event_at,
-    metadata
+    request_id,
+    biz_type,
+    biz_reference
 FROM pgledger_transfers;
 
 CREATE OR REPLACE VIEW pgledger_entries_view AS
@@ -239,6 +210,6 @@ SELECT
     e.account_version,
     e.created_at,
     t.event_at,
-    t.metadata
+    t.biz_reference
 FROM pgledger_entries e
 INNER JOIN pgledger_transfers t ON e.transfer_id = t.id;
