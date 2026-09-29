@@ -207,8 +207,10 @@ BEGIN
 
     v_biz_reference := NULLIF(btrim(p_biz_reference), '');
     v_biz_type := upper(btrim(COALESCE(p_biz_type, 'TRANSFER')));
-    IF v_biz_type NOT IN ('TRANSFER', 'DEPOSIT', 'WITHDRAWAL') THEN
-        RAISE EXCEPTION 'biz_type must be TRANSFER, DEPOSIT, or WITHDRAWAL';
+    IF v_biz_type IS NULL OR v_biz_type = '' OR NOT EXISTS (
+        SELECT 1 FROM pgledger_biz_types WHERE code = v_biz_type
+    ) THEN
+        RAISE EXCEPTION 'biz type not found';
     END IF;
     v_request_id := NULLIF(btrim(p_request_id), '');
     IF v_request_id IS NULL THEN

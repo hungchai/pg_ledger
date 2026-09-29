@@ -4,7 +4,8 @@
 -- store. account_id is the caller's business account. One row is one balance:
 -- unique (account_id, balance_type, currency).
 -- No cross-table parent checks. Sharding cannot validate a row in another table.
--- pgledger_accounts_account_class_chk and pgledger_transfers_biz_type_chk stay.
+-- pgledger_accounts_account_class_chk stays.
+-- pgledger_biz_types holds transfer codes. A transfer stores the code as text.
 
 -- UUID to ULID text. Ids are stored as text, so the reverse (ULID to UUID) is not loaded.
 
@@ -125,6 +126,18 @@ CREATE TABLE IF NOT EXISTS pgledger_accounts (
 
 CREATE INDEX IF NOT EXISTS pgledger_accounts_account_id_idx ON pgledger_accounts (account_id);
 
+CREATE TABLE IF NOT EXISTS pgledger_biz_types (
+    code TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+INSERT INTO pgledger_biz_types (code, name)
+VALUES
+    ('TRANSFER', 'Transfer'),
+    ('DEPOSIT', 'Deposit'),
+    ('WITHDRAWAL', 'Withdrawal')
+ON CONFLICT (code) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS pgledger_transfers (
     id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pglt'),
     from_account_id TEXT NOT NULL,
@@ -135,10 +148,7 @@ CREATE TABLE IF NOT EXISTS pgledger_transfers (
     request_id TEXT,
     biz_type TEXT NOT NULL,
     biz_reference TEXT,
-    CHECK (amount > 0 AND from_account_id != to_account_id),
-    CONSTRAINT pgledger_transfers_biz_type_chk CHECK (
-        biz_type IN ('TRANSFER', 'DEPOSIT', 'WITHDRAWAL')
-    )
+    CHECK (amount > 0 AND from_account_id != to_account_id)
 );
 
 CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_idx ON pgledger_transfers (request_id);

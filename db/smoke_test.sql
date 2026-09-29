@@ -41,6 +41,11 @@ BEGIN
     WHERE from_account_id = ANY(smoke_ids) OR to_account_id = ANY(smoke_ids);
     DELETE FROM pgledger_accounts WHERE id = ANY(smoke_ids);
     DELETE FROM pgledger_balance_types WHERE code IN ('SMOKE_AVAILABLE', 'SMOKE_LOCKED');
+    DELETE FROM pgledger_biz_types WHERE code = 'SMOKE_FEE';
+
+    IF (SELECT count(*) FROM pgledger_biz_types WHERE code IN ('TRANSFER', 'DEPOSIT', 'WITHDRAWAL')) <> 3 THEN
+        RAISE EXCEPTION 'biz types not seeded';
+    END IF;
 
     PERFORM * FROM pgledger_create_balance_type('SMOKE_AVAILABLE', 'Available', NULL);
     PERFORM * FROM pgledger_create_balance_type('SMOKE_LOCKED', 'Locked', NULL);
@@ -76,6 +81,18 @@ BEGIN
     EXCEPTION
         WHEN OTHERS THEN
             IF SQLERRM NOT LIKE '%account already exists%' THEN
+                RAISE;
+            END IF;
+    END;
+
+    BEGIN
+        PERFORM * FROM pgledger_create_transfer(
+            'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'USD', 1,
+            NULL, NULL, 'smoke-bad-biz', 'NOT_A_TYPE');
+        RAISE EXCEPTION 'expected unknown biz type to fail';
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF SQLERRM NOT LIKE '%biz type not found%' THEN
                 RAISE;
             END IF;
     END;
@@ -354,6 +371,21 @@ BEGIN
     IF available_balance <> 60 OR bank_balance <> 0 THEN
         RAISE EXCEPTION 'after withdrawal client=% bank=%, expected 60 / 0', available_balance, bank_balance;
     END IF;
+
+    INSERT INTO pgledger_biz_types (code, name) VALUES ('SMOKE_FEE', 'Smoke fee');
+    PERFORM * FROM pgledger_create_transfers(
+        ARRAY[
+            ('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'USD', 1)
+        ]::transfer_request[],
+        NULL, NULL, 'smoke-fee-1', 'SMOKE_FEE'
+    );
+    SELECT biz_type INTO deposit_biz
+    FROM pgledger_transfers
+    WHERE request_id = 'smoke-fee-1';
+    IF deposit_biz IS DISTINCT FROM 'SMOKE_FEE' THEN
+        RAISE EXCEPTION 'inserted biz type was not stored';
+    END IF;
+    DELETE FROM pgledger_biz_types WHERE code = 'SMOKE_FEE';
 
     RAISE NOTICE 'smoke test passed';
 END $$;
