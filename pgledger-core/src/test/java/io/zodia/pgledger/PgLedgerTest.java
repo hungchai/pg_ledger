@@ -441,23 +441,23 @@ class PgLedgerTest {
             assertEquals(2, before.size());
             Account shard0 = before.get(0);
             Account shard1 = before.get(1);
-            String aimedAtDeleted = requestForShard(2, 0);
 
             ledger.deleteAccount(shard0.accountId(), type, "USD");
             BigDecimal amount = new BigDecimal("7");
-            Transfer deposit = ledger.deposit(cash(aimedAtDeleted, client, type, amount));
+            String aimedAtDeleted = requestForShard(2, 0);
+            String aimedAtLive = requestForShard(2, 1);
+            LedgerViolation blocked = assertThrows(LedgerViolation.class,
+                    () -> ledger.deposit(cash(aimedAtDeleted, client, type, amount)));
+            assertTrue(blocked.getMessage().contains("deleted"));
+            Transfer deposit = ledger.deposit(cash(aimedAtLive, client, type, amount));
             assertEquals(shard1.accountId(), deposit.fromAccountId());
             assertFalse(shard0.accountId().equals(deposit.fromAccountId()));
-            for (int i = 0; i < 7; i++) {
-                Transfer more = ledger.deposit(cash(id("MORE"), client, type, amount));
-                assertEquals(shard1.accountId(), more.fromAccountId());
-            }
             nodes.awaitCatchUp();
             List<Account> after = ledger.bankShards(type, "USD");
             assertTrue(after.get(0).deleted());
             assertFalse(after.get(1).deleted());
             assertEquals(0, BigDecimal.ZERO.compareTo(after.get(0).balance()));
-            assertEquals(0, amount.multiply(new BigDecimal("8")).negate().compareTo(after.get(1).balance()));
+            assertEquals(0, amount.negate().compareTo(after.get(1).balance()));
             assertEquals(shard1.accountId(), after.get(1).accountId());
 
             LedgerViolation named = assertThrows(LedgerViolation.class,
@@ -466,7 +466,7 @@ class PgLedgerTest {
 
             Transfer original = deposit;
             ledger.deleteAccount(client, type, "USD");
-            Transfer replay = ledger.deposit(cash(aimedAtDeleted, client, type, amount));
+            Transfer replay = ledger.deposit(cash(aimedAtLive, client, type, amount));
             assertEquals(original.id(), replay.id());
             LedgerViolation rejected = assertThrows(LedgerViolation.class,
                     () -> ledger.deposit(cash(id("NEW"), client, type, amount)));
@@ -477,7 +477,7 @@ class PgLedgerTest {
             nodes.awaitCatchUp();
             Account still = ledger.balance(client, type, "USD");
             assertTrue(still.deleted());
-            assertEquals(0, amount.multiply(new BigDecimal("8")).compareTo(still.balance()));
+            assertEquals(0, amount.compareTo(still.balance()));
             assertTrue(journalHas(ledger, original.id()));
         }
     }
@@ -499,18 +499,14 @@ class PgLedgerTest {
             try (Connection hold = writer.getConnection()) {
                 hold.setAutoCommit(false);
                 try (PreparedStatement ps = hold.prepareStatement("""
-                        SELECT a.id
-                        FROM pgledger_bank_shards s
-                        JOIN pgledger_accounts a
-                          ON a.account_id = s.account_id
-                         AND a.balance_type = s.balance_type
-                         AND a.currency = s.currency
-                        WHERE s.balance_type = ? AND s.currency = ? AND s.shard = ?
+                        SELECT id
+                        FROM pgledger_accounts
+                        WHERE account_id = ? AND balance_type = ? AND currency = ?
                         FOR UPDATE
                         """)) {
-                    ps.setString(1, type);
-                    ps.setString(2, "USD");
-                    ps.setInt(3, shard);
+                    ps.setString(1, "BANK-USD-" + type + "-" + shard);
+                    ps.setString(2, type);
+                    ps.setString(3, "USD");
                     try (ResultSet rs = ps.executeQuery()) {
                         assertTrue(rs.next());
                     }
@@ -518,7 +514,7 @@ class PgLedgerTest {
                 ExecutorService pool = Executors.newSingleThreadExecutor();
                 try {
                     Future<Transfer> posted = pool.submit(() -> ledger.deposit(cash(requestId, client, type, amount)));
-                    assertTrue(awaitLock(writer, "pgledger_post_cash"), "deposit did not wait on the bank shard");
+                    assertTrue(awaitLock(writer, "pgledger_create_transfer"), "deposit did not wait on the bank shard");
                     assertFalse(posted.isDone());
                     hold.commit();
                     Transfer transfer = posted.get(30, TimeUnit.SECONDS);

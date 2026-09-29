@@ -48,9 +48,6 @@ public final class PostgresLedgerStore implements LedgerStore {
     private static final String CREATE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
             + " FROM pgledger_create_account(?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?)";
     private static final String ENSURE_BANK_POOL = "SELECT pgledger_ensure_bank_pool(?, ?, ?, ?)";
-    private static final String POST_CASH = """
-            SELECT id FROM pgledger_post_cash(?, ?, ?, ?, ?, ?, NULL, NULL, ?)
-            """;
     private static final String DELETE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
             + " FROM pgledger_delete_account(?, ?, ?)";
     private static final String BANK_POSITION = "SELECT pgledger_bank_position(?, ?)";
@@ -71,7 +68,7 @@ public final class PostgresLedgerStore implements LedgerStore {
     // The function insert is its own statement. Joining pgledger_entries in that
     // same statement sees a snapshot from before the insert and returns no row.
     private static final String CREATE_TRANSFER = """
-            SELECT id FROM pgledger_create_transfer(?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            SELECT id FROM pgledger_create_transfer(?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
             """;
     private static final String LOAD_TRANSFER = """
             SELECT
@@ -253,6 +250,11 @@ public final class PostgresLedgerStore implements LedgerStore {
                 ps.setBigDecimal(6, posting.amount());
                 ps.setString(7, posting.bizReference());
                 ps.setString(8, posting.requestId());
+                if (posting.bizType() == null || posting.bizType().isBlank()) {
+                    ps.setNull(9, Types.VARCHAR);
+                } else {
+                    ps.setString(9, posting.bizType());
+                }
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new LedgerException("pgledger_create_transfer returned no row");
@@ -279,30 +281,6 @@ public final class PostgresLedgerStore implements LedgerStore {
                     return rs.getInt(1);
                 }
             }
-        });
-    }
-
-    @Override
-    public Transfer postCash(String direction, String requestId, String accountId, String balanceType,
-                             String currency, java.math.BigDecimal amount, int poolSize) {
-        return write(conn -> {
-            String transferId;
-            try (PreparedStatement ps = conn.prepareStatement(POST_CASH)) {
-                ps.setString(1, requestId);
-                ps.setString(2, direction);
-                ps.setString(3, accountId);
-                ps.setString(4, balanceType);
-                ps.setString(5, currency);
-                ps.setBigDecimal(6, amount);
-                ps.setInt(7, poolSize);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        throw new LedgerException("pgledger_post_cash returned no row");
-                    }
-                    transferId = rs.getString(1);
-                }
-            }
-            return loadTransfer(conn, transferId);
         });
     }
 

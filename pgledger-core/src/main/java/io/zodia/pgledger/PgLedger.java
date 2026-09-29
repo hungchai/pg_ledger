@@ -139,11 +139,11 @@ public final class PgLedger implements AutoCloseable {
     }
 
     public Transfer deposit(CashMovement movement) {
-        return cash("DEPOSIT", movement);
+        return cash(movement, "BANK", null, "DEPOSIT");
     }
 
     public Transfer withdraw(CashMovement movement) {
-        return cash("WITHDRAWAL", movement);
+        return cash(movement, null, "BANK", "WITHDRAWAL");
     }
 
     public Account deleteAccount(String accountId, String balanceType, String currency) {
@@ -176,6 +176,7 @@ public final class PgLedger implements AutoCloseable {
             throw new LedgerViolation("Amount (" + (amount == null ? "null" : amount.toPlainString()) + ") must be positive");
         }
         String bizReference = posting.bizReference();
+        String bizType = posting.bizType();
         return writer.post(new Posting(
                 posting.fromAccountId().strip(),
                 posting.fromBalanceType().strip(),
@@ -184,7 +185,8 @@ public final class PgLedger implements AutoCloseable {
                 posting.currency().strip(),
                 amount,
                 posting.requestId().strip(),
-                bizReference == null || bizReference.isBlank() ? null : bizReference.strip()));
+                bizReference == null || bizReference.isBlank() ? null : bizReference.strip(),
+                bizType == null || bizType.isBlank() ? null : bizType.strip()));
     }
 
     public List<Account> balances(String accountId) {
@@ -218,7 +220,7 @@ public final class PgLedger implements AutoCloseable {
         return dataSource;
     }
 
-    private Transfer cash(String direction, CashMovement movement) {
+    private Transfer cash(CashMovement movement, String fromAccountId, String toAccountId, String bizType) {
         if (movement == null || blank(movement.requestId())) {
             throw new LedgerViolation("request_id is required");
         }
@@ -229,14 +231,12 @@ public final class PgLedger implements AutoCloseable {
         if (amount == null || amount.signum() <= 0) {
             throw new LedgerViolation("Amount (" + (amount == null ? "null" : amount.toPlainString()) + ") must be positive");
         }
-        return writer.postCash(
-                direction,
-                movement.requestId().strip(),
-                accountId,
-                balanceType,
-                currency,
-                amount,
-                bankPoolSize);
+        String from = fromAccountId == null ? accountId : fromAccountId;
+        String to = toAccountId == null ? accountId : toAccountId;
+        writer.ensureBankPool(balanceType, currency, bankPoolSize, true);
+        return post(new Posting(
+                from, balanceType, to, balanceType, currency, amount,
+                movement.requestId().strip(), null, bizType));
     }
 
     private static int poolSize(int poolSize) {

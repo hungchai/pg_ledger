@@ -22,9 +22,6 @@ public interface LedgerStore extends AutoCloseable {
 
     int ensureBankPool(String balanceType, String currency, int poolSize, boolean keepExisting);
 
-    Transfer postCash(String direction, String requestId, String accountId, String balanceType,
-                      String currency, BigDecimal amount, int poolSize);
-
     Account deleteAccount(String accountId, String balanceType, String currency);
 
     BigDecimal bankPosition(String balanceType, String currency);

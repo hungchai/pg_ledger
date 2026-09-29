@@ -103,6 +103,15 @@ CREATE TABLE IF NOT EXISTS pgledger_balance_types (
     updated_at TIMESTAMPTZ NOT NULL
 );
 
+INSERT INTO pgledger_balance_types (code, name, created_at, updated_at)
+VALUES
+    ('LIQUID', 'LIQUID', now(), now()),
+    ('PENDING_INCOMING', 'PENDING_INCOMING', now(), now()),
+    ('PENDING_OUTGOING', 'PENDING_OUTGOING', now(), now()),
+    ('COMPLIANCE_HOLD', 'COMPLIANCE_HOLD', now(), now()),
+    ('GAS_FEE', 'GAS_FEE', now(), now())
+ON CONFLICT (code) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS pgledger_accounts (
     id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pgla'),
     account_id TEXT NOT NULL,
@@ -136,6 +145,17 @@ VALUES
     ('TRANSFER', 'Transfer'),
     ('DEPOSIT', 'Deposit'),
     ('WITHDRAWAL', 'Withdrawal')
+ON CONFLICT (code) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS pgledger_currencies (
+    code TEXT PRIMARY KEY,
+    scale INT NOT NULL
+);
+
+INSERT INTO pgledger_currencies (code, scale)
+VALUES
+    ('USD', 2),
+    ('EUR', 2)
 ON CONFLICT (code) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS pgledger_transfers (

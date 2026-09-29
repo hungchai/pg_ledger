@@ -41,10 +41,22 @@ BEGIN
     WHERE from_account_id = ANY(smoke_ids) OR to_account_id = ANY(smoke_ids);
     DELETE FROM pgledger_accounts WHERE id = ANY(smoke_ids);
     DELETE FROM pgledger_balance_types WHERE code IN ('SMOKE_AVAILABLE', 'SMOKE_LOCKED');
-    DELETE FROM pgledger_biz_types WHERE code = 'SMOKE_FEE';
+    DELETE FROM pgledger_biz_types WHERE code IN ('SMOKE_FEE', 'COIN_DEPOSIT');
+    DELETE FROM pgledger_currencies WHERE code = 'SMOKE_CCY';
 
     IF (SELECT count(*) FROM pgledger_biz_types WHERE code IN ('TRANSFER', 'DEPOSIT', 'WITHDRAWAL')) <> 3 THEN
         RAISE EXCEPTION 'biz types not seeded';
+    END IF;
+    IF (
+        SELECT count(*)
+        FROM pgledger_balance_types
+        WHERE code IN ('LIQUID', 'PENDING_INCOMING', 'PENDING_OUTGOING', 'COMPLIANCE_HOLD', 'GAS_FEE')
+          AND name = code
+    ) <> 5 THEN
+        RAISE EXCEPTION 'balance types not seeded';
+    END IF;
+    IF (SELECT count(*) FROM pgledger_currencies WHERE code IN ('USD', 'EUR') AND scale = 2) <> 2 THEN
+        RAISE EXCEPTION 'currencies not seeded';
     END IF;
 
     PERFORM * FROM pgledger_create_balance_type('SMOKE_AVAILABLE', 'Available', NULL);
@@ -64,6 +76,16 @@ BEGIN
     PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_LOCKED', 'Client locked', 'USD', FALSE, TRUE, NULL);
     PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'Client EUR', 'EUR', TRUE, TRUE, NULL);
     PERFORM * FROM pgledger_create_account('SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'Company', 'USD', TRUE, TRUE, NULL);
+
+    BEGIN
+        PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'x', 'ZZZ', TRUE, TRUE, NULL);
+        RAISE EXCEPTION 'expected unknown currency to fail';
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF SQLERRM NOT LIKE '%currency not found%' THEN
+                RAISE;
+            END IF;
+    END;
 
     BEGIN
         PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'MISSING', 'x', 'USD', FALSE, TRUE, NULL);
@@ -93,6 +115,18 @@ BEGIN
     EXCEPTION
         WHEN OTHERS THEN
             IF SQLERRM NOT LIKE '%biz type not found%' THEN
+                RAISE;
+            END IF;
+    END;
+
+    BEGIN
+        PERFORM * FROM pgledger_create_transfer(
+            'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'ZZZ', 1,
+            NULL, NULL, 'smoke-bad-ccy');
+        RAISE EXCEPTION 'expected unknown currency to fail';
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF SQLERRM NOT LIKE '%currency not found%' THEN
                 RAISE;
             END IF;
     END;
@@ -276,8 +310,9 @@ BEGIN
     END;
 
     SELECT id INTO deposit_id
-    FROM pgledger_post_cash(
-        'smoke-dep-1', 'DEPOSIT', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 15, NULL, 'smoke-wire', 8
+    FROM pgledger_create_transfer(
+        'BANK', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 15,
+        NULL, 'smoke-wire', 'smoke-dep-1', 'DEPOSIT'
     );
     SELECT biz_type, request_id, biz_reference INTO deposit_biz, deposit_request, deposit_ref
     FROM pgledger_transfers
@@ -307,8 +342,9 @@ BEGIN
     END IF;
 
     SELECT id INTO replay_id
-    FROM pgledger_post_cash(
-        'smoke-dep-1', 'DEPOSIT', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 15, NULL, NULL, 8
+    FROM pgledger_create_transfer(
+        'BANK', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 15,
+        NULL, NULL, 'smoke-dep-1', 'DEPOSIT'
     );
     IF replay_id IS DISTINCT FROM deposit_id THEN
         RAISE EXCEPTION 'replay posted a second transfer';
@@ -325,8 +361,9 @@ BEGIN
     END IF;
 
     BEGIN
-        PERFORM * FROM pgledger_post_cash(
-            'smoke-dep-1', 'DEPOSIT', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 16, NULL, NULL, 8
+        PERFORM * FROM pgledger_create_transfer(
+            'BANK', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 16,
+            NULL, NULL, 'smoke-dep-1', 'DEPOSIT'
         );
         RAISE EXCEPTION 'expected reused request id to fail';
     EXCEPTION
@@ -344,8 +381,9 @@ BEGIN
     END IF;
 
     SELECT id INTO withdrawal_id
-    FROM pgledger_post_cash(
-        'smoke-wd-1', 'WITHDRAWAL', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 15, NULL, NULL, 8
+    FROM pgledger_create_transfer(
+        'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'BANK', 'SMOKE_AVAILABLE', 'USD', 15,
+        NULL, NULL, 'smoke-wd-1', 'WITHDRAWAL'
     );
     SELECT t.biz_type INTO withdrawal_biz
     FROM pgledger_transfers t
@@ -386,6 +424,35 @@ BEGIN
         RAISE EXCEPTION 'inserted biz type was not stored';
     END IF;
     DELETE FROM pgledger_biz_types WHERE code = 'SMOKE_FEE';
+
+    INSERT INTO pgledger_biz_types (code, name) VALUES ('COIN_DEPOSIT', 'Coin deposit');
+    SELECT id INTO deposit_id
+    FROM pgledger_create_transfer(
+        'BANK', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 1,
+        NULL, NULL, 'smoke-coin-1', 'COIN_DEPOSIT'
+    );
+    SELECT biz_type, fa.account_id INTO deposit_biz, deposit_from
+    FROM pgledger_transfers t
+    JOIN pgledger_accounts fa ON fa.id = t.from_account_id
+    WHERE t.id = deposit_id;
+    IF deposit_biz IS DISTINCT FROM 'COIN_DEPOSIT'
+        OR deposit_from IS DISTINCT FROM pgledger_bank_account_id(
+            'USD', 'SMOKE_AVAILABLE', pgledger_bank_shard('smoke-coin-1', 8)
+        ) THEN
+        RAISE EXCEPTION 'coin deposit biz_type=% from=%, expected COIN_DEPOSIT and the bank shard',
+            deposit_biz, deposit_from;
+    END IF;
+    DELETE FROM pgledger_biz_types WHERE code = 'COIN_DEPOSIT';
+
+    INSERT INTO pgledger_currencies (code, scale) VALUES ('SMOKE_CCY', 8);
+    PERFORM * FROM pgledger_create_account(
+        'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'Client smoke ccy', 'SMOKE_CCY', TRUE, TRUE, NULL);
+    PERFORM * FROM pgledger_create_account(
+        'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'Company smoke ccy', 'SMOKE_CCY', TRUE, TRUE, NULL);
+    PERFORM * FROM pgledger_create_transfer(
+        'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'SMOKE_CCY', 1,
+        NULL, NULL, 'smoke-ccy-1');
+    DELETE FROM pgledger_currencies WHERE code = 'SMOKE_CCY';
 
     RAISE NOTICE 'smoke test passed';
 END $$;

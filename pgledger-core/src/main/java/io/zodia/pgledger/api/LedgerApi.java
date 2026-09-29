@@ -53,7 +53,20 @@ public final class LedgerApi {
             String currency,
             BigDecimal amount,
             String requestId,
-            String bizReference) {
+            String bizReference,
+            String bizType) {
+        public Posting(
+                String fromAccountId,
+                String fromBalanceType,
+                String toAccountId,
+                String toBalanceType,
+                String currency,
+                BigDecimal amount,
+                String requestId,
+                String bizReference) {
+            this(fromAccountId, fromBalanceType, toAccountId, toBalanceType,
+                    currency, amount, requestId, bizReference, null);
+        }
     }
 
     public record Account(
