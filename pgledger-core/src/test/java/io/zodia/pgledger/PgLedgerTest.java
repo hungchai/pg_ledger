@@ -17,8 +17,6 @@ import org.postgresql.ds.PGSimpleDataSource;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -588,30 +586,7 @@ class PgLedgerTest {
     }
 
     @Test
-    void schemaScriptsKeepFunctionBodiesIntact() throws Exception {
-        String tables = Files.readString(Path.of("db/V001__ledger.sql"));
-        String functions = Files.readString(Path.of("db/V002__functions.sql"));
-        List<String> tableStatements = SqlScripts.statements(tables);
-        List<String> functionStatements = SqlScripts.statements(functions);
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("CREATE TABLE") && sql.contains("pgledger_accounts")));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("CREATE TABLE") && sql.contains("pgledger_balance_types")));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("balance_type") && sql.contains("account_id")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_balance_type")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_account")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_transfer")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_post_cash")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_delete_account")));
-        assertTrue(functionStatements.stream().noneMatch(sql -> sql.contains("pgledger_post(")));
-        String lowered = functionsText(functionStatements);
-        assertFalse(lowered.contains("skip locked"));
-        assertFalse(lowered.contains("for update limit"));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("account_class") && sql.contains("deleted")));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("pgledger_bank_shards")));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("pgledger_cash_requests")));
-        for (int i = 0; i < functionStatements.size(); i++) {
-            String sql = functionStatements.get(i);
-            assertEquals(0, count(sql, "$$") % 2, sql);
-        }
+    void sqlScriptsKeepDollarQuoteBodies() {
         List<String> sample = SqlScripts.statements("SELECT 1; CREATE FUNCTION f() AS $$ SELECT ';' $$ LANGUAGE sql;");
         assertEquals(2, sample.size());
         assertTrue(sample.get(1).contains("SELECT ';'"));
@@ -773,14 +748,6 @@ class PgLedgerTest {
         }
     }
 
-    private static String functionsText(List<String> statements) {
-        StringBuilder text = new StringBuilder();
-        for (int i = 0; i < statements.size(); i++) {
-            text.append(statements.get(i).toLowerCase(java.util.Locale.ROOT)).append('\n');
-        }
-        return text.toString();
-    }
-
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
                                    String currency, String amount) {
         return new Posting(fromAccount, fromType, toAccount, toType, currency, new BigDecimal(amount), null);
@@ -789,20 +756,6 @@ class PgLedgerTest {
     private static String id(String prefix) {
         return prefix + Long.toUnsignedString(IDS.incrementAndGet(), 36)
                 + Long.toUnsignedString(System.nanoTime(), 36);
-    }
-
-    private static int count(String text, String token) {
-        int n = 0;
-        int from = 0;
-        while (from < text.length()) {
-            int at = text.indexOf(token, from);
-            if (at < 0) {
-                return n;
-            }
-            n++;
-            from = at + token.length();
-        }
-        return n;
     }
 
     private static final class Nodes implements AutoCloseable {

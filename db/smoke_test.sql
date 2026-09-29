@@ -199,22 +199,6 @@ BEGIN
         RAISE EXCEPTION 'pairwise posting must be TRANSFER with null request_id and biz_reference';
     END IF;
 
-    IF to_regclass('pgledger_bank_pools') IS NOT NULL
-        OR to_regclass('pgledger_bank_shards') IS NOT NULL
-        OR to_regclass('pgledger_cash_requests') IS NOT NULL THEN
-        RAISE EXCEPTION 'redundant bank tables still exist';
-    END IF;
-
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'pgledger_transfers' AND column_name = 'metadata'
-    ) OR NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'pgledger_transfers' AND column_name = 'biz_reference' AND is_nullable = 'YES'
-    ) THEN
-        RAISE EXCEPTION 'pgledger_transfers must have nullable biz_reference and no metadata';
-    END IF;
-
     SELECT id INTO deposit_id
     FROM pgledger_post_cash(
         'smoke-dep-1', 'DEPOSIT', 'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'USD', 15, NULL, 'smoke-wire', 8

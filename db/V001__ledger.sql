@@ -1,8 +1,10 @@
 -- pgledger schema (https://github.com/pgr0ss/pgledger) plus balance_type registry.
 -- pgledger_balance_types holds registered codes (AVAILABLE, LOCKED, ...).
--- pgledger_accounts.id is the internal primary key referenced by transfers and
--- entries. account_id is the caller's business account. One row is one balance:
+-- pgledger_accounts.id is the internal primary key that transfers and entries
+-- store. account_id is the caller's business account. One row is one balance:
 -- unique (account_id, balance_type, currency).
+-- No cross-table parent checks. Sharding cannot validate a row in another table.
+-- pgledger_accounts_account_class_chk and pgledger_transfers_biz_type_chk stay.
 
 -- UUID to ULID text. Ids are stored as text, so the reverse (ULID to UUID) is not loaded.
 
@@ -103,7 +105,7 @@ CREATE TABLE IF NOT EXISTS pgledger_balance_types (
 CREATE TABLE IF NOT EXISTS pgledger_accounts (
     id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pgla'),
     account_id TEXT NOT NULL,
-    balance_type TEXT NOT NULL REFERENCES pgledger_balance_types (code),
+    balance_type TEXT NOT NULL,
     name TEXT NOT NULL,
     currency TEXT NOT NULL,
     balance NUMERIC NOT NULL DEFAULT 0,
@@ -125,8 +127,8 @@ CREATE INDEX IF NOT EXISTS pgledger_accounts_account_id_idx ON pgledger_accounts
 
 CREATE TABLE IF NOT EXISTS pgledger_transfers (
     id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pglt'),
-    from_account_id TEXT NOT NULL REFERENCES pgledger_accounts (id),
-    to_account_id TEXT NOT NULL REFERENCES pgledger_accounts (id),
+    from_account_id TEXT NOT NULL,
+    to_account_id TEXT NOT NULL,
     amount NUMERIC NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     event_at TIMESTAMPTZ NOT NULL,
@@ -147,8 +149,8 @@ CREATE INDEX IF NOT EXISTS pgledger_transfers_created_at_idx ON pgledger_transfe
 
 CREATE TABLE IF NOT EXISTS pgledger_entries (
     id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pgle'),
-    account_id TEXT NOT NULL REFERENCES pgledger_accounts (id),
-    transfer_id TEXT NOT NULL REFERENCES pgledger_transfers (id),
+    account_id TEXT NOT NULL,
+    transfer_id TEXT NOT NULL,
     amount NUMERIC NOT NULL,
     account_previous_balance NUMERIC NOT NULL,
     account_current_balance NUMERIC NOT NULL,
