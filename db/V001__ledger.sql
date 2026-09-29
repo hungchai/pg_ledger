@@ -170,7 +170,7 @@ END
 $class$;
 
 -- One pool per (balance_type, currency). Shard rows are BANK accounts. Soft-deleted
--- shards stay here so old transfers still resolve; the picker ignores them.
+-- shards stay here so old transfers still resolve. The picker ignores them.
 CREATE TABLE IF NOT EXISTS pgledger_bank_pools (
     currency TEXT NOT NULL,
     balance_type TEXT NOT NULL REFERENCES pgledger_balance_types (code),
