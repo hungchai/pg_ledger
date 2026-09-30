@@ -21,6 +21,7 @@ dependencies {
     implementation(project(":pgledger-core"))
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.apache.shardingsphere:shardingsphere-jdbc:5.5.2")
+    implementation("org.mybatis.spring.boot:mybatis-spring-boot-starter:3.0.4")
     implementation("com.zaxxer:HikariCP")
     runtimeOnly("org.postgresql:postgresql")
     testImplementation(project(":pgledger-client-sdk"))

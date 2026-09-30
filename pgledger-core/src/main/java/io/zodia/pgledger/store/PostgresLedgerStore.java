@@ -8,6 +8,7 @@ import io.zodia.pgledger.api.LedgerApi.Entry;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
+import io.zodia.pgledger.store.read.LedgerReadSql;
 
 import javax.sql.DataSource;
 import java.io.IOException;
@@ -98,19 +99,6 @@ public final class PostgresLedgerStore implements LedgerStore {
             WHERE t.id = ?
             ORDER BY e.id
             """;
-    private static final String ONE_BALANCE = "SELECT " + ACCOUNT_ID_COLUMNS + """
-             FROM pgledger_accounts
-             WHERE account_id = ? AND balance_type_id = ? AND currency_id = ?
-            """;
-    private static final String BALANCES = "SELECT " + ACCOUNT_ID_COLUMNS + """
-             FROM pgledger_accounts
-             WHERE account_id = ?
-            """;
-    private static final String BANK_POSITION = """
-            SELECT COALESCE(SUM(balance), 0)
-            FROM pgledger_accounts
-            WHERE account_class_id = ? AND balance_type_id = ? AND currency_id = ?
-            """;
     private static final String JOURNAL_COUNT = "SELECT count(*) FROM pgledger_transfers";
     private static final String JOURNALS = """
             SELECT
@@ -152,10 +140,17 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     private final DataSource dataSource;
     private final RegistryCache registries;
+    private final LedgerReadSql.ReadQueryFactory reads;
 
     public PostgresLedgerStore(DataSource dataSource, boolean migrate, RegistryCache registries) {
+        this(dataSource, migrate, registries, LedgerReadSql.queries(LedgerReadSql.factory(dataSource), registries));
+    }
+
+    PostgresLedgerStore(DataSource dataSource, boolean migrate, RegistryCache registries,
+                        LedgerReadSql.ReadQueryFactory reads) {
         this.dataSource = dataSource;
         this.registries = registries;
+        this.reads = reads;
         if (migrate) {
             migrate(dataSource);
         }
@@ -298,25 +293,7 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     @Override
     public java.math.BigDecimal bankPosition(String balanceType, String currency) {
-        Integer classId = registries.accountClassId("BANK");
-        Integer typeId = registries.findBalanceTypeId(balanceType);
-        Integer currencyId = registries.currencyId(currency);
-        if (classId == null || typeId == null || currencyId == null) {
-            return java.math.BigDecimal.ZERO;
-        }
-        return read(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(BANK_POSITION)) {
-                ps.setInt(1, classId);
-                ps.setInt(2, typeId);
-                ps.setInt(3, currencyId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        throw new LedgerException("pgledger_bank_position returned no row");
-                    }
-                    return rs.getBigDecimal(1);
-                }
-            }
-        });
+        return reads.query(reads -> reads.bankPosition(balanceType, currency));
     }
 
     @Override
@@ -351,43 +328,12 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     @Override
     public List<Account> balances(String accountId) {
-        List<Account> rows = read(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(BALANCES)) {
-                ps.setString(1, accountId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    ArrayList<Account> found = new ArrayList<>();
-                    while (rs.next()) {
-                        found.add(accountIds(rs));
-                    }
-                    return List.copyOf(found);
-                }
-            }
-        });
-        ArrayList<Account> sorted = new ArrayList<>(rows);
-        sorted.sort(java.util.Comparator.comparing(Account::balanceType).thenComparing(Account::currency));
-        return List.copyOf(sorted);
+        return reads.query(reads -> reads.balances(accountId));
     }
 
     @Override
     public Account balance(String accountId, String balanceType, String currency) {
-        Integer typeId = registries.findBalanceTypeId(balanceType);
-        Integer currencyId = registries.currencyId(currency);
-        if (typeId == null || currencyId == null) {
-            return null;
-        }
-        return read(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(ONE_BALANCE)) {
-                ps.setString(1, accountId);
-                ps.setInt(2, typeId);
-                ps.setInt(3, currencyId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        return null;
-                    }
-                    return accountIds(rs);
-                }
-            }
-        });
+        return reads.query(reads -> reads.balance(accountId, balanceType, currency));
     }
 
     @Override

@@ -4,6 +4,8 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.zodia.pgledger.PgLedger;
 import io.zodia.pgledger.store.PostgresLedgerStore;
+import io.zodia.pgledger.store.read.LedgerReadMapper;
+import io.zodia.pgledger.store.read.LedgerReadService;
 import org.apache.shardingsphere.driver.api.ShardingSphereDataSourceFactory;
 import org.apache.shardingsphere.infra.algorithm.core.config.AlgorithmConfiguration;
 import org.apache.shardingsphere.infra.config.rule.RuleConfiguration;
@@ -11,6 +13,8 @@ import org.apache.shardingsphere.readwritesplitting.config.ReadwriteSplittingRul
 import org.apache.shardingsphere.readwritesplitting.config.rule.ReadwriteSplittingDataSourceGroupRuleConfiguration;
 import org.apache.shardingsphere.readwritesplitting.transaction.TransactionalReadQueryStrategy;
 import org.apache.shardingsphere.single.config.SingleRuleConfiguration;
+import org.mybatis.spring.SqlSessionFactoryBean;
+import org.mybatis.spring.mapper.MapperFactoryBean;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -56,6 +60,36 @@ class PgLedgerDataSourceConfiguration {
                 ? PgLedger.DEFAULT_BANK_POOL_SIZE
                 : properties.bankPoolSize().intValue();
         return PgLedger.routed(dataSource, poolSize);
+    }
+
+    @Bean
+    org.apache.ibatis.session.SqlSessionFactory sqlSessionFactory(@Qualifier("dataSource") DataSource dataSource)
+            throws Exception {
+        SqlSessionFactoryBean factory = new SqlSessionFactoryBean();
+        factory.setDataSource(dataSource);
+        org.apache.ibatis.session.Configuration configuration =
+                new org.apache.ibatis.session.Configuration();
+        configuration.setMapUnderscoreToCamelCase(true);
+        configuration.setUseColumnLabel(true);
+        factory.setConfiguration(configuration);
+        return factory.getObject();
+    }
+
+    @Bean
+    MapperFactoryBean<LedgerReadMapper> ledgerReadMapper(
+            org.apache.ibatis.session.SqlSessionFactory sessionFactory) {
+        // MapperFactoryBean works with a plain SqlSessionFactory; it only needs
+        // the factory to open one session per call. Reads ride the same
+        // read/write-splitting DataSource as everything else.
+        MapperFactoryBean<LedgerReadMapper> factoryBean =
+                new MapperFactoryBean<>(LedgerReadMapper.class);
+        factoryBean.setSqlSessionFactory(sessionFactory);
+        return factoryBean;
+    }
+
+    @Bean
+    LedgerReadService ledgerReadService(LedgerReadMapper mapper, PgLedger ledger) {
+        return new LedgerReadService(mapper, ledger.registryCache());
     }
 
     private static DataSource readWriteSplitting(DataSource writer, DataSource reader) throws SQLException {

@@ -51,6 +51,13 @@ public final class PgLedger implements AutoCloseable {
     }
 
     /**
+     * The registry snapshot backing id/code resolution. Shared, read-only view.
+     */
+    public RegistryCache registryCache() {
+        return registries;
+    }
+
+    /**
      * Writes go to {@code writer}. Balance and journal queries go to {@code reader}.
      * The reader URL is required and is never copied from the writer.
      */
@@ -157,11 +164,11 @@ public final class PgLedger implements AutoCloseable {
     }
 
     public Transfer deposit(CashMovement movement) {
-        return cash(movement, "BANK", null, "DEPOSIT");
+        return moveViaBank(movement, "BANK", null, "DEPOSIT");
     }
 
     public Transfer withdraw(CashMovement movement) {
-        return cash(movement, null, "BANK", "WITHDRAWAL");
+        return moveViaBank(movement, null, "BANK", "WITHDRAWAL");
     }
 
     public Account deleteAccount(String accountId, String balanceType, String currency) {
@@ -245,7 +252,11 @@ public final class PgLedger implements AutoCloseable {
         return dataSource;
     }
 
-    private Transfer cash(CashMovement movement, String fromAccountId, String toAccountId, String bizType) {
+    /**
+     * Moves value between an account and the bank shard pool. The asset can be fiat or
+     * crypto; only the direction differs. {@code bizType} says DEPOSIT or WITHDRAWAL.
+     */
+    private Transfer moveViaBank(CashMovement movement, String fromAccountId, String toAccountId, String bizType) {
         if (movement == null || blank(movement.requestId())) {
             throw new LedgerViolation("request_id is required");
         }

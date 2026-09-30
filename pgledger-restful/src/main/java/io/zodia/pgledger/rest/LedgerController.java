@@ -8,6 +8,7 @@ import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.DeleteAccount;
 import io.zodia.pgledger.api.LedgerApi.Posting;
 import io.zodia.pgledger.store.LedgerJson;
+import io.zodia.pgledger.store.read.LedgerReadService;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -21,9 +22,11 @@ final class LedgerController {
     private static final int MAX_BODY = 1 << 20;
 
     private final PgLedger ledger;
+    private final LedgerReadService reads;
 
-    LedgerController(PgLedger ledger) {
+    LedgerController(PgLedger ledger, LedgerReadService reads) {
         this.ledger = ledger;
+        this.reads = reads;
     }
 
     @GetMapping("/health")
@@ -52,26 +55,26 @@ final class LedgerController {
 
     @GetMapping("/api/v1/accounts/{accountId}/balances")
     ResponseEntity<byte[]> balances(@PathVariable("accountId") String accountId) {
-        return HttpResponses.of(200, PgLedgerServer.READER, LedgerJson.writeBytes(ledger.balances(accountId)));
+        return HttpResponses.of(200, PgLedgerServer.READER, LedgerJson.writeBytes(reads.balances(accountId)));
     }
 
     @PostMapping("/api/v1/postings")
     ResponseEntity<byte[]> post(@RequestBody(required = false) byte[] body) {
-        Posting posting = read(LedgerJson.numbersAsText(body, "fromBalanceType", "toBalanceType"), Posting.class);
+        Posting posting = read(numbersAsText(body, "fromBalanceType", "toBalanceType"), Posting.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.post(posting))));
     }
 
     @PostMapping("/api/v1/deposits")
     ResponseEntity<byte[]> deposit(@RequestBody(required = false) byte[] body) {
-        CashMovement movement = read(LedgerJson.numbersAsText(body, "balanceType"), CashMovement.class);
+        CashMovement movement = read(numbersAsText(body, "balanceType"), CashMovement.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.deposit(movement))));
     }
 
     @PostMapping("/api/v1/withdrawals")
     ResponseEntity<byte[]> withdraw(@RequestBody(required = false) byte[] body) {
-        CashMovement movement = read(LedgerJson.numbersAsText(body, "balanceType"), CashMovement.class);
+        CashMovement movement = read(numbersAsText(body, "balanceType"), CashMovement.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.withdraw(movement))));
     }
@@ -88,7 +91,7 @@ final class LedgerController {
             @RequestParam(name = "accountId", required = false) String accountId,
             @RequestParam(name = "balanceType", required = false) String balanceType,
             @RequestParam(name = "currency", required = false) String currency) {
-        Account account = ledger.balance(required(accountId), required(balanceType), required(currency));
+        Account account = reads.balance(required(accountId), required(balanceType), required(currency));
         if (account == null) {
             return HttpResponses.of(404, PgLedgerServer.READER, HttpResponses.NOT_FOUND);
         }
@@ -137,6 +140,20 @@ final class LedgerController {
                 throw new BadRequestException();
             }
             return value;
+        } catch (LedgerJson.JsonReadException e) {
+            throw new BadRequestException();
+        }
+    }
+
+    /**
+     * Same as {@link LedgerJson#numbersAsText} but malformed JSON is a 400, not a 500.
+     */
+    private static byte[] numbersAsText(byte[] json, String... fields) {
+        if (json == null || json.length == 0 || json.length > MAX_BODY) {
+            throw new BadRequestException();
+        }
+        try {
+            return LedgerJson.numbersAsText(json, fields);
         } catch (LedgerJson.JsonReadException e) {
             throw new BadRequestException();
         }

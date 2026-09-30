@@ -19,6 +19,7 @@ dependencies {
     implementation("org.postgresql:postgresql:42.7.7")
     implementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.18.2")
+    implementation("org.mybatis:mybatis:3.5.19")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
 }
 
