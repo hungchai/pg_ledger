@@ -27,6 +27,9 @@ dependencies {
     testImplementation(project(":pgledger-client-sdk"))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("org.postgresql:postgresql")
+    testImplementation(platform("org.testcontainers:testcontainers-bom:1.20.4"))
+    testImplementation("org.testcontainers:junit-jupiter")
+    testImplementation("org.testcontainers:postgresql")
 }
 
 tasks.withType<JavaCompile> {
@@ -37,10 +40,12 @@ tasks.test {
     useJUnitPlatform {
         excludeTags("stress")
     }
+    // Repo-root docker/ scripts for Testcontainers primary+replica (PgLedgerRestTest).
+    workingDir = rootProject.projectDir
 }
 
 tasks.register<Test>("stressTest") {
-    description = "Writer/reader HTTP stress. Requires docker compose up."
+    description = "Writer/reader HTTP stress against docker compose :5432/:5433. Prints TPS report. Not Testcontainers."
     group = "verification"
     testClassesDirs = sourceSets["test"].output.classesDirs
     classpath = sourceSets["test"].runtimeClasspath

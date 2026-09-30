@@ -3,9 +3,7 @@ package io.zodia.pgledger.store;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -40,23 +38,6 @@ public final class LedgerJson {
             return MAPPER.writeValueAsString(value);
         } catch (IOException e) {
             throw new LedgerException("failed to write json", e);
-        }
-    }
-
-    public static byte[] numbersAsText(byte[] json, String... fields) {
-        try {
-            JsonNode node = MAPPER.readTree(json);
-            if (node instanceof ObjectNode object) {
-                for (String field : fields) {
-                    JsonNode value = object.get(field);
-                    if (value != null && value.isNumber()) {
-                        object.put(field, value.asText());
-                    }
-                }
-            }
-            return MAPPER.writeValueAsBytes(node);
-        } catch (IOException e) {
-            throw new JsonReadException(e);
         }
     }
 

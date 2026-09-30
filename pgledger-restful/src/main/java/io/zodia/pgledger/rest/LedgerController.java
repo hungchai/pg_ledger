@@ -60,21 +60,21 @@ final class LedgerController {
 
     @PostMapping("/api/v1/postings")
     ResponseEntity<byte[]> post(@RequestBody(required = false) byte[] body) {
-        Posting posting = read(numbersAsText(body, "fromBalanceType", "toBalanceType"), Posting.class);
+        Posting posting = read(body, Posting.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.post(posting))));
     }
 
     @PostMapping("/api/v1/deposits")
     ResponseEntity<byte[]> deposit(@RequestBody(required = false) byte[] body) {
-        CashMovement movement = read(numbersAsText(body, "balanceType"), CashMovement.class);
+        CashMovement movement = read(body, CashMovement.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.deposit(movement))));
     }
 
     @PostMapping("/api/v1/withdrawals")
     ResponseEntity<byte[]> withdraw(@RequestBody(required = false) byte[] body) {
-        CashMovement movement = read(numbersAsText(body, "balanceType"), CashMovement.class);
+        CashMovement movement = read(body, CashMovement.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.withdraw(movement))));
     }
@@ -140,20 +140,6 @@ final class LedgerController {
                 throw new BadRequestException();
             }
             return value;
-        } catch (LedgerJson.JsonReadException e) {
-            throw new BadRequestException();
-        }
-    }
-
-    /**
-     * Same as {@link LedgerJson#numbersAsText} but malformed JSON is a 400, not a 500.
-     */
-    private static byte[] numbersAsText(byte[] json, String... fields) {
-        if (json == null || json.length == 0 || json.length > MAX_BODY) {
-            throw new BadRequestException();
-        }
-        try {
-            return LedgerJson.numbersAsText(json, fields);
         } catch (LedgerJson.JsonReadException e) {
             throw new BadRequestException();
         }

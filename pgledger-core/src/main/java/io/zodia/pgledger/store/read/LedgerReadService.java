@@ -1,12 +1,16 @@
 package io.zodia.pgledger.store.read;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.Entry;
+import io.zodia.pgledger.api.LedgerApi.JournalPage;
+import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerJson;
 import io.zodia.pgledger.store.RegistryCache;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -43,6 +47,88 @@ public class LedgerReadService {
         }
         LedgerReadMapper.AccountRow row = mapper.balance(accountId, typeId.intValue(), currencyId.intValue());
         return row == null ? null : toAccount(row);
+    }
+
+    /**
+     * Groups joined rows into transfers, page order preserved: newest transfer
+     * first, entries by id inside a transfer. Rows past the end yield an empty
+     * page, never a repeat of an earlier one.
+     */
+    public JournalPage journals(int page, int size) {
+        long offset = (long) page * (long) size;
+        List<LedgerReadMapper.JournalRow> rows = mapper.journals(size, offset);
+        // Window total rides the same snapshot as the rows. An empty page (offset
+        // past the end) has no rows to carry it; the standalone count then cannot
+        // contradict hasNext because the page is empty either way.
+        long total = rows.isEmpty() ? mapper.journalCount() : rows.get(0).totalCount();
+        LinkedHashMap<String, Transfer> transfers = new LinkedHashMap<>(rows.size());
+        LinkedHashMap<String, ArrayList<Entry>> entries = new LinkedHashMap<>(rows.size());
+        for (LedgerReadMapper.JournalRow row : rows) {
+            transfers.computeIfAbsent(row.transferId(), ignored -> toTransfer(row));
+            if (row.entryId() != null) {
+                entries.computeIfAbsent(row.transferId(), ignored -> new ArrayList<>(2))
+                        .add(toEntry(row));
+            }
+        }
+        ArrayList<Transfer> pageRows = new ArrayList<>(transfers.size());
+        for (Transfer transfer : transfers.values()) {
+            List<Entry> lines = entries.get(transfer.id());
+            pageRows.add(withEntries(transfer, lines == null ? List.of() : List.copyOf(lines)));
+        }
+        // pageRows counts transfers, not joined rows; hasNext compares like with like.
+        boolean hasNext = offset + pageRows.size() < total;
+        return new JournalPage(page, size, total, hasNext, List.copyOf(pageRows));
+    }
+
+    private Transfer toTransfer(LedgerReadMapper.JournalRow row) {
+        int currencyId = row.currencyId();
+        int bizTypeId = row.bizTypeId();
+        return new Transfer(
+                row.transferId(),
+                row.fromAccountId(),
+                row.fromBalanceTypeId(),
+                row.toAccountId(),
+                row.toBalanceTypeId(),
+                code(registries.currencyCode(currencyId), currencyId),
+                row.transferAmount(),
+                row.transferCreatedAt(),
+                row.eventAt(),
+                row.requestId(),
+                code(registries.bizTypeCode(bizTypeId), bizTypeId),
+                row.bizReference(),
+                List.of());
+    }
+
+    private Entry toEntry(LedgerReadMapper.JournalRow row) {
+        int currencyId = row.entryCurrencyId() == null ? 0 : row.entryCurrencyId().intValue();
+        int balanceTypeId = row.entryBalanceTypeId() == null ? 0 : row.entryBalanceTypeId().intValue();
+        return new Entry(
+                row.entryId(),
+                row.entryAccountId(),
+                balanceTypeId,
+                code(registries.currencyCode(currencyId), currencyId),
+                row.entryAmount(),
+                row.accountPreviousBalance(),
+                row.accountCurrentBalance(),
+                row.accountVersion() == null ? 0L : row.accountVersion().longValue(),
+                row.entryCreatedAt());
+    }
+
+    private static Transfer withEntries(Transfer transfer, List<Entry> entries) {
+        return new Transfer(
+                transfer.id(),
+                transfer.fromAccountId(),
+                transfer.fromBalanceType(),
+                transfer.toAccountId(),
+                transfer.toBalanceType(),
+                transfer.currency(),
+                transfer.amount(),
+                transfer.createdAt(),
+                transfer.eventAt(),
+                transfer.requestId(),
+                transfer.bizType(),
+                transfer.bizReference(),
+                entries);
     }
 
     public BigDecimal bankPosition(String balanceType, String currency) {

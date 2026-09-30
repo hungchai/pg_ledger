@@ -27,7 +27,7 @@ public final class RegistryCache implements AutoCloseable {
             SELECT id, code FROM pgledger_account_classes
             """;
     private static final String BALANCE_TYPES = """
-            SELECT id, code, name, description, created_at, updated_at
+            SELECT id, code, name, description, allow_negative, allow_positive, created_at, updated_at
             FROM pgledger_balance_types
             """;
     private static final String BIZ_TYPES = """
@@ -239,6 +239,8 @@ public final class RegistryCache implements AutoCloseable {
                 rs.getString("code"),
                 rs.getString("name"),
                 rs.getString("description"),
+                rs.getBoolean("allow_negative"),
+                rs.getBoolean("allow_positive"),
                 instant(rs, "created_at"),
                 instant(rs, "updated_at"));
     }

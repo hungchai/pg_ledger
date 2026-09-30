@@ -117,7 +117,8 @@ public final class PgLedger implements AutoCloseable {
         String description = command.description() == null || command.description().isBlank()
                 ? null
                 : command.description().strip();
-        BalanceType created = writer.createBalanceType(new CreateBalanceType(code, name, description));
+        BalanceType created = writer.createBalanceType(new CreateBalanceType(code, name, description,
+                command.allowNegative(), command.allowPositive()));
         registries.remember(created);
         return created;
     }
@@ -147,8 +148,6 @@ public final class PgLedger implements AutoCloseable {
                 balanceType,
                 currency,
                 name,
-                flag(command.allowNegativeBalance()),
-                flag(command.allowPositiveBalance()),
                 command.metadata(),
                 registries.requireAccountClass(command.accountClass())));
     }
@@ -295,9 +294,5 @@ public final class PgLedger implements AutoCloseable {
 
     private static boolean blank(String value) {
         return value == null || value.isBlank();
-    }
-
-    private static boolean flag(Boolean value) {
-        return value == null || value.booleanValue();
     }
 }

@@ -12,11 +12,14 @@ import io.zodia.pgledger.client.PgLedgerClient;
 import io.zodia.pgledger.client.PgLedgerClientConfig;
 import io.zodia.pgledger.client.PgLedgerClientException;
 import org.apache.shardingsphere.infra.hint.HintManager;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
@@ -31,6 +34,10 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -40,28 +47,36 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+/**
+ * REST integration against Testcontainers primary + streaming replica.
+ * Does not use docker compose; see {@link PgLedgerStressTest} for that.
+ */
 @SpringBootTest(
         classes = PgLedgerServerMain.class,
-        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {
-                "pgledger.writer-jdbc-url=jdbc:postgresql://localhost:5432/pgledger",
-                "pgledger.reader-jdbc-url=jdbc:postgresql://localhost:5433/pgledger",
-                "pgledger.jdbc-user=pgledger",
-                "pgledger.jdbc-password=pgledger"
-        })
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class PgLedgerRestTest {
-    private static final String WRITER_URL = "jdbc:postgresql://localhost:5432/pgledger";
-    private static final String READER_URL = "jdbc:postgresql://localhost:5433/pgledger";
-    private static final String DB_USER = "pgledger";
-    private static final String DB_PASSWORD = "pgledger";
     private static final long CATCH_UP_NS = 15_000_000_000L;
     private static final AtomicLong IDS = new AtomicLong();
+    private static final PostgresReplicaCluster CLUSTER = PostgresReplicaCluster.start();
 
     @LocalServerPort
     private int port;
 
     @Autowired
     private DataSource dataSource;
+
+    @DynamicPropertySource
+    static void jdbcProperties(DynamicPropertyRegistry registry) {
+        registry.add("pgledger.writer-jdbc-url", CLUSTER::writerJdbcUrl);
+        registry.add("pgledger.reader-jdbc-url", CLUSTER::readerJdbcUrl);
+        registry.add("pgledger.jdbc-user", CLUSTER::username);
+        registry.add("pgledger.jdbc-password", CLUSTER::password);
+    }
+
+    @AfterAll
+    static void stopCluster() {
+        CLUSTER.close();
+    }
 
     @Test
     void readsHitReplicaAndWritesHitPrimary() throws Exception {
@@ -86,22 +101,32 @@ class PgLedgerRestTest {
             String locked = prefix + "L";
             String company = prefix + "CO";
             String clientId = prefix + "C";
-            client.createBalanceType(new CreateBalanceType(available, "Available", null));
+            BalanceType availableType = client.createBalanceType(new CreateBalanceType(available, "Available", null));
             assertEquals(200, client.status());
             assertEquals(PgLedgerServer.WRITER, client.role());
+            assertFalse(availableType.allowNegative());
+            assertTrue(availableType.allowPositive());
             client.createBalanceType(new CreateBalanceType(locked, "Locked", null));
+            String sinkable = prefix + "SINK";
+            BalanceType sinkType = client.createBalanceType(
+                    new CreateBalanceType(sinkable, "Sink", null, true, false));
+            assertTrue(sinkType.allowNegative());
+            assertFalse(sinkType.allowPositive());
             nodes.awaitCatchUp();
             List<BalanceType> types = client.balanceTypes();
             assertEquals(PgLedgerServer.READER, client.role());
             assertEquals(1, countCode(types, available));
             assertEquals(1, countCode(types, locked));
+            assertEquals(1, countCode(types, sinkable));
 
-            Account companyRow = client.createAccount(account(company, available, "USD", true, true));
+            Account companyRow = client.createAccount(
+                    new CreateAccount(company, available, "USD", company, null, "BANK"));
+            assertEquals(company, companyRow.accountId());
             assertEquals(company, companyRow.accountId());
             assertEquals(200, client.status());
             assertEquals(PgLedgerServer.WRITER, client.role());
-            client.createAccount(account(clientId, available, "USD", false, true));
-            client.createAccount(account(clientId, locked, "USD", false, true));
+            client.createAccount(account(clientId, available, "USD"));
+            client.createAccount(account(clientId, locked, "USD"));
 
             Transfer funded = client.post(posting(company, available, clientId, available, "USD", "10"));
             assertEquals(clientId, funded.toAccountId());
@@ -144,10 +169,61 @@ class PgLedgerRestTest {
             assertTrue(rejected.getMessage().contains("does not allow negative balance"));
             assertEquals(0, new BigDecimal("10").compareTo(client.balance(clientId, available, "USD").balance()));
 
+            String sink = prefix + "S";
+            client.createAccount(account(sink, sinkable, "USD"));
+            PgLedgerClientException noPositive = assertThrows(PgLedgerClientException.class,
+                    () -> client.post(posting(company, available, sink, sinkable, "USD", "1")));
+            assertEquals(422, noPositive.status());
+            assertTrue(noPositive.getMessage().contains("does not allow positive balance"));
+
             assertNull(client.balance(clientId, available, "GBP"));
             assertEquals(404, client.status());
             assertEquals(PgLedgerServer.READER, client.role());
             http.close();
+        }
+    }
+
+    /**
+     * Two threads post the same requestId at the same time. Exactly one transfer
+     * is created and the client is credited once. The loser either returns the
+     * same transfer (unique index wait) or 422; both leave the balance at amount.
+     */
+    @Test
+    void concurrentSameRequestIdCreditsOnce() throws Exception {
+        try (Nodes nodes = new Nodes();
+             PgLedgerClient http = client(port)) {
+            String prefix = id("RACE");
+            String type = prefix + "A";
+            String clientId = prefix + "C";
+            http.createBalanceType(new CreateBalanceType(type, "Available", null));
+            http.createAccount(account(clientId, type, "USD"));
+            http.createAccount(account(prefix + "B", type, "USD"));
+            BigDecimal amount = new BigDecimal("30");
+            String requestId = prefix + "R1";
+
+            int threads = 2;
+            CountDownLatch start = new CountDownLatch(1);
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            List<Future<Transfer>> posted = new java.util.ArrayList<>(threads);
+            try {
+                for (int i = 0; i < threads; i++) {
+                    posted.add(pool.submit(() -> {
+                        start.await();
+                        return http.deposit(new CashMovement(requestId, clientId, type, "USD", amount));
+                    }));
+                }
+                start.countDown();
+                java.util.Set<String> ids = new java.util.HashSet<>();
+                for (Future<Transfer> future : posted) {
+                    ids.add(future.get().id());
+                }
+                assertEquals(1, ids.size(), "same requestId must map to one transfer");
+            } finally {
+                pool.shutdownNow();
+            }
+            nodes.awaitCatchUp();
+            assertEquals(0, amount.compareTo(http.balance(clientId, type, "USD").balance()));
+            assertEquals(1L, journalCountFor(clientId));
         }
     }
 
@@ -160,7 +236,7 @@ class PgLedgerRestTest {
             String clientId = prefix + "C";
             http.createBalanceType(new CreateBalanceType(type, "Available", null));
             assertEquals(PgLedgerServer.WRITER, http.role());
-            http.createAccount(account(clientId, type, "USD", false, true));
+            http.createAccount(account(clientId, type, "USD"));
             BigDecimal amount = new BigDecimal("12");
             Transfer first = http.deposit(new CashMovement(prefix + "R1", clientId, type, "USD", amount));
             assertEquals(200, http.status());
@@ -253,9 +329,8 @@ class PgLedgerRestTest {
         return n;
     }
 
-    private static CreateAccount account(String accountId, String balanceType, String currency,
-                                         boolean allowNegative, boolean allowPositive) {
-        return new CreateAccount(accountId, balanceType, currency, accountId, allowNegative, allowPositive, null, null);
+    private static CreateAccount account(String accountId, String balanceType, String currency) {
+        return new CreateAccount(accountId, balanceType, currency, accountId, null, null);
     }
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
@@ -294,8 +369,8 @@ class PgLedgerRestTest {
         private final DataSource reader;
 
         private Nodes() throws SQLException {
-            writer = dataSource(WRITER_URL);
-            reader = dataSource(READER_URL);
+            writer = dataSource(CLUSTER.writerJdbcUrl());
+            reader = dataSource(CLUSTER.readerJdbcUrl());
             if (queryBoolean(writer, "SELECT pg_is_in_recovery()")) {
                 throw new IllegalStateException("writer url is a replica");
             }
@@ -359,9 +434,30 @@ class PgLedgerRestTest {
     private static PGSimpleDataSource dataSource(String url) {
         PGSimpleDataSource dataSource = new PGSimpleDataSource();
         dataSource.setURL(url);
-        dataSource.setUser(DB_USER);
-        dataSource.setPassword(DB_PASSWORD);
+        dataSource.setUser(CLUSTER.username());
+        dataSource.setPassword(CLUSTER.password());
         dataSource.setConnectTimeout(5);
         return dataSource;
+    }
+
+    /**
+     * Transfers involving the client, read from the writer so no replica lag.
+     */
+    private long journalCountFor(String clientId) throws SQLException {
+        try (Connection conn = dataSource(CLUSTER.writerJdbcUrl()).getConnection();
+             PreparedStatement ps = conn.prepareStatement("""
+                     SELECT count(DISTINCT t.id)
+                     FROM pgledger_transfers t
+                     JOIN pgledger_accounts a ON a.id IN (t.from_account_id, t.to_account_id)
+                     WHERE a.account_id = ?
+                     """)) {
+            ps.setString(1, clientId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    throw new IllegalStateException("journal count returned no row");
+                }
+                return rs.getLong(1);
+            }
+        }
     }
 }

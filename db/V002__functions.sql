@@ -5,13 +5,28 @@
 -- Balance rows are locked in sorted internal id order, same as pgledger.
 
 CREATE OR REPLACE FUNCTION pgledger_check_account_balance_constraints(account pgledger_accounts) RETURNS VOID AS $$
+DECLARE
+    v_type TEXT;
+    v_allow_negative BOOLEAN;
+    v_allow_positive BOOLEAN;
 BEGIN
-    IF NOT account.allow_negative_balance AND (account.balance < 0) THEN
-        RAISE EXCEPTION 'Account (id=%, name=%) does not allow negative balance', account.id, account.name;
+    -- Sign policy is on the balance type. BANK class may sit on either side of zero.
+    SELECT bt.code,
+           bt.allow_negative OR ac.code = 'BANK',
+           bt.allow_positive OR ac.code = 'BANK'
+    INTO v_type, v_allow_negative, v_allow_positive
+    FROM pgledger_balance_types bt
+    JOIN pgledger_account_classes ac ON ac.id = account.account_class_id
+    WHERE bt.id = account.balance_type_id;
+
+    IF NOT v_allow_negative AND (account.balance < 0) THEN
+        RAISE EXCEPTION 'Balance type % does not allow negative balance (account id=%, name=%)',
+            v_type, account.id, account.name;
     END IF;
 
-    IF NOT account.allow_positive_balance AND (account.balance > 0) THEN
-        RAISE EXCEPTION 'Account (id=%, name=%) does not allow positive balance', account.id, account.name;
+    IF NOT v_allow_positive AND (account.balance > 0) THEN
+        RAISE EXCEPTION 'Balance type % does not allow positive balance (account id=%, name=%)',
+            v_type, account.id, account.name;
     END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -19,7 +34,9 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION pgledger_create_balance_type(
     p_code TEXT,
     p_name TEXT,
-    p_description TEXT DEFAULT NULL
+    p_description TEXT DEFAULT NULL,
+    p_allow_negative BOOLEAN DEFAULT FALSE,
+    p_allow_positive BOOLEAN DEFAULT TRUE
 )
 RETURNS SETOF pgledger_balance_types_view
 AS $$
@@ -34,11 +51,15 @@ BEGIN
     v_code := btrim(p_code);
     v_name := COALESCE(NULLIF(btrim(p_name), ''), v_code);
 
-    INSERT INTO pgledger_balance_types (code, name, description, created_at, updated_at)
-    VALUES (v_code, v_name, NULLIF(btrim(p_description), ''), now(), now());
+    INSERT INTO pgledger_balance_types (code, name, description, allow_negative, allow_positive, created_at, updated_at)
+    VALUES (
+        v_code, v_name, NULLIF(btrim(p_description), ''),
+        COALESCE(p_allow_negative, FALSE), COALESCE(p_allow_positive, TRUE),
+        now(), now()
+    );
 
     RETURN QUERY
-    SELECT id, code, name, description, created_at, updated_at
+    SELECT id, code, name, description, allow_negative, allow_positive, created_at, updated_at
     FROM pgledger_balance_types_view
     WHERE code = v_code;
 EXCEPTION
@@ -121,14 +142,13 @@ END;
 $$ LANGUAGE plpgsql;
 
 DROP FUNCTION IF EXISTS pgledger_create_account(TEXT, TEXT, TEXT, TEXT, BOOLEAN, BOOLEAN, JSONB);
+DROP FUNCTION IF EXISTS pgledger_create_account(TEXT, TEXT, TEXT, TEXT, BOOLEAN, BOOLEAN, JSONB, TEXT);
 
 CREATE OR REPLACE FUNCTION pgledger_create_account(
     p_account_id TEXT,
     p_balance_type TEXT,
     p_name TEXT,
     p_currency TEXT,
-    p_allow_negative_balance BOOLEAN DEFAULT TRUE,
-    p_allow_positive_balance BOOLEAN DEFAULT TRUE,
     p_metadata JSONB DEFAULT NULL,
     p_account_class TEXT DEFAULT 'CLIENT'
 )
@@ -141,8 +161,6 @@ DECLARE
     v_currency_id INT;
     v_class_id INT;
     v_id TEXT;
-    v_allow_negative BOOLEAN;
-    v_allow_positive BOOLEAN;
 BEGIN
     IF p_account_id IS NULL OR btrim(p_account_id) = ''
         OR p_balance_type IS NULL OR btrim(p_balance_type) = ''
@@ -150,6 +168,7 @@ BEGIN
         RAISE EXCEPTION 'account_id, balance_type, and currency are required';
     END IF;
 
+    -- Sign policy lives on pgledger_balance_types; accounts do not store allow flags.
     SELECT id INTO v_balance_type_id
     FROM pgledger_balance_types
     WHERE code = btrim(p_balance_type);
@@ -174,22 +193,14 @@ BEGIN
     END IF;
 
     v_name := COALESCE(NULLIF(btrim(p_name), ''), p_account_id);
-    v_allow_negative := COALESCE(p_allow_negative_balance, TRUE);
-    v_allow_positive := COALESCE(p_allow_positive_balance, TRUE);
-    -- BANK is the deposit counterparty and may sit on either side of zero.
-    IF v_class = 'BANK' THEN
-        v_allow_negative := TRUE;
-        v_allow_positive := TRUE;
-    END IF;
 
     INSERT INTO pgledger_accounts (
         account_id, balance_type_id, name, currency_id,
-        allow_negative_balance, allow_positive_balance, metadata,
-        created_at, updated_at, account_class_id
+        metadata, created_at, updated_at, account_class_id
     )
     VALUES (
         btrim(p_account_id), v_balance_type_id, v_name, v_currency_id,
-        v_allow_negative, v_allow_positive, p_metadata, now(), now(), v_class_id
+        p_metadata, now(), now(), v_class_id
     )
     RETURNING id INTO v_id;
 
@@ -601,12 +612,11 @@ BEGIN
         ) THEN
             INSERT INTO pgledger_accounts (
                 account_id, balance_type_id, name, currency_id,
-                allow_negative_balance, allow_positive_balance, metadata,
-                created_at, updated_at, account_class_id
+                metadata, created_at, updated_at, account_class_id
             )
             VALUES (
                 v_account_id, p_balance_type_id, 'BANK ' || v_shard, v_currency_id,
-                TRUE, TRUE, jsonb_build_object('shard', v_shard), now(), now(), v_bank
+                jsonb_build_object('shard', v_shard), now(), now(), v_bank
             );
         END IF;
     END LOOP;

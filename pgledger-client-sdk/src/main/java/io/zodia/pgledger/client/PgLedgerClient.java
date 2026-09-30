@@ -34,7 +34,8 @@ public final class PgLedgerClient implements AutoCloseable {
     private final Duration readTimeout;
     private final int attempts;
     private final ThreadLocal<String> role = new ThreadLocal<>();
-    private final ThreadLocal<Integer> statusCode = new ThreadLocal<>();
+    /** Mutable holder avoids boxing an {@code Integer} per response. Unset is -1. */
+    private final ThreadLocal<int[]> statusCode = ThreadLocal.withInitial(() -> new int[]{-1});
 
     public PgLedgerClient(PgLedgerClientConfig config) {
         String base = config.baseUrl().toString();
@@ -57,8 +58,7 @@ public final class PgLedgerClient implements AutoCloseable {
 
     /** HTTP status from the latest response on this thread, or -1 when the call failed before a response. */
     public int status() {
-        Integer value = statusCode.get();
-        return value == null ? -1 : value.intValue();
+        return statusCode.get()[0];
     }
 
     public BalanceType createBalanceType(CreateBalanceType command) {
@@ -147,7 +147,7 @@ public final class PgLedgerClient implements AutoCloseable {
                 if (status >= 500 && status < 600 && attempt + 1 < attempts) {
                     continue;
                 }
-                statusCode.set(status);
+                statusCode.get()[0] = status;
                 String header = response.headers().firstValue(ROLE_HEADER).orElse(null);
                 if (header == null) {
                     role.remove();

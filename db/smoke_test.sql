@@ -42,7 +42,7 @@ BEGIN
     DELETE FROM pgledger_transfers
     WHERE from_account_id = ANY(smoke_ids) OR to_account_id = ANY(smoke_ids);
     DELETE FROM pgledger_accounts WHERE id = ANY(smoke_ids);
-    DELETE FROM pgledger_balance_types WHERE code IN ('SMOKE_AVAILABLE', 'SMOKE_LOCKED');
+    DELETE FROM pgledger_balance_types WHERE code IN ('SMOKE_AVAILABLE', 'SMOKE_LOCKED', 'SMOKE_NEG');
     DELETE FROM pgledger_biz_types WHERE code IN ('SMOKE_FEE', 'COIN_DEPOSIT');
     DELETE FROM pgledger_currencies WHERE code = 'SMOKE_CCY';
 
@@ -166,6 +166,26 @@ BEGIN
     PERFORM * FROM pgledger_create_balance_type('SMOKE_LOCKED', 'Locked', NULL);
     SELECT id INTO available_type FROM pgledger_balance_types WHERE code = 'SMOKE_AVAILABLE';
     SELECT id INTO locked_type FROM pgledger_balance_types WHERE code = 'SMOKE_LOCKED';
+    IF (
+        SELECT count(*)
+        FROM pgledger_balance_types
+        WHERE code IN ('SMOKE_AVAILABLE', 'SMOKE_LOCKED')
+          AND allow_negative = FALSE
+          AND allow_positive = TRUE
+    ) <> 2 THEN
+        RAISE EXCEPTION 'smoke balance types did not default to (false, true)';
+    END IF;
+    IF (
+        SELECT count(*)
+        FROM pgledger_balance_types
+        WHERE (code = 'LIQUID' AND NOT allow_negative AND allow_positive)
+           OR (code = 'PENDING_INCOMING' AND NOT allow_negative AND allow_positive)
+           OR (code = 'PENDING_OUTGOING' AND NOT allow_negative AND allow_positive)
+           OR (code = 'COMPLIANCE_HOLD' AND NOT allow_negative AND allow_positive)
+           OR (code = 'GAS_FEE' AND allow_negative AND allow_positive)
+    ) <> 5 THEN
+        RAISE EXCEPTION 'seeded balance type sign policy is wrong';
+    END IF;
 
     BEGIN
         PERFORM * FROM pgledger_create_balance_type('SMOKE_AVAILABLE', 'dup', NULL);
@@ -177,13 +197,22 @@ BEGIN
             END IF;
     END;
 
-    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'Client', 'USD', FALSE, TRUE, NULL);
-    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_LOCKED', 'Client locked', 'USD', FALSE, TRUE, NULL);
-    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'Client EUR', 'EUR', TRUE, TRUE, NULL);
-    PERFORM * FROM pgledger_create_account('SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'Company', 'USD', TRUE, TRUE, NULL);
+    PERFORM * FROM pgledger_create_balance_type('SMOKE_NEG', 'Smoke negative', NULL, TRUE, TRUE);
+    IF (
+        SELECT allow_negative FROM pgledger_balance_types WHERE code = 'SMOKE_NEG'
+    ) IS DISTINCT FROM TRUE THEN
+        RAISE EXCEPTION 'smoke negative type did not store allow_negative';
+    END IF;
+
+    -- SMOKE_COMPANY funds the client and may sit below zero, so it uses the BANK
+    -- class override. A CLIENT account on SMOKE_AVAILABLE cannot go negative.
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'Client', 'USD', NULL);
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_LOCKED', 'Client locked', 'USD', NULL);
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'Client EUR', 'EUR', NULL);
+    PERFORM * FROM pgledger_create_account('SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'Company', 'USD', NULL, 'BANK');
 
     BEGIN
-        PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'x', 'ZZZ', TRUE, TRUE, NULL);
+        PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'x', 'ZZZ', NULL);
         RAISE EXCEPTION 'expected unknown currency to fail';
     EXCEPTION
         WHEN OTHERS THEN
@@ -193,7 +222,7 @@ BEGIN
     END;
 
     BEGIN
-        PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'MISSING', 'x', 'USD', FALSE, TRUE, NULL);
+        PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'MISSING', 'x', 'USD', NULL);
         RAISE EXCEPTION 'expected unknown balance type to fail';
     EXCEPTION
         WHEN OTHERS THEN
@@ -203,7 +232,7 @@ BEGIN
     END;
 
     BEGIN
-        PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'dup', 'USD', FALSE, TRUE, NULL);
+        PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'dup', 'USD', NULL);
         RAISE EXCEPTION 'expected duplicate account to fail';
     EXCEPTION
         WHEN OTHERS THEN
@@ -522,7 +551,8 @@ BEGIN
     WHERE account_id = 'SMOKE_CLIENT' AND balance_type = 'SMOKE_AVAILABLE' AND currency = 'USD';
     SELECT COALESCE(SUM(balance), 0) INTO bank_balance
     FROM pgledger_accounts_view
-    WHERE account_class = 'BANK' AND balance_type = 'SMOKE_AVAILABLE' AND currency = 'USD';
+    WHERE account_class = 'BANK' AND balance_type = 'SMOKE_AVAILABLE' AND currency = 'USD'
+      AND account_id <> 'SMOKE_COMPANY';
     IF available_balance <> 60 OR bank_balance <> 0 THEN
         RAISE EXCEPTION 'after withdrawal client=% bank=%, expected 60 / 0', available_balance, bank_balance;
     END IF;
@@ -563,9 +593,9 @@ BEGIN
 
     INSERT INTO pgledger_currencies (code, scale) VALUES ('SMOKE_CCY', 8);
     PERFORM * FROM pgledger_create_account(
-        'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'Client smoke ccy', 'SMOKE_CCY', TRUE, TRUE, NULL);
+        'SMOKE_CLIENT', 'SMOKE_AVAILABLE', 'Client smoke ccy', 'SMOKE_CCY', NULL);
     PERFORM * FROM pgledger_create_account(
-        'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'Company smoke ccy', 'SMOKE_CCY', TRUE, TRUE, NULL);
+        'SMOKE_COMPANY', 'SMOKE_AVAILABLE', 'Company smoke ccy', 'SMOKE_CCY', NULL, 'BANK');
     PERFORM * FROM pgledger_create_transfer(
         'SMOKE_COMPANY', available_type, 'SMOKE_CLIENT', available_type, 'SMOKE_CCY', 1,
         NULL, NULL, 'smoke-ccy-1');
@@ -587,9 +617,9 @@ BEGIN
         RAISE EXCEPTION 'expected 6 crypto BANK accounts';
     END IF;
 
-    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client BTC', 'BTC', FALSE, TRUE, NULL);
-    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client ETH', 'ETH', FALSE, TRUE, NULL);
-    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client USDT', 'USDT', FALSE, TRUE, NULL);
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client BTC', 'BTC', NULL);
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client ETH', 'ETH', NULL);
+    PERFORM * FROM pgledger_create_account('SMOKE_CLIENT', 'LIQUID', 'Client USDT', 'USDT', NULL);
 
     PERFORM * FROM pgledger_create_transfer(
         'BANK', liquid_type, 'SMOKE_CLIENT', liquid_type, 'BTC', 0.12345678,

@@ -25,17 +25,22 @@ import org.springframework.boot.web.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
 
 import javax.sql.DataSource;
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
@@ -55,10 +60,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * Stress against docker writer :5432 and streaming reader :5433.
+ * Stress against docker compose writer :5432 and streaming reader :5433
+ * (not Testcontainers — use {@code PgLedgerTest} / {@code PgLedgerRestTest} for that).
  * Starts its own HTTP server. Truncates ledger tables in {@code @BeforeAll}.
  *
  * <p>docker compose up -d &amp;&amp; gradle :pgledger-restful:stressTest
+ *
+ * <p>After the suite finishes, prints a TPS summary to stdout and optionally
+ * {@code build/reports/pgledger-stress-tps.txt} (override with {@code -Dpgledger.stress.report=...};
+ * empty string disables the file).
  */
 @Tag("stress")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -70,6 +80,7 @@ class PgLedgerStressTest {
     private static final String COMPANY = "COMPANY";
     private static final long MAX_LAG_MS = Long.getLong("pgledger.stress.maxLagMs", 15_000L);
     private static final int POSTS = Integer.getInteger("pgledger.stress.posts", 20);
+    private static final List<TpsSample> TPS_SAMPLES = new ArrayList<>();
     private static final String SUM_BROKEN = """
             SELECT c.code AS currency, sum(a.balance) AS balance
             FROM pgledger_accounts a
@@ -103,7 +114,8 @@ class PgLedgerStressTest {
             FROM pgledger_accounts a
             JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
             JOIN pgledger_currencies c ON c.id = a.currency_id
-            WHERE NOT a.allow_negative_balance AND a.balance < 0
+            JOIN pgledger_account_classes ac ON ac.id = a.account_class_id
+            WHERE NOT (bt.allow_negative OR ac.code = 'BANK') AND a.balance < 0
             """;
     private static final String ENTRY_CHAIN = """
             SELECT id, account_previous_balance, amount, account_current_balance, account_version
@@ -137,13 +149,14 @@ class PgLedgerStressTest {
         }
         ledger = PgLedger.postgres(writer, reader);
         SpringApplication application = new SpringApplication(PgLedgerServerMain.class);
-        application.setDefaultProperties(Map.of(
-                "server.port", "0",
-                "pgledger.writer-jdbc-url", writerUrl,
-                "pgledger.reader-jdbc-url", readerUrl,
-                "pgledger.jdbc-user", user,
-                "pgledger.jdbc-password", password));
-        server = application.run();
+        // Command-line args outrank application.yml, whose ${VAR:} placeholders
+        // would otherwise blank out these values when the env vars are unset.
+        server = application.run(
+                "--server.port=0",
+                "--pgledger.writer-jdbc-url=" + writerUrl,
+                "--pgledger.reader-jdbc-url=" + readerUrl,
+                "--pgledger.jdbc-user=" + user,
+                "--pgledger.jdbc-password=" + password);
         int port = ((WebServerApplicationContext) server).getWebServer().getPort();
         client = new PgLedgerClient(new PgLedgerClientConfig(
                 URI.create("http://127.0.0.1:" + port),
@@ -157,21 +170,26 @@ class PgLedgerStressTest {
                 "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()");
         client.createBalanceType(new CreateBalanceType(AVAILABLE, "Available", null));
         client.createBalanceType(new CreateBalanceType(LOCKED, "Locked", null));
-        client.createAccount(account(COMPANY, AVAILABLE, true));
+        // BANK may sit on either side of zero; funding clients debits this account.
+        client.createAccount(new CreateAccount(COMPANY, AVAILABLE, USD, COMPANY, null, "BANK"));
         awaitCatchUp();
         assertNoDeadlocks();
     }
 
     @AfterAll
     static void down() {
-        if (client != null) {
-            client.close();
-        }
-        if (server != null) {
-            server.close();
-        }
-        if (ledger != null) {
-            ledger.close();
+        try {
+            printTpsReport();
+        } finally {
+            if (client != null) {
+                client.close();
+            }
+            if (server != null) {
+                server.close();
+            }
+            if (ledger != null) {
+                ledger.close();
+            }
         }
     }
 
@@ -191,7 +209,7 @@ class PgLedgerStressTest {
 
         String accountId = "RACE_ACCT_" + suffix();
         fill(threads, 1, (thread, seq) -> {
-            client.createAccount(account(accountId, AVAILABLE, false));
+            client.createAccount(account(accountId, AVAILABLE));
             return client.status();
         }, status, new long[threads]);
         assertEquals(1, count(status, 200), "account winners");
@@ -207,9 +225,13 @@ class PgLedgerStressTest {
     @Order(2)
     void hotAccountContention() throws Exception {
         String hot = "HOT_" + suffix();
-        client.createAccount(account(hot, AVAILABLE, true));
+        client.createAccount(account(hot, AVAILABLE));
         int threads = 32;
         int posts = 20;
+        int credits = (threads / 2) * posts;
+        int debits = credits;
+        // AVAILABLE denies negative; seed enough for the debit half of the race.
+        client.post(posting(COMPANY, AVAILABLE, hot, AVAILABLE, BigDecimal.valueOf(debits)));
         int[] status = new int[threads * posts];
         fill(threads, posts, (thread, seq) -> {
             if ((thread & 1) == 0) {
@@ -220,11 +242,9 @@ class PgLedgerStressTest {
             return client.status();
         }, status, new long[threads * posts]);
         assertOnly(status, 200);
-        int credits = (threads / 2) * posts;
-        int debits = credits;
         Account account = readBalance(hot, AVAILABLE);
-        assertEquals(0, BigDecimal.valueOf((long) credits - debits).compareTo(account.balance()));
-        assertEquals((long) threads * posts, account.version());
+        assertEquals(0, BigDecimal.valueOf(debits).compareTo(account.balance()));
+        assertEquals(1L + (long) threads * posts, account.version());
         assertInvariants();
     }
 
@@ -233,11 +253,15 @@ class PgLedgerStressTest {
     void oppositeTransfersAvoidDeadlock() throws Exception {
         String left = "OPP_A_" + suffix();
         String right = "OPP_B_" + suffix();
-        client.createAccount(account(left, AVAILABLE, true));
-        client.createAccount(account(right, AVAILABLE, true));
+        client.createAccount(account(left, AVAILABLE));
+        client.createAccount(account(right, AVAILABLE));
         int wings = 16;
         int posts = 30;
         int threads = wings * 2;
+        long perSide = (long) wings * posts;
+        // Seed both sides so concurrent opposite posts never breach the type policy.
+        client.post(posting(COMPANY, AVAILABLE, left, AVAILABLE, BigDecimal.valueOf(perSide)));
+        client.post(posting(COMPANY, AVAILABLE, right, AVAILABLE, BigDecimal.valueOf(perSide)));
         int[] status = new int[threads * posts];
         fill(threads, posts, (thread, seq) -> {
             if (thread < wings) {
@@ -250,10 +274,10 @@ class PgLedgerStressTest {
         assertOnly(status, 200);
         Account a = readBalance(left, AVAILABLE);
         Account b = readBalance(right, AVAILABLE);
-        assertEquals(0, a.balance().add(b.balance()).compareTo(BigDecimal.ZERO));
+        assertEquals(0, a.balance().add(b.balance()).compareTo(BigDecimal.valueOf(2 * perSide)));
         long touches = (long) threads * posts;
-        assertEquals(touches, a.version());
-        assertEquals(touches, b.version());
+        assertEquals(1L + touches, a.version());
+        assertEquals(1L + touches, b.version());
         assertInvariants();
     }
 
@@ -263,8 +287,8 @@ class PgLedgerStressTest {
         int funded = 80;
         String id = "NONNEG_" + suffix();
         String sink = "SINK_" + suffix();
-        client.createAccount(account(id, AVAILABLE, false));
-        client.createAccount(account(sink, AVAILABLE, true));
+        client.createAccount(account(id, AVAILABLE));
+        client.createAccount(account(sink, AVAILABLE));
         client.post(posting(COMPANY, AVAILABLE, id, AVAILABLE, BigDecimal.valueOf(funded)));
         int threads = funded + 1;
         int[] status = new int[threads];
@@ -289,8 +313,8 @@ class PgLedgerStressTest {
         int funded = 40;
         int attempts = 70;
         String id = "CROSS_" + suffix();
-        client.createAccount(account(id, AVAILABLE, false));
-        client.createAccount(account(id, LOCKED, false));
+        client.createAccount(account(id, AVAILABLE));
+        client.createAccount(account(id, LOCKED));
         client.post(posting(COMPANY, AVAILABLE, id, AVAILABLE, BigDecimal.valueOf(funded)));
         int[] status = new int[attempts];
         fill(attempts, 1, (thread, seq) -> {
@@ -313,7 +337,7 @@ class PgLedgerStressTest {
     void readerRejectsWritesAndCatchesUp() throws Exception {
         assertReadOnlyReplica();
         String id = "LAG_" + suffix();
-        client.createAccount(account(id, AVAILABLE, true));
+        client.createAccount(account(id, AVAILABLE));
         client.post(posting(COMPANY, AVAILABLE, id, AVAILABLE, BigDecimal.ONE));
         awaitCatchUp();
 
@@ -398,10 +422,12 @@ class PgLedgerStressTest {
     void journalPaginationUnderGrowth() throws Exception {
         String src = "JRN_SRC_" + suffix();
         String dst = "JRN_DST_" + suffix();
-        client.createAccount(account(src, AVAILABLE, true));
-        client.createAccount(account(dst, AVAILABLE, true));
+        client.createAccount(account(src, AVAILABLE));
+        client.createAccount(account(dst, AVAILABLE));
         int threads = 10;
         int posts = 25;
+        // AVAILABLE denies negative; fund src before concurrent drains.
+        client.post(posting(COMPANY, AVAILABLE, src, AVAILABLE, BigDecimal.valueOf((long) threads * posts)));
         int[] status = new int[threads * posts];
         fill(threads, posts, (thread, seq) -> {
             client.post(posting(src, AVAILABLE, dst, AVAILABLE, BigDecimal.ONE));
@@ -418,10 +444,13 @@ class PgLedgerStressTest {
         Transfer previous = null;
         long seen = 0L;
         int page = 0;
+        long totalAtStart = total;
+        JournalPage lastPage = null;
+        // Writers may add transfers while we walk; totals move. The last page's
+        // total is the authoritative count for this walk.
         while (true) {
             JournalPage journalPage = client.journals(page, 200);
             assertEquals(PgLedgerServer.READER, client.role());
-            assertEquals(total, journalPage.total());
             assertTrue(journalPage.transfers().size() <= 200);
             for (int i = 0; i < journalPage.transfers().size(); i++) {
                 Transfer transfer = journalPage.transfers().get(i);
@@ -438,18 +467,25 @@ class PgLedgerStressTest {
                 previous = transfer;
                 seen++;
             }
+            lastPage = journalPage;
             if (!journalPage.hasNext()) {
                 break;
             }
-            assertEquals(200, journalPage.transfers().size());
             page++;
             assertTrue(page < 100_000, "journal page walk did not end");
         }
-        assertEquals(total, seen);
-        JournalPage tail = client.journals(page + 1, 50);
-        assertEquals(total, tail.total());
-        assertEquals(0, tail.transfers().size());
-        assertFalse(tail.hasNext());
+        assertNotNull(lastPage);
+        assertEquals(lastPage.total(), seen,
+                "walked " + seen + " transfers, last page reported total " + lastPage.total());
+        assertTrue(seen >= totalAtStart, "walk saw fewer transfers than at the start");
+        // Probe genuinely past the end: (page+1)*200 = 9800 > total.
+        // (A different page size would land mid-data and legitimately return rows.)
+        JournalPage tail = client.journals(page + 1, 200);
+        assertEquals(lastPage.total(), tail.total(), "tail total");
+        assertTrue(tail.transfers().size() <= 200,
+                "tail page returned " + tail.transfers().size());
+        assertFalse(tail.hasNext(),
+                "page past the end still has next; total=" + lastPage.total() + " rows=" + tail.transfers().size());
         assertEquals(PgLedgerServer.READER, client.role());
         assertInvariants();
     }
@@ -459,7 +495,7 @@ class PgLedgerStressTest {
         int[] created = new int[clients * 2];
         fill(clients, 2, (thread, seq) -> {
             String id = prefix + (seq == 0 ? "S" : "D") + thread;
-            client.createAccount(account(id, AVAILABLE, true));
+            client.createAccount(account(id, AVAILABLE));
             return client.status();
         }, created, new long[clients * 2]);
         assertOnly(created, 200);
@@ -517,7 +553,7 @@ class PgLedgerStressTest {
     private static void assertReadOnlyReplica() throws Exception {
         String code = "ZZ_READER_REJECT";
         String probe = "READER_PROBE_" + suffix();
-        client.createAccount(account(probe, AVAILABLE, false));
+        client.createAccount(account(probe, AVAILABLE));
         awaitCatchUp();
         String nameBefore = queryString(writer,
                 "SELECT name FROM pgledger_accounts WHERE account_id = ?", probe);
@@ -636,16 +672,88 @@ class PgLedgerStressTest {
         double seconds = wallNanos / 1_000_000_000.0;
         double tps = seconds == 0.0 ? 0.0 : ok / seconds;
         double errorRate = n == 0 ? 0.0 : (n - ok) / (double) n;
-        System.out.println(op
-                + " clients=" + clients
-                + " n=" + n
-                + " tps=" + String.format(Locale.ROOT, "%.1f", tps)
-                + " p50=" + percentileMillis(nanos, 50) + "ms"
-                + " p95=" + percentileMillis(nanos, 95) + "ms"
-                + " p99=" + percentileMillis(nanos, 99) + "ms"
-                + " errorRate=" + String.format(Locale.ROOT, "%.4f", errorRate)
-                + " 5xx=" + serverErrors
-                + " timeouts=" + timeouts);
+        long p50 = percentileMillis(nanos, 50);
+        long p95 = percentileMillis(nanos, 95);
+        long p99 = percentileMillis(nanos, 99);
+        TpsSample sample = new TpsSample(op, clients, n, ok, seconds, tps, p50, p95, p99,
+                errorRate, serverErrors, timeouts);
+        TPS_SAMPLES.add(sample);
+        System.out.println(sample.line());
+    }
+
+    private static void printTpsReport() {
+        if (TPS_SAMPLES.isEmpty()) {
+            System.out.println("""
+                    === PgLedger stress TPS ===
+                    (no throughput samples — throughputAndLatency did not run or report)
+                    ===========================""");
+            return;
+        }
+        StringBuilder text = new StringBuilder(512);
+        text.append("=== PgLedger stress TPS ===\n");
+        int totalOps = 0;
+        int totalOk = 0;
+        double totalWall = 0.0;
+        for (int i = 0; i < TPS_SAMPLES.size(); i++) {
+            TpsSample sample = TPS_SAMPLES.get(i);
+            text.append(sample.line()).append('\n');
+            totalOps += sample.n();
+            totalOk += sample.ok();
+            totalWall += sample.wallSeconds();
+        }
+        double overallTps = totalWall == 0.0 ? 0.0 : totalOk / totalWall;
+        text.append("---\n");
+        text.append(String.format(Locale.ROOT,
+                "total ops=%d  ok=%d  wall=%.3fs  tps=%.1f\n",
+                totalOps, totalOk, totalWall, overallTps));
+        text.append("===========================");
+        String report = text.toString();
+        System.out.println(report);
+        String reportPath = System.getProperty("pgledger.stress.report",
+                "build/reports/pgledger-stress-tps.txt");
+        if (reportPath == null || reportPath.isBlank()) {
+            return;
+        }
+        try {
+            Path path = Path.of(reportPath);
+            Path parent = path.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.writeString(path, report + '\n', StandardCharsets.UTF_8);
+            System.out.println("TPS report written to " + path.toAbsolutePath());
+        } catch (IOException e) {
+            System.err.println("TPS report file failed: " + e.getMessage());
+        }
+    }
+
+    private record TpsSample(
+            String op,
+            int clients,
+            int n,
+            int ok,
+            double wallSeconds,
+            double tps,
+            long p50Ms,
+            long p95Ms,
+            long p99Ms,
+            double errorRate,
+            int serverErrors,
+            int timeouts) {
+        String line() {
+            return op
+                    + " clients=" + clients
+                    + " n=" + n
+                    + " ok=" + ok
+                    + " wall=" + String.format(Locale.ROOT, "%.3fs", wallSeconds)
+                    + " tps=" + String.format(Locale.ROOT, "%.1f", tps)
+                    + " p50=" + p50Ms + "ms"
+                    + " p95=" + p95Ms + "ms"
+                    + " p99=" + p99Ms + "ms"
+                    + " errorRate=" + String.format(Locale.ROOT, "%.4f", errorRate)
+                    + " 5xx=" + serverErrors
+                    + " timeouts=" + timeouts;
+        }
     }
 
     private static long percentileMillis(long[] nanos, int percentile) {
@@ -924,8 +1032,8 @@ class PgLedgerStressTest {
         return dataSource;
     }
 
-    private static CreateAccount account(String accountId, String balanceType, boolean allowNegative) {
-        return new CreateAccount(accountId, balanceType, USD, accountId, allowNegative, true, null, null);
+    private static CreateAccount account(String accountId, String balanceType) {
+        return new CreateAccount(accountId, balanceType, USD, accountId, null, null);
     }
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,

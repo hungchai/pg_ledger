@@ -5,6 +5,9 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 
+import io.zodia.pgledger.api.NumberAsTextDeserializer;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+
 public final class LedgerApi {
     private LedgerApi() {
     }
@@ -12,7 +15,13 @@ public final class LedgerApi {
     public record CreateBalanceType(
             String code,
             String name,
-            String description) {
+            String description,
+            Boolean allowNegative,
+            Boolean allowPositive) {
+
+        public CreateBalanceType(String code, String name, String description) {
+            this(code, name, description, null, null);
+        }
     }
 
     public record BalanceType(
@@ -20,6 +29,8 @@ public final class LedgerApi {
             String code,
             String name,
             String description,
+            boolean allowNegative,
+            boolean allowPositive,
             Instant createdAt,
             Instant updatedAt) {
     }
@@ -29,8 +40,6 @@ public final class LedgerApi {
             String balanceType,
             String currency,
             String name,
-            Boolean allowNegativeBalance,
-            Boolean allowPositiveBalance,
             Map<String, Object> metadata,
             String accountClass) {
     }
@@ -41,16 +50,16 @@ public final class LedgerApi {
     public record CashMovement(
             String requestId,
             String accountId,
-            String balanceType,
+            @JsonDeserialize(using = NumberAsTextDeserializer.class) String balanceType,
             String currency,
             BigDecimal amount) {
     }
 
     public record Posting(
             String fromAccountId,
-            String fromBalanceType,
+            @JsonDeserialize(using = NumberAsTextDeserializer.class) String fromBalanceType,
             String toAccountId,
-            String toBalanceType,
+            @JsonDeserialize(using = NumberAsTextDeserializer.class) String toBalanceType,
             String currency,
             BigDecimal amount,
             String requestId,

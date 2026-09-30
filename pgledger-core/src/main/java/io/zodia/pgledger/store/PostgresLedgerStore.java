@@ -35,33 +35,37 @@ import java.util.concurrent.locks.LockSupport;
 public final class PostgresLedgerStore implements LedgerStore {
     private static final String[] SCHEMA = {"/db/V001__ledger.sql", "/db/V002__functions.sql"};
     private static final String BALANCE_TYPE_COLUMNS = """
-            id, code, name, description, created_at, updated_at
+            id, code, name, description, allow_negative, allow_positive, created_at, updated_at
             """;
     private static final String CREATE_BALANCE_TYPE = "SELECT " + BALANCE_TYPE_COLUMNS
-            + " FROM pgledger_create_balance_type(?, ?, ?)";
+            + " FROM pgledger_create_balance_type(?, ?, ?, ?, ?)";
     private static final String ACCOUNT_COLUMNS = """
             id, account_id, balance_type, name, currency, balance, version,
             allow_negative_balance, allow_positive_balance, metadata::text AS metadata,
             created_at, updated_at, account_class, deleted
             """;
     private static final String CREATE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
-            + " FROM pgledger_create_account(?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?)";
+            + " FROM pgledger_create_account(?, ?, ?, ?, CAST(? AS jsonb), ?)";
     private static final String ENSURE_BANK_POOL = "SELECT pgledger_ensure_bank_pool(?, ?, ?, ?, ?)";
     private static final String DELETE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
             + " FROM pgledger_delete_account(?, ?, ?)";
     private static final String ACCOUNT_ID_COLUMNS = """
-            id, account_id, balance_type_id, name, currency_id, balance, version,
-            allow_negative_balance, allow_positive_balance, metadata::text AS metadata,
-            created_at, updated_at, account_class_id, deleted
+            a.id, a.account_id, a.balance_type_id, a.name, a.currency_id, a.balance, a.version,
+            bt.allow_negative OR ac.code = 'BANK' AS allow_negative_balance,
+            bt.allow_positive OR ac.code = 'BANK' AS allow_positive_balance,
+            a.metadata::text AS metadata,
+            a.created_at, a.updated_at, a.account_class_id, a.deleted
             """;
     private static final String BANK_SHARDS = "SELECT " + ACCOUNT_ID_COLUMNS + """
-             FROM pgledger_accounts
-             WHERE account_class_id = ?
-               AND balance_type_id = ?
-               AND currency_id = ?
-               AND left(account_id, char_length(?)) = ?
-               AND substring(account_id FROM char_length(?) + 1) ~ '^[0-9]+$'
-             ORDER BY substring(account_id FROM char_length(?) + 1)::int
+             FROM pgledger_accounts a
+             JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+             JOIN pgledger_account_classes ac ON ac.id = a.account_class_id
+             WHERE a.account_class_id = ?
+               AND a.balance_type_id = ?
+               AND a.currency_id = ?
+               AND left(a.account_id, char_length(?)) = ?
+               AND substring(a.account_id FROM char_length(?) + 1) ~ '^[0-9]+$'
+             ORDER BY substring(a.account_id FROM char_length(?) + 1)::int
             """;
     // The function insert is its own statement. Joining pgledger_entries in that
     // same statement sees a snapshot from before the insert and returns no row.
@@ -99,43 +103,6 @@ public final class PostgresLedgerStore implements LedgerStore {
             WHERE t.id = ?
             ORDER BY e.id
             """;
-    private static final String JOURNAL_COUNT = "SELECT count(*) FROM pgledger_transfers";
-    private static final String JOURNALS = """
-            SELECT
-                t.id AS transfer_id,
-                fa.account_id AS from_account_id,
-                fa.balance_type_id AS from_balance_type_id,
-                ta.account_id AS to_account_id,
-                ta.balance_type_id AS to_balance_type_id,
-                fa.currency_id AS currency_id,
-                t.amount AS transfer_amount,
-                t.created_at AS transfer_created_at,
-                t.event_at,
-                t.biz_reference,
-                t.request_id,
-                t.biz_type_id,
-                e.id AS entry_id,
-                ea.account_id AS entry_account_id,
-                ea.balance_type_id AS entry_balance_type_id,
-                ea.currency_id AS entry_currency_id,
-                e.amount AS entry_amount,
-                e.account_previous_balance,
-                e.account_current_balance,
-                e.account_version,
-                e.created_at AS entry_created_at
-            FROM pgledger_transfers t
-            JOIN pgledger_accounts fa ON fa.id = t.from_account_id
-            JOIN pgledger_accounts ta ON ta.id = t.to_account_id
-            LEFT JOIN pgledger_entries e ON e.transfer_id = t.id
-            LEFT JOIN pgledger_accounts ea ON ea.id = e.account_id
-            WHERE t.id IN (
-                SELECT id FROM pgledger_transfers
-                ORDER BY created_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            )
-            ORDER BY t.created_at DESC, t.id DESC, e.id
-            """;
-
     private static final int MIGRATION_ATTEMPTS = 30;
 
     private final DataSource dataSource;
@@ -185,6 +152,8 @@ public final class PostgresLedgerStore implements LedgerStore {
                 } else {
                     ps.setString(3, command.description());
                 }
+                ps.setBoolean(4, command.allowNegative() != null && command.allowNegative().booleanValue());
+                ps.setBoolean(5, command.allowPositive() == null || command.allowPositive().booleanValue());
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new LedgerException("pgledger_create_balance_type returned no row");
@@ -208,13 +177,11 @@ public final class PostgresLedgerStore implements LedgerStore {
                 ps.setString(2, command.balanceType());
                 ps.setString(3, command.name());
                 ps.setString(4, command.currency());
-                ps.setBoolean(5, flag(command.allowNegativeBalance()));
-                ps.setBoolean(6, flag(command.allowPositiveBalance()));
-                setJson(ps, 7, command.metadata());
+                setJson(ps, 5, command.metadata());
                 if (command.accountClass() == null) {
-                    ps.setNull(8, Types.VARCHAR);
+                    ps.setNull(6, Types.VARCHAR);
                 } else {
-                    ps.setString(8, command.accountClass());
+                    ps.setString(6, command.accountClass());
                 }
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
@@ -338,50 +305,7 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     @Override
     public JournalPage journals(int page, int size) {
-        return read(conn -> {
-            long total = journalCount(conn);
-            long offset = (long) page * (long) size;
-            try (PreparedStatement ps = conn.prepareStatement(JOURNALS)) {
-                ps.setInt(1, size);
-                ps.setLong(2, offset);
-                try (ResultSet rs = ps.executeQuery()) {
-                    LinkedHashMap<String, ArrayList<Entry>> entries = new LinkedHashMap<>();
-                    LinkedHashMap<String, Transfer> transfers = new LinkedHashMap<>();
-                    while (rs.next()) {
-                        String transferId = rs.getString("transfer_id");
-                        if (!transfers.containsKey(transferId)) {
-                            transfers.put(transferId, transfer(rs, transferId));
-                        }
-                        String entryId = rs.getString("entry_id");
-                        if (entryId != null) {
-                            ArrayList<Entry> lines = entries.get(transferId);
-                            if (lines == null) {
-                                lines = new ArrayList<>(2);
-                                entries.put(transferId, lines);
-                            }
-                            lines.add(entry(rs));
-                        }
-                    }
-                    ArrayList<Transfer> pageRows = new ArrayList<>(transfers.size());
-                    for (Transfer transfer : transfers.values()) {
-                        List<Entry> lines = entries.get(transfer.id());
-                        pageRows.add(withEntries(transfer, lines == null ? List.of() : List.copyOf(lines)));
-                    }
-                    boolean hasNext = offset + pageRows.size() < total;
-                    return new JournalPage(page, size, total, hasNext, List.copyOf(pageRows));
-                }
-            }
-        });
-    }
-
-    private static long journalCount(Connection conn) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(JOURNAL_COUNT);
-             ResultSet rs = ps.executeQuery()) {
-            if (!rs.next()) {
-                throw new LedgerException("journal count returned no row");
-            }
-            return rs.getLong(1);
-        }
+        return reads.query(reads -> reads.journals(page, size));
     }
 
     @Override
@@ -500,10 +424,6 @@ public final class PostgresLedgerStore implements LedgerStore {
         } else {
             ps.setString(index, LedgerJson.writeString(metadata));
         }
-    }
-
-    private static boolean flag(Boolean value) {
-        return value == null || value.booleanValue();
     }
 
     private static BalanceType balanceType(ResultSet rs) throws SQLException {

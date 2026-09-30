@@ -4,6 +4,24 @@ Postgres only. No Kafka. No Redis.
 
 Writes go to the writer. Balance and entry reads go to the reader.
 
+## Tests
+
+Docker daemon required for all of these. Compose is only for stress (and local API).
+
+| Suite | How Postgres is provided | Command |
+|---|---|---|
+| Core (`PgLedgerTest`) | Testcontainers (single `postgres:16`) | `./gradlew :pgledger-core:test` |
+| REST (`PgLedgerRestTest`) | Testcontainers (primary + streaming replica) | `./gradlew :pgledger-restful:test` |
+| Stress (`PgLedgerStressTest`) | Docker Compose on localhost `5432` / `5433` | `docker compose up -d` then `./gradlew :pgledger-restful:stressTest` |
+
+`PgLedgerTest` and `PgLedgerRestTest` never use Compose. `stressTest` is excluded from `:pgledger-restful:test` and expects the Compose writer/reader.
+
+Schema scripts (`V001`/`V002`) are idempotent and also run on API/stress startup. Compose `initdb` only runs on an empty volume. If a long-lived volume predates a breaking schema move and migrate still fails, wipe and recreate: `docker compose down -v && docker compose up -d`.
+
+After stress finishes it prints a TPS summary (per-level lines plus total ops, wall duration, TPS, latency percentiles) to stdout and writes `pgledger-restful/build/reports/pgledger-stress-tps.txt` (override with `-Dpgledger.stress.report=...`, blank disables the file). Tunables: `-Dpgledger.stress.levels=50,100,200`, `-Dpgledger.stress.posts=20`, `-Dpgledger.stress.maxLagMs=15000`.
+
+## Local stack (Compose)
+
 | | Host | Port | Database | User | Password |
 |---|---|---|---|---|---|
 | Writer | localhost | 5432 | pgledger | pgledger | pgledger |
@@ -24,7 +42,7 @@ curl -s -X POST http://localhost:8080/api/v1/balance-types \
   -d '{"code":"AVAILABLE","name":"Available"}'
 curl -s -X POST http://localhost:8080/api/v1/accounts \
   -H 'Content-Type: application/json' \
-  -d '{"accountId":"CLIENT_ACC_001","balanceType":"AVAILABLE","currency":"USD","allowNegativeBalance":false}'
+  -d '{"accountId":"CLIENT_ACC_001","balanceType":"AVAILABLE","currency":"USD"}'
 curl -s -X POST http://localhost:8080/api/v1/postings \
   -H 'Content-Type: application/json' \
   -d '{"fromAccountId":"LP_DESK","fromBalanceType":"AVAILABLE","toAccountId":"CLIENT_ACC_001","toBalanceType":"AVAILABLE","currency":"USD","amount":100,"requestId":"fund-1"}'
@@ -67,9 +85,11 @@ Seeded ids: `1 CLIENT`, `2 COMPANY`, `3 BANK`, `4 NOSTRO`, `5 SUSPENSE`, `6 CONT
 | `code` | Unique. |
 | `name` | Required display name. |
 | `description` | Optional. |
+| `allow_negative` | Sign policy for accounts on this type. Default `FALSE`. |
+| `allow_positive` | Sign policy for accounts on this type. Default `TRUE`. |
 | `created_at`, `updated_at` | Required. |
 
-Seeded rows, `name` equal to `code`: `1 LIQUID`, `2 PENDING_INCOMING`, `3 PENDING_OUTGOING`, `4 COMPLIANCE_HOLD`, `5 GAS_FEE`.
+Seeded rows, `name` equal to `code`: `1 LIQUID`, `2 PENDING_INCOMING`, `3 PENDING_OUTGOING`, `4 COMPLIANCE_HOLD`, `5 GAS_FEE`. Seed policy: `GAS_FEE` is `(TRUE, TRUE)`; the other four are `(FALSE, TRUE)`.
 
 `pgledger_accounts.balance_type_id` stores this id. Indexed. Not a foreign key.
 
@@ -107,10 +127,11 @@ Seeded rows: `1 TRANSFER` / `Transfer`, `2 DEPOSIT` / `Deposit`, `3 WITHDRAWAL` 
 | `name` | Display name. |
 | `balance` | Unbounded `NUMERIC`, starts at 0. |
 | `version` | Starts at 0. Each posting increments it. |
-| `allow_negative_balance`, `allow_positive_balance` | A `BANK` row allows both signs. |
 | `metadata` | Optional `JSONB` on the account. Transfers do not have metadata. |
 | `account_class_id` | Registry id. Default `1` (`CLIENT`). |
 | `deleted` | Soft delete, default `false`. The row stays. New transfers skip it. |
+
+Sign policy lives on `pgledger_balance_types` (`allow_negative`, `allow_positive`). `pgledger_accounts_view` still returns `allow_negative_balance` and `allow_positive_balance` for the account: the type's flags, with both forced on for a `BANK` class account.
 
 `pgledger_accounts_view` joins the registries and returns `balance_type`, `currency`, and `account_class` as codes.
 
@@ -137,11 +158,12 @@ Run these on the **writer**. `pgledger_create_transfer` and `pgledger_create_tra
 
 ### Balance type
 
-`pgledger_create_balance_type(code, name, description)` returns the row, including `id`. A duplicate code fails. A new balance type is that insert, not a new function.
+`pgledger_create_balance_type(code, name, description, allow_negative, allow_positive)` returns the row, including `id`. Flags default to `(FALSE, TRUE)`. A duplicate code fails. A new balance type is that insert, not a new function.
 
 ```sql
 SELECT * FROM pgledger_create_balance_type('AVAILABLE', 'Available', NULL);
 SELECT * FROM pgledger_create_balance_type('LOCKED', 'Locked', NULL);
+SELECT * FROM pgledger_create_balance_type('GAS_FEE_HOUSE', 'Gas fee', NULL, TRUE, TRUE);
 ```
 
 ### Currency
@@ -177,27 +199,21 @@ SELECT * FROM pgledger_create_account(
     p_account_id => 'CLIENT_ACC_001',
     p_balance_type => 'AVAILABLE',
     p_name => 'Client available',
-    p_currency => 'USD',
-    p_allow_negative_balance => FALSE,
-    p_allow_positive_balance => TRUE
+    p_currency => 'USD'
 );
 
 SELECT * FROM pgledger_create_account(
     p_account_id => 'CLIENT_ACC_001',
     p_balance_type => 'LOCKED',
     p_name => 'Client locked',
-    p_currency => 'USD',
-    p_allow_negative_balance => FALSE,
-    p_allow_positive_balance => TRUE
+    p_currency => 'USD'
 );
 
 SELECT * FROM pgledger_create_account(
     p_account_id => 'CLIENT_ACC_002',
     p_balance_type => 'AVAILABLE',
     p_name => 'Client 2',
-    p_currency => 'USD',
-    p_allow_negative_balance => FALSE,
-    p_allow_positive_balance => TRUE
+    p_currency => 'USD'
 );
 
 SELECT * FROM pgledger_create_account(
@@ -205,8 +221,7 @@ SELECT * FROM pgledger_create_account(
     p_balance_type => 'AVAILABLE',
     p_name => 'LP desk',
     p_currency => 'USD',
-    p_allow_negative_balance => TRUE,
-    p_allow_positive_balance => TRUE
+    p_account_class => 'COMPANY'
 );
 ```
 

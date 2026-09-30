@@ -117,18 +117,38 @@ CREATE TABLE IF NOT EXISTS pgledger_balance_types (
     code TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     description TEXT,
+    allow_negative BOOLEAN NOT NULL DEFAULT FALSE,
+    allow_positive BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
 
-INSERT INTO pgledger_balance_types (id, code, name, created_at, updated_at)
+-- A stale dev volume created before the flags moved here still has the old
+-- shape. Bring it up to date before anything selects the new columns.
+ALTER TABLE pgledger_balance_types ADD COLUMN IF NOT EXISTS allow_negative BOOLEAN;
+ALTER TABLE pgledger_balance_types ADD COLUMN IF NOT EXISTS allow_positive BOOLEAN;
+UPDATE pgledger_balance_types SET allow_negative = FALSE, allow_positive = TRUE
+WHERE allow_negative IS NULL OR allow_positive IS NULL;
+ALTER TABLE pgledger_balance_types ALTER COLUMN allow_negative SET DEFAULT FALSE;
+ALTER TABLE pgledger_balance_types ALTER COLUMN allow_positive SET DEFAULT TRUE;
+ALTER TABLE pgledger_balance_types ALTER COLUMN allow_negative SET NOT NULL;
+ALTER TABLE pgledger_balance_types ALTER COLUMN allow_positive SET NOT NULL;
+
+INSERT INTO pgledger_balance_types (id, code, name, allow_negative, allow_positive, created_at, updated_at)
 VALUES
-    (1, 'LIQUID', 'LIQUID', now(), now()),
-    (2, 'PENDING_INCOMING', 'PENDING_INCOMING', now(), now()),
-    (3, 'PENDING_OUTGOING', 'PENDING_OUTGOING', now(), now()),
-    (4, 'COMPLIANCE_HOLD', 'COMPLIANCE_HOLD', now(), now()),
-    (5, 'GAS_FEE', 'GAS_FEE', now(), now())
+    (1, 'LIQUID', 'LIQUID', FALSE, TRUE, now(), now()),
+    (2, 'PENDING_INCOMING', 'PENDING_INCOMING', FALSE, TRUE, now(), now()),
+    (3, 'PENDING_OUTGOING', 'PENDING_OUTGOING', FALSE, TRUE, now(), now()),
+    (4, 'COMPLIANCE_HOLD', 'COMPLIANCE_HOLD', FALSE, TRUE, now(), now()),
+    (5, 'GAS_FEE', 'GAS_FEE', TRUE, TRUE, now(), now())
 ON CONFLICT (code) DO NOTHING;
+
+-- Keep the sign policy of the five seeded rows on volumes where they already
+-- existed before the flags moved to this table.
+UPDATE pgledger_balance_types SET allow_negative = TRUE, allow_positive = TRUE
+WHERE code = 'GAS_FEE';
+UPDATE pgledger_balance_types SET allow_negative = FALSE, allow_positive = TRUE
+WHERE code IN ('LIQUID', 'PENDING_INCOMING', 'PENDING_OUTGOING', 'COMPLIANCE_HOLD');
 
 SELECT setval(
     pg_get_serial_sequence('pgledger_balance_types', 'id'),
@@ -181,8 +201,6 @@ CREATE TABLE IF NOT EXISTS pgledger_accounts (
     currency_id INT NOT NULL,
     balance NUMERIC NOT NULL DEFAULT 0,
     version BIGINT NOT NULL DEFAULT 0,
-    allow_negative_balance BOOLEAN NOT NULL,
-    allow_positive_balance BOOLEAN NOT NULL,
     metadata JSONB,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
@@ -231,16 +249,41 @@ CREATE TABLE IF NOT EXISTS pgledger_entries (
 CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries (account_id);
 CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries (transfer_id);
 
+-- The old view had no flag columns. Functions with the old
+-- pgledger_create_balance_type signature depend on that shape, so drop it with
+-- CASCADE only when it is outdated. V002 recreates those functions.
+DO $do$
+DECLARE
+    has_flags BOOLEAN := FALSE;
+BEGIN
+    IF to_regclass('pgledger_balance_types_view') IS NOT NULL THEN
+        SELECT TRUE INTO has_flags
+        FROM pg_attribute
+        WHERE attrelid = 'pgledger_balance_types_view'::regclass
+          AND attname = 'allow_negative'
+          AND NOT attisdropped;
+    END IF;
+    IF NOT COALESCE(has_flags, FALSE) THEN
+        DROP VIEW IF EXISTS pgledger_balance_types_view CASCADE;
+    END IF;
+END
+$do$;
+
 CREATE OR REPLACE VIEW pgledger_balance_types_view AS
 SELECT
     id,
     code,
     name,
     description,
+    allow_negative,
+    allow_positive,
     created_at,
     updated_at
 FROM pgledger_balance_types;
 
+-- Sign policy moved to the balance type. The two account columns stay on the
+-- view with the same names so downstream JSON is unchanged: the flags come from
+-- the balance type, and a BANK class account may sit on either side of zero.
 CREATE OR REPLACE VIEW pgledger_accounts_view AS
 SELECT
     a.id,
@@ -250,8 +293,8 @@ SELECT
     c.code AS currency,
     a.balance,
     a.version,
-    a.allow_negative_balance,
-    a.allow_positive_balance,
+    bt.allow_negative OR ac.code = 'BANK' AS allow_negative_balance,
+    bt.allow_positive OR ac.code = 'BANK' AS allow_positive_balance,
     a.metadata,
     a.created_at,
     a.updated_at,
@@ -261,6 +304,12 @@ FROM pgledger_accounts a
 JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
 JOIN pgledger_currencies c ON c.id = a.currency_id
 JOIN pgledger_account_classes ac ON ac.id = a.account_class_id;
+
+-- A stale dev volume created before sign policy moved to pgledger_balance_types
+-- still has these columns. Dropping them here, after the views above were replaced
+-- without those columns, avoids a dependency error on migration.
+ALTER TABLE pgledger_accounts DROP COLUMN IF EXISTS allow_negative_balance;
+ALTER TABLE pgledger_accounts DROP COLUMN IF EXISTS allow_positive_balance;
 
 CREATE OR REPLACE VIEW pgledger_transfers_view AS
 SELECT

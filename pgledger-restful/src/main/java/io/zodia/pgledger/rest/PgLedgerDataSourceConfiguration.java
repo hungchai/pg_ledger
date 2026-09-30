@@ -36,20 +36,21 @@ import java.util.Properties;
 class PgLedgerDataSourceConfiguration {
     @Bean(name = "writerDataSource", destroyMethod = "close")
     DataSource writerDataSource(PgLedgerProperties properties) {
-        return pool("pgledger-writer", required("PGLEDGER_WRITER_JDBC_URL", properties.writerJdbcUrl()), properties);
+        return pool("pgledger-writer", propertyOrDefault(properties.writerJdbcUrl(), "PGLEDGER_WRITER_JDBC_URL"), properties);
     }
 
     @Bean(name = "readerDataSource", destroyMethod = "close")
     DataSource readerDataSource(PgLedgerProperties properties) {
-        return pool("pgledger-reader", required("PGLEDGER_READER_JDBC_URL", properties.readerJdbcUrl()), properties);
+        return pool("pgledger-reader", propertyOrDefault(properties.readerJdbcUrl(), "PGLEDGER_READER_JDBC_URL"), properties);
     }
 
     @Bean(destroyMethod = "close")
     @Primary
     DataSource dataSource(
             @Qualifier("writerDataSource") DataSource writer,
-            @Qualifier("readerDataSource") DataSource reader) throws SQLException {
-        requireRoles(writer, reader);
+            @Qualifier("readerDataSource") DataSource reader,
+            PgLedgerProperties properties) throws SQLException {
+        requireRoles(writer, reader, properties);
         PostgresLedgerStore.migrate(writer);
         return readWriteSplitting(writer, reader);
     }
@@ -114,17 +115,27 @@ class PgLedgerDataSourceConfiguration {
         HikariConfig config = new HikariConfig();
         config.setPoolName(name);
         config.setJdbcUrl(jdbcUrl);
-        config.setUsername(required("PGLEDGER_JDBC_USER", properties.jdbcUser()));
-        config.setPassword(required("PGLEDGER_JDBC_PASSWORD", properties.jdbcPassword()));
+        config.setUsername(propertyOrDefault(properties.jdbcUser(), "PGLEDGER_JDBC_USER"));
+        config.setPassword(propertyOrDefault(properties.jdbcPassword(), "PGLEDGER_JDBC_PASSWORD"));
         config.setMaximumPoolSize(10);
         config.setMinimumIdle(1);
         config.setConnectionTimeout(5_000L);
         return new HikariDataSource(config);
     }
 
-    private static void requireRoles(DataSource writer, DataSource reader) throws SQLException {
+    /**
+     * Writer must be a primary. Reader must be a streaming replica unless both
+     * JDBC URLs are identical (single-node Testcontainers / local primary).
+     */
+    private static void requireRoles(DataSource writer, DataSource reader, PgLedgerProperties properties)
+            throws SQLException {
         if (recovery(writer)) {
             throw new IllegalStateException("PGLEDGER_WRITER_JDBC_URL is a replica");
+        }
+        String writerUrl = propertyOrDefault(properties.writerJdbcUrl(), "PGLEDGER_WRITER_JDBC_URL");
+        String readerUrl = propertyOrDefault(properties.readerJdbcUrl(), "PGLEDGER_READER_JDBC_URL");
+        if (writerUrl.equals(readerUrl)) {
+            return;
         }
         if (!recovery(reader)) {
             throw new IllegalStateException("PGLEDGER_READER_JDBC_URL is not a replica");
@@ -147,5 +158,14 @@ class PgLedgerDataSourceConfiguration {
             throw new IllegalStateException(name + " is required");
         }
         return value;
+    }
+
+    /**
+     * Spring property (application.yml, test DefaultProperties) wins; the
+     * environment variable is the fallback for container and plain runs. A
+     * property of "" means unset, matching the ${VAR:} placeholders in yml.
+     */
+    private static String propertyOrDefault(String property, String envName) {
+        return required(envName, property == null || property.isBlank() ? System.getenv(envName) : property);
     }
 }
