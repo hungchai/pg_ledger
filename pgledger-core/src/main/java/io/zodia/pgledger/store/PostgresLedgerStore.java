@@ -103,6 +103,37 @@ public final class PostgresLedgerStore implements LedgerStore {
             WHERE t.id = ?
             ORDER BY e.id
             """;
+    private static final String LOAD_TRANSFERS_BY_REQUEST = """
+            SELECT
+                t.id AS transfer_id,
+                fa.account_id AS from_account_id,
+                fa.balance_type_id AS from_balance_type_id,
+                ta.account_id AS to_account_id,
+                ta.balance_type_id AS to_balance_type_id,
+                fa.currency_id AS currency_id,
+                t.amount AS transfer_amount,
+                t.created_at AS transfer_created_at,
+                t.event_at,
+                t.biz_reference,
+                t.request_id,
+                t.biz_type_id,
+                e.id AS entry_id,
+                ea.account_id AS entry_account_id,
+                ea.balance_type_id AS entry_balance_type_id,
+                ea.currency_id AS entry_currency_id,
+                e.amount AS entry_amount,
+                e.account_previous_balance,
+                e.account_current_balance,
+                e.account_version,
+                e.created_at AS entry_created_at
+            FROM pgledger_transfers t
+            JOIN pgledger_accounts fa ON fa.id = t.from_account_id
+            JOIN pgledger_accounts ta ON ta.id = t.to_account_id
+            JOIN pgledger_entries e ON e.transfer_id = t.id
+            JOIN pgledger_accounts ea ON ea.id = e.account_id
+            WHERE t.request_id = ?
+            ORDER BY t.id, e.id
+            """;
     private static final int MIGRATION_ATTEMPTS = 30;
 
     private final DataSource dataSource;
@@ -195,30 +226,55 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     @Override
     public Transfer post(Posting posting) {
+        List<Transfer> transfers = post(List.of(posting));
+        if (transfers.isEmpty()) {
+            throw new LedgerException("pgledger_create_transfer returned no row");
+        }
+        return transfers.get(0);
+    }
+
+    @Override
+    public List<Transfer> post(List<Posting> legs) {
+        if (legs == null || legs.isEmpty()) {
+            throw new LedgerException("at least one posting leg is required");
+        }
+        Posting first = legs.get(0);
+        String requestId = first.requestId();
         return write(conn -> {
-            String transferId;
-            try (PreparedStatement ps = conn.prepareStatement(CREATE_TRANSFER)) {
-                ps.setString(1, posting.fromAccountId());
-                ps.setInt(2, Integer.parseInt(posting.fromBalanceType()));
-                ps.setString(3, posting.toAccountId());
-                ps.setInt(4, Integer.parseInt(posting.toBalanceType()));
-                ps.setString(5, posting.currency());
-                ps.setBigDecimal(6, posting.amount());
-                ps.setString(7, posting.bizReference());
-                ps.setString(8, posting.requestId());
-                if (posting.bizType() == null || posting.bizType().isBlank()) {
-                    ps.setNull(9, Types.VARCHAR);
+            StringBuilder sql = new StringBuilder(96 + legs.size() * 48);
+            sql.append("SELECT id FROM pgledger_create_transfers(ARRAY[");
+            for (int i = 0; i < legs.size(); i++) {
+                if (i > 0) {
+                    sql.append(',');
+                }
+                sql.append("ROW(?,?,?,?,?,?)::transfer_request");
+            }
+            sql.append("]::transfer_request[], NULL, ?, ?, ?)");
+            try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+                int index = 1;
+                for (int i = 0; i < legs.size(); i++) {
+                    Posting leg = legs.get(i);
+                    ps.setString(index++, leg.fromAccountId());
+                    ps.setInt(index++, Integer.parseInt(leg.fromBalanceType()));
+                    ps.setString(index++, leg.toAccountId());
+                    ps.setInt(index++, Integer.parseInt(leg.toBalanceType()));
+                    ps.setString(index++, leg.currency());
+                    ps.setBigDecimal(index++, leg.amount());
+                }
+                ps.setString(index++, first.bizReference());
+                ps.setString(index++, requestId);
+                if (first.bizType() == null || first.bizType().isBlank()) {
+                    ps.setNull(index, Types.VARCHAR);
                 } else {
-                    ps.setString(9, posting.bizType());
+                    ps.setString(index, first.bizType());
                 }
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
-                        throw new LedgerException("pgledger_create_transfer returned no row");
+                        throw new LedgerException("pgledger_create_transfers returned no row");
                     }
-                    transferId = rs.getString(1);
                 }
             }
-            return loadTransfer(conn, transferId);
+            return loadTransfersByRequest(conn, requestId);
         });
     }
 
@@ -482,6 +538,32 @@ public final class PostgresLedgerStore implements LedgerStore {
                     throw new LedgerException("pgledger_create_transfer returned no row");
                 }
                 return transfer;
+            }
+        }
+    }
+
+    private List<Transfer> loadTransfersByRequest(Connection conn, String requestId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(LOAD_TRANSFERS_BY_REQUEST)) {
+            ps.setString(1, requestId);
+            try (ResultSet rs = ps.executeQuery()) {
+                LinkedHashMap<String, Transfer> transfers = new LinkedHashMap<>();
+                LinkedHashMap<String, ArrayList<Entry>> entries = new LinkedHashMap<>();
+                while (rs.next()) {
+                    String transferId = rs.getString("transfer_id");
+                    if (!transfers.containsKey(transferId)) {
+                        transfers.put(transferId, transfer(rs, transferId));
+                        entries.put(transferId, new ArrayList<>(2));
+                    }
+                    entries.get(transferId).add(entry(rs));
+                }
+                if (transfers.isEmpty()) {
+                    throw new LedgerException("pgledger_create_transfers returned no row");
+                }
+                ArrayList<Transfer> page = new ArrayList<>(transfers.size());
+                for (Transfer transfer : transfers.values()) {
+                    page.add(withEntries(transfer, List.copyOf(entries.get(transfer.id()))));
+                }
+                return List.copyOf(page);
             }
         }
     }

@@ -27,9 +27,7 @@ dependencies {
     testImplementation(project(":pgledger-client-sdk"))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("org.postgresql:postgresql")
-    testImplementation(platform("org.testcontainers:testcontainers-bom:1.20.4"))
-    testImplementation("org.testcontainers:junit-jupiter")
-    testImplementation("org.testcontainers:postgresql")
+    testImplementation("io.zonky.test:embedded-postgres:2.2.0")
 }
 
 tasks.withType<JavaCompile> {
@@ -41,12 +39,6 @@ tasks.test {
         excludeTags("stress")
     }
     workingDir = rootProject.projectDir
-    val dockerSock = System.getenv("DOCKER_HOST")
-            ?: "unix://${System.getProperty("user.home")}/.docker/run/docker.sock"
-    environment("DOCKER_HOST", dockerSock)
-    environment("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE",
-            System.getenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE")
-                    ?: "${System.getProperty("user.home")}/.docker/run/docker.sock")
 }
 
 tasks.register<Test>("stressTest") {

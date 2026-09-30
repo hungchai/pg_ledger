@@ -3,6 +3,7 @@ package io.zodia.pgledger.store;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
@@ -44,6 +45,22 @@ public final class LedgerJson {
     public static <T> T read(byte[] json, Class<T> type) {
         try {
             return MAPPER.readValue(json, type);
+        } catch (IOException e) {
+            throw new JsonReadException(e);
+        }
+    }
+
+    public static JsonNode tree(byte[] json) {
+        try {
+            return MAPPER.readTree(json);
+        } catch (IOException e) {
+            throw new JsonReadException(e);
+        }
+    }
+
+    public static <T> T convert(JsonNode node, Class<T> type) {
+        try {
+            return MAPPER.treeToValue(node, type);
         } catch (IOException e) {
             throw new JsonReadException(e);
         }

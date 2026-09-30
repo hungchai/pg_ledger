@@ -117,9 +117,9 @@ class PgLedgerDataSourceConfiguration {
         config.setJdbcUrl(jdbcUrl);
         config.setUsername(propertyOrDefault(properties.jdbcUser(), "PGLEDGER_JDBC_USER"));
         config.setPassword(propertyOrDefault(properties.jdbcPassword(), "PGLEDGER_JDBC_PASSWORD"));
-        config.setMaximumPoolSize(10);
+        config.setMaximumPoolSize(properties.jdbcPoolSizeOrDefault());
         config.setMinimumIdle(1);
-        config.setConnectionTimeout(5_000L);
+        config.setConnectionTimeout(30_000L);
         config.setConnectionInitSql("SET TIME ZONE 'UTC'");
         return new HikariDataSource(config);
     }

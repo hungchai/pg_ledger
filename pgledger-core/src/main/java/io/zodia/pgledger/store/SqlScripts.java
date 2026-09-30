@@ -3,7 +3,7 @@ package io.zodia.pgledger.store;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Splits a SQL script on semicolons that are outside dollar quotes. */
+/** Splits a SQL script on semicolons that are outside dollar quotes and line comments. */
 public final class SqlScripts {
     private SqlScripts() {
     }
@@ -14,6 +14,19 @@ public final class SqlScripts {
         String openTag = null;
         for (int i = 0; i < sql.length(); i++) {
             char c = sql.charAt(i);
+            if (openTag == null && c == '-' && i + 1 < sql.length() && sql.charAt(i + 1) == '-') {
+                current.append(c).append(sql.charAt(i + 1));
+                i += 2;
+                while (i < sql.length()) {
+                    char line = sql.charAt(i);
+                    current.append(line);
+                    if (line == '\n') {
+                        break;
+                    }
+                    i++;
+                }
+                continue;
+            }
             if (c == '$') {
                 int tagEnd = tagEnd(sql, i);
                 if (tagEnd > i) {

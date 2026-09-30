@@ -4,7 +4,7 @@
 -- Registries use a 4-byte id. Hot tables store that id. There are no foreign keys.
 -- Shard business ids stay text: BANK-{currency code}-{balance type code}-{n}.
 
--- TIMESTAMPTZ is always stored as UTC; pin the database session timezone so
+-- TIMESTAMPTZ is always stored as UTC - pin the database session timezone so
 -- clients (psql, DBeaver, JDBC) show and interpret wall times as UTC.
 DO $$
 BEGIN

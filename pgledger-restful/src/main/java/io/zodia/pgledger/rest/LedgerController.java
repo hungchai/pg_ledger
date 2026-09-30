@@ -7,8 +7,10 @@ import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.DeleteAccount;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.PostingBatch;
 import io.zodia.pgledger.store.LedgerJson;
 import io.zodia.pgledger.store.read.LedgerReadService;
+import com.fasterxml.jackson.databind.JsonNode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -60,7 +62,13 @@ final class LedgerController {
 
     @PostMapping("/api/v1/postings")
     ResponseEntity<byte[]> post(@RequestBody(required = false) byte[] body) {
-        Posting posting = read(body, Posting.class);
+        JsonNode root = tree(body);
+        if (root.has("legs")) {
+            PostingBatch batch = LedgerJson.convert(root, PostingBatch.class);
+            return HttpResponses.of(200, PgLedgerServer.WRITER,
+                    LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.post(batch))));
+        }
+        Posting posting = LedgerJson.convert(root, Posting.class);
         return HttpResponses.of(200, PgLedgerServer.WRITER,
                 LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.post(posting))));
     }
@@ -140,6 +148,21 @@ final class LedgerController {
                 throw new BadRequestException();
             }
             return value;
+        } catch (LedgerJson.JsonReadException e) {
+            throw new BadRequestException();
+        }
+    }
+
+    private static JsonNode tree(byte[] json) {
+        if (json == null || json.length == 0 || json.length > MAX_BODY) {
+            throw new BadRequestException();
+        }
+        try {
+            JsonNode node = LedgerJson.tree(json);
+            if (node == null || node.isNull()) {
+                throw new BadRequestException();
+            }
+            return node;
         } catch (LedgerJson.JsonReadException e) {
             throw new BadRequestException();
         }

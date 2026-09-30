@@ -32,3 +32,4 @@ pgledger:
   jdbc-user: ${PGLEDGER_JDBC_USER:}
   jdbc-password: ${PGLEDGER_JDBC_PASSWORD:}
   bank-pool-size: ${PGLEDGER_BANK_POOL_SIZE:8}
+  jdbc-pool-size: ${PGLEDGER_JDBC_POOL_SIZE:10}

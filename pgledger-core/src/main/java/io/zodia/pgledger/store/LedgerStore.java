@@ -20,6 +20,9 @@ public interface LedgerStore extends AutoCloseable {
 
     Transfer post(Posting posting);
 
+    /** Atomic multi-leg post. Every leg shares the same requestId. */
+    List<Transfer> post(List<Posting> legs);
+
     int ensureBankPool(String balanceTypeCode, int balanceTypeId, String currency, int poolSize, boolean keepExisting);
 
     Account deleteAccount(String accountId, String balanceType, String currency);

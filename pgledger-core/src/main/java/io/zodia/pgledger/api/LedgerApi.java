@@ -79,6 +79,27 @@ public final class LedgerApi {
         }
     }
 
+    /** One leg of a multi-leg posting (e.g. RFQ). Balance types may be codes or ids. */
+    public record PostingLeg(
+            String fromAccountId,
+            @JsonDeserialize(using = NumberAsTextDeserializer.class) String fromBalanceType,
+            String toAccountId,
+            @JsonDeserialize(using = NumberAsTextDeserializer.class) String toBalanceType,
+            String currency,
+            BigDecimal amount) {
+    }
+
+    /**
+     * Atomic multi-leg posting. One {@code requestId}, one SQL {@code pgledger_create_transfers}.
+     * Single-leg callers keep using {@link Posting}.
+     */
+    public record PostingBatch(
+            String requestId,
+            String bizReference,
+            String bizType,
+            List<PostingLeg> legs) {
+    }
+
     public record Account(
             String id,
             String accountId,

@@ -22,10 +22,8 @@ dependencies {
     implementation("org.mybatis:mybatis:3.5.19")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    testImplementation(platform("org.testcontainers:testcontainers-bom:1.20.4"))
-    testImplementation("org.testcontainers:junit-jupiter")
-    testImplementation("org.testcontainers:postgresql")
-    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.16")
+    testImplementation("io.zonky.test:embedded-postgres:2.2.0")
+    testRuntimeOnly("org.slf4j:slf4j-simple:1.7.36")
 }
 
 // SQL lives in /db at the repo root, not under this module.
@@ -42,17 +40,4 @@ tasks.withType<JavaCompile> {
 tasks.test {
     useJUnitPlatform()
     workingDir = rootProject.projectDir
-    // Docker Desktop on macOS often exposes the engine on ~/.docker/run/docker.sock.
-    val dockerSock = System.getenv("DOCKER_HOST")
-            ?: "unix://${System.getProperty("user.home")}/.docker/run/docker.sock"
-    environment("DOCKER_HOST", dockerSock)
-    environment("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE",
-            System.getenv("TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE")
-                    ?: "${System.getProperty("user.home")}/.docker/run/docker.sock")
-}
-
-tasks.register("printTestClasspath") {
-    doLast {
-        println(configurations.getByName("testRuntimeClasspath").asPath)
-    }
 }

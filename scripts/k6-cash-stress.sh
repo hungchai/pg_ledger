@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# One-shot: wipe DB volumes, start stack (API + Grafana), run deposit + withdrawal k6, recon.
-# Three reports under reports/<run-id>/.
-#
-# Prerequisites: docker, docker compose, k6, curl; psql OR docker (recon uses docker exec).
+# One-shot: wipe DB, start stack, run deposit + withdrawal + RFQ k6, then recon.
 #
 # Usage (same shape as jraft test-cycle.sh):
 #   ./scripts/k6-cash-stress.sh
-#   ./scripts/k6-cash-stress.sh --vus 50 --duration 2m
-#   ./scripts/k6-cash-stress.sh --vus 20 --duration 60s --no-wipe --accounts 100
-#
-# Env still works as override defaults: VUS, DURATION, ACCOUNTS, BASE_URL, SKIP_WIPE, SKIP_BUILD
+#   ./scripts/k6-cash-stress.sh --vus 100 --duration 120m
+#   ./scripts/k6-cash-stress.sh --vus 20 --duration 60s --no-wipe --no-build
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,21 +19,20 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 PROM_RW="${K6_PROMETHEUS_RW_SERVER_URL:-http://127.0.0.1:9090/api/v1/write}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 REPORT_DIR="${REPORT_DIR:-$ROOT/reports/$RUN_ID}"
+FUND_ROUNDS="${FUND_ROUNDS:-30}"
 
 usage() {
   echo "Usage: $0 [--vus N] [--duration M] [--accounts N] [--base-url URL]"
   echo "         [--no-wipe] [--no-build] [--fund-rounds N]"
   echo "  --vus N           Virtual users (default: ${VUS})"
-  echo "  --duration M      k6 duration, e.g. 60s / 2m (default: ${DURATION})"
-  echo "  --accounts N      CASH accounts (default: ${ACCOUNTS})"
+  echo "  --duration M      k6 duration per scenario, e.g. 60s / 120m (default: ${DURATION})"
+  echo "  --accounts N      CASH + RFQ accounts (default: ${ACCOUNTS})"
   echo "  --base-url URL    API base (default: ${BASE_URL})"
-  echo "  --no-wipe         Keep docker volumes (skip compose down -v)"
-  echo "  --no-build        docker compose up without --build"
-  echo "  --fund-rounds N   Deposits per account/ccy before withdrawal (default: 30)"
+  echo "  --no-wipe         Keep docker volumes"
+  echo "  --no-build        compose up without --build"
+  echo "  --fund-rounds N   Seed deposits per CASH account/ccy before withdrawal (default: 30)"
   exit 1
 }
-
-FUND_ROUNDS="${FUND_ROUNDS:-30}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -106,6 +100,7 @@ export K6_PROMETHEUS_RW_TREND_STATS="${K6_PROMETHEUS_RW_TREND_STATS:-p(50),p(95)
 
 TESTID_DEP="deposit-${RUN_ID}"
 TESTID_WD="withdrawal-${RUN_ID}"
+TESTID_RFQ="rfq-${RUN_ID}"
 
 echo "==> k6 deposit (testid=$TESTID_DEP)"
 REPORT_PATH="$REPORT_DIR/01-deposit.txt" \
@@ -119,34 +114,40 @@ REPORT_PATH="$REPORT_DIR/02-withdrawal.txt" \
     -o experimental-prometheus-rw --tag "testid=${TESTID_WD}" "$ROOT/k6/withdrawal.js" \
   | tee "$REPORT_DIR/02-withdrawal.console.txt"
 
+echo "==> k6 rfq (testid=$TESTID_RFQ) company=CO_RFQ"
+REPORT_PATH="$REPORT_DIR/03-rfq.txt" \
+  k6 run -e "VUS=${VUS}" -e "DURATION=${DURATION}" -e "ACCOUNTS=${ACCOUNTS}" \
+    -o experimental-prometheus-rw --tag "testid=${TESTID_RFQ}" "$ROOT/k6/rfq.js" \
+  | tee "$REPORT_DIR/03-rfq.console.txt"
+
 echo "==> recon"
 RECON_FAIL=0
-if ! "$ROOT/scripts/recon.sh" "$REPORT_DIR/03-recon.txt"; then
-  echo "recon FAILED — see $REPORT_DIR/03-recon.txt" >&2
+if ! "$ROOT/scripts/recon.sh" "$REPORT_DIR/04-recon.txt"; then
+  echo "recon FAILED — see $REPORT_DIR/04-recon.txt" >&2
   RECON_FAIL=1
 fi
 
 cat > "$REPORT_DIR/README.md" <<EOF
-# pgledger cash stress — ${RUN_ID}
+# pgledger stress — ${RUN_ID}
 
 | # | Report | File |
 |---|---|---|
 | 1 | Deposit | \`01-deposit.txt\` |
-| 2 | Withdrawal (+ gas reserve/settle) | \`02-withdrawal.txt\` |
-| 3 | Recon | \`03-recon.txt\` |
+| 2 | Withdrawal (+ gas) | \`02-withdrawal.txt\` |
+| 3 | RFQ (one company \`CO_RFQ\`) | \`03-rfq.txt\` |
+| 4 | Recon | \`04-recon.txt\` |
 
-- Grafana: http://127.0.0.1:3000 (admin / pgledger) — dashboard **pgledger**
-- testid: \`${TESTID_DEP}\` / \`${TESTID_WD}\`
+- Grafana: http://127.0.0.1:3000 (admin / pgledger)
+- testid: \`${TESTID_DEP}\` / \`${TESTID_WD}\` / \`${TESTID_RFQ}\`
 - VUs=${VUS} DURATION=${DURATION} ACCOUNTS=${ACCOUNTS}
-- RFQ: not in this run
 EOF
 
 echo
-echo "=== three reports ==="
+echo "=== reports ==="
 echo "1) $REPORT_DIR/01-deposit.txt"
 echo "2) $REPORT_DIR/02-withdrawal.txt"
-echo "3) $REPORT_DIR/03-recon.txt"
-echo "index: $REPORT_DIR/README.md"
+echo "3) $REPORT_DIR/03-rfq.txt"
+echo "4) $REPORT_DIR/04-recon.txt"
 echo
 
 exit "${RECON_FAIL}"

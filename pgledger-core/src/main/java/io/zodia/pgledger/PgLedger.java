@@ -7,6 +7,8 @@ import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.PostingBatch;
+import io.zodia.pgledger.api.LedgerApi.PostingLeg;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerStore;
 import io.zodia.pgledger.store.LedgerViolation;
@@ -16,6 +18,7 @@ import org.postgresql.ds.PGSimpleDataSource;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -184,39 +187,73 @@ public final class PgLedger implements AutoCloseable {
     }
 
     public Transfer post(Posting posting) {
-        if (posting == null
-                || blank(posting.fromAccountId())
-                || blank(posting.fromBalanceType())
-                || blank(posting.toAccountId())
-                || blank(posting.toBalanceType())
-                || blank(posting.currency())) {
+        if (posting == null) {
             throw new LedgerViolation("account_id, balance_type, and currency are required");
         }
-        if (blank(posting.requestId())) {
+        List<Transfer> transfers = post(new PostingBatch(
+                posting.requestId(),
+                posting.bizReference(),
+                posting.bizType(),
+                List.of(new PostingLeg(
+                        posting.fromAccountId(),
+                        posting.fromBalanceType(),
+                        posting.toAccountId(),
+                        posting.toBalanceType(),
+                        posting.currency(),
+                        posting.amount()))));
+        return transfers.get(0);
+    }
+
+    /**
+     * Atomic multi-leg posting (RFQ). One {@code requestId}, all legs commit or none.
+     */
+    public List<Transfer> post(PostingBatch batch) {
+        if (batch == null || batch.legs() == null || batch.legs().isEmpty()) {
+            throw new LedgerViolation("at least one posting leg is required");
+        }
+        if (blank(batch.requestId())) {
             throw new LedgerViolation("request_id is required");
         }
-        BigDecimal amount = posting.amount();
-        if (amount == null || amount.signum() <= 0) {
-            throw new LedgerViolation("Amount (" + (amount == null ? "null" : amount.toPlainString()) + ") must be positive");
-        }
-        String bizReference = posting.bizReference();
-        String bizType = posting.bizType();
-        if (bizType != null && !bizType.isBlank()) {
+        String requestId = batch.requestId().strip();
+        String bizReference = batch.bizReference() == null || batch.bizReference().isBlank()
+                ? null
+                : batch.bizReference().strip();
+        String bizType = batch.bizType() == null || batch.bizType().isBlank()
+                ? null
+                : batch.bizType().strip();
+        if (bizType != null) {
             registries.requireBizType(bizType);
         }
-        registries.requireCurrency(posting.currency());
-        int fromType = registries.balanceTypeId(posting.fromBalanceType());
-        int toType = registries.balanceTypeId(posting.toBalanceType());
-        return writer.post(new Posting(
-                posting.fromAccountId().strip(),
-                Integer.toString(fromType),
-                posting.toAccountId().strip(),
-                Integer.toString(toType),
-                posting.currency().strip(),
-                amount,
-                posting.requestId().strip(),
-                bizReference == null || bizReference.isBlank() ? null : bizReference.strip(),
-                bizType == null || bizType.isBlank() ? null : bizType.strip()));
+        ArrayList<Posting> resolved = new ArrayList<>(batch.legs().size());
+        for (int i = 0; i < batch.legs().size(); i++) {
+            PostingLeg leg = batch.legs().get(i);
+            if (leg == null
+                    || blank(leg.fromAccountId())
+                    || blank(leg.fromBalanceType())
+                    || blank(leg.toAccountId())
+                    || blank(leg.toBalanceType())
+                    || blank(leg.currency())) {
+                throw new LedgerViolation("account_id, balance_type, and currency are required");
+            }
+            BigDecimal amount = leg.amount();
+            if (amount == null || amount.signum() <= 0) {
+                throw new LedgerViolation("Amount (" + (amount == null ? "null" : amount.toPlainString()) + ") must be positive");
+            }
+            registries.requireCurrency(leg.currency());
+            int fromType = registries.balanceTypeId(leg.fromBalanceType());
+            int toType = registries.balanceTypeId(leg.toBalanceType());
+            resolved.add(new Posting(
+                    leg.fromAccountId().strip(),
+                    Integer.toString(fromType),
+                    leg.toAccountId().strip(),
+                    Integer.toString(toType),
+                    leg.currency().strip(),
+                    amount,
+                    requestId,
+                    bizReference,
+                    bizType));
+        }
+        return writer.post(List.copyOf(resolved));
     }
 
     public List<Account> balances(String accountId) {

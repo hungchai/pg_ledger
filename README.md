@@ -21,7 +21,8 @@ Writes go to the primary (**writer**). Balance and journal reads go to a streami
 7. [Tests](#tests)
 8. [Load / stress](#load--stress)
 9. [Schema reference](#schema-reference)
-10. [Observability](#observability)
+10. [Performance tuning](#performance-tuning)
+11. [Observability](#observability)
 
 ---
 
@@ -283,6 +284,7 @@ Set the same variables on every API replica:
 | `PGLEDGER_READER_JDBC_URL` | yes | — | Replica JDBC URL (may equal writer for single-node) |
 | `PGLEDGER_JDBC_USER` | yes | — | DB user |
 | `PGLEDGER_JDBC_PASSWORD` | yes | — | DB password |
+| `PGLEDGER_JDBC_POOL_SIZE` | no | `10` | Hikari max pool size per role (writer and reader each) |
 | `PGLEDGER_BANK_POOL_SIZE` | no | `8` | BANK shard pool size when auto-created |
 | `PORT` | no | `8080` | HTTP listen port |
 
@@ -332,11 +334,11 @@ docker run --rm -p 8080:8080 \
 
 | Suite | Postgres | Command |
 |-------|----------|---------|
-| Core (`PgLedgerTest`) | Embedded (zonky, no Docker) | `./gradlew :pgledger-core:test` |
-| REST (`PgLedgerRestTest`) | Embedded (single primary for writer+reader URLs) | `./gradlew :pgledger-restful:test` |
+| Core (`PgLedgerTest`) | Embedded Postgres (zonky, no Docker) | `./gradlew :pgledger-core:test` |
+| REST (`PgLedgerRestTest`) | Embedded Postgres (single primary for writer+reader URLs) | `./gradlew :pgledger-restful:test` |
 | Stress (`PgLedgerStressTest`) | Compose on `5432` / `5433` | `docker compose up -d` then `./gradlew :pgledger-restful:stressTest` |
 
-Core and REST do not need Docker. Stress needs a real writer/reader replica and is **excluded** from `:pgledger-restful:test`.
+Core and REST do not need Docker. `stressTest` is excluded from `:pgledger-restful:test`.
 
 Stress prints a TPS summary to stdout and writes `pgledger-restful/build/reports/pgledger-stress-tps.txt` (override with `-Dpgledger.stress.report=...`; blank disables the file).
 
@@ -346,13 +348,14 @@ Tunables: `-Dpgledger.stress.levels=50,100,200`, `-Dpgledger.stress.posts=20`, `
 
 ## Load / stress
 
-One-shot wipe, start Compose (API + Prometheus + Grafana), run deposit then withdrawal (with gas reserve/settle), then recon. Needs `docker`, `k6`, and `curl`.
+One-shot wipe, start Compose (API + Prometheus + Grafana), run deposit → withdrawal (gas reserve/settle) → RFQ (one `CO_RFQ` dealer), then recon. Needs `docker`, `k6`, and `curl`.
 
 ```bash
-# defaults: 20 VUs, 60s, 100 CASH accounts
+# defaults: 20 VUs, 60s, 100 accounts
 ./scripts/k6-cash-stress.sh
 
 ./scripts/k6-cash-stress.sh --vus 50 --duration 2m
+./scripts/k6-cash-stress.sh --vus 100 --duration 120m
 ./scripts/k6-cash-stress.sh --vus 20 --duration 60s --no-wipe --no-build
 ./scripts/k6-cash-stress.sh --help
 ```
@@ -360,22 +363,23 @@ One-shot wipe, start Compose (API + Prometheus + Grafana), run deposit then with
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--vus N` | `20` | Virtual users |
-| `--duration M` | `60s` | k6 duration (`60s`, `2m`, …) |
-| `--accounts N` | `100` | `CASH-000` … accounts × ETH/BTC/USDT |
+| `--duration M` | `60s` | k6 duration **per scenario** (`60s`, `120m`, …) |
+| `--accounts N` | `100` | `CASH-000` / `RFQ-000` … × ETH/BTC/USDT |
 | `--base-url URL` | `http://127.0.0.1:8080` | API base |
 | `--no-wipe` | off | Skip `docker compose down -v` |
 | `--no-build` | off | `compose up` without `--build` |
-| `--fund-rounds N` | `30` | Seed deposits per account/ccy before withdrawal |
+| `--fund-rounds N` | `30` | Seed deposits per CASH account/ccy before withdrawal |
 
 Reports under `reports/<run-id>/` (also mirrored to `reports/latest/`):
 
 1. `01-deposit.txt` — deposit TPS / latency
 2. `02-withdrawal.txt` — withdraw + `LIQUID→GAS_FEE` reserve + settle
-3. `03-recon.txt` — money conservation / orphans / versions
+3. `03-rfq.txt` — multi-leg RFQ vs one company dealer `CO_RFQ`
+4. `04-recon.txt` — money conservation / orphans / versions
 
-Grafana dashboard **pgledger**: pick testid `deposit-*` or `withdrawal-*` for API TPS.
+Grafana dashboard **pgledger**: pick testid `deposit-*`, `withdrawal-*`, or `rfq-*` for API TPS.
 
-Recon alone (stack already up): `./scripts/recon.sh` or `./scripts/recon.sh reports/latest/03-recon.txt`.
+Recon alone (stack already up): `./scripts/recon.sh` or `./scripts/recon.sh reports/latest/04-recon.txt`.
 
 ---
 
@@ -399,8 +403,45 @@ Design notes for agents/sessions: [docs/ledger-ai-context.md](docs/ledger-ai-con
 
 ---
 
+## Performance tuning
+
+Knobs and code paths that actually move throughput or latency here. Measure with the [stress suite](#tests) and the Grafana **pgledger** dashboard before/after.
+
+### Connection pools (start here)
+
+- `PGLEDGER_JDBC_POOL_SIZE` (default `10`, Compose sets `100`) is the Hikari max **per role** — writer and reader each. Total API sessions ≈ `2 × pool × instances`; keep it under Postgres `max_connections` (Compose writer: `400`).
+- Reads are cheap and offloaded to the replica — the reader pool can usually be smaller than the writer pool.
+- Pool exhaustion shows up as latency spikes, not errors. Watch Hikari `pending` / connection wait in metrics.
+
+### Contention (the real TPS ceiling)
+
+- `pgledger_create_transfers` locks every touched balance row **in sorted internal-id order** (`FOR UPDATE`), so multi-leg posts serialize per-account, not globally. Hotspot ceiling = one account pair.
+- The `BANK` sentinel fans out to `BANK-{currency}-{type}-{n}` shards (`n = hash(request_id) % poolSize`, locked `FOR UPDATE`, **no `SKIP LOCKED`**). If deposits/withdrawals queue behind each other, raise `PGLEDGER_BANK_POOL_SIZE` **before first use** — the pool is created once and keeps its size (`pgledger_ensure_bank_pool(..., keep_existing => false)` to force a resize).
+- Same-account same-balance contention (RFQ hold + pay hitting one balance) serializes by design; keep hold/pay legs on **different balance types** (`LIQUID` vs `LOCKED`) where possible.
+
+### Postgres writer
+
+| Knob | Why |
+|------|-----|
+| `synchronous_commit = off` | Latency win on deposits/withdrawals if you can tolerate a small commit-loss window. Do **not** do this for a real ledger without understanding the tradeoff. |
+| `max_connections` | Size for `2 × JDBC pool × API instances` + exporters + admin. |
+| `shared_buffers`, `wal_keep_size` | Compose defaults are demo-sized; raise for real volume. |
+| `hot_standby` feedback / replication lag | Reader lag directly delays balance visibility — monitor `pg_stat_replication` on the writer (exporter panel). |
+
+### Reads
+
+- Balance and journal reads hit the **reader** — scale read throughput by adding replicas, not writer capacity.
+- Registry lookups (balance type / currency / biz type / class) never hit the DB per-request; they come from the in-process cache refreshed every 60s. New registry rows are visible only after refresh — don't "fix" slow-looking lookups that aren't there.
+- Journal pages use `(created_at DESC, id DESC)` — deep pages (`page` high) get slow; prefer cursoring by time window if you page far back.
+
+### JVM
+
+- The API is Spring Boot on JDK 21. Keep heaps small-to-moderate; the write path is JDBC-bound, not allocation-bound. Virtual threads (used by the stress client) help open-connection concurrency, not lock contention.
+
+---
+
 ## Observability
 
-- Grafana dashboard **pgledger** (provisioned under `grafana/`)
+- Grafana dashboard **pgledger** (provisioned under `grafana/`) — http://127.0.0.1:3000, login `admin` / `pgledger`
 - Postgres exporters: writer `:9187`, reader `:9188`
 - Cash stress reports: `./scripts/k6-cash-stress.sh` → `reports/<run-id>/`

@@ -8,6 +8,7 @@ import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.DeleteAccount;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.PostingBatch;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerJson;
 
@@ -75,6 +76,10 @@ public final class PgLedgerClient implements AutoCloseable {
 
     public Transfer post(Posting posting) {
         return read(ok(exchange("POST", "/api/v1/postings", LedgerJson.writeBytes(posting))), Transfer.class);
+    }
+
+    public List<Transfer> post(PostingBatch batch) {
+        return readList(ok(exchange("POST", "/api/v1/postings", LedgerJson.writeBytes(batch))), Transfer.class);
     }
 
     public Transfer deposit(CashMovement movement) {
