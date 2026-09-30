@@ -8,8 +8,9 @@
 # wipe volumes and re-run init: docker compose down -v
 # max_connections=400 so 200 concurrent API calls each keep one session.
 # Grafana: http://localhost:3000  admin / pgledger
-# k6 TPS:  K6_PROMETHEUS_RW_TREND_STATS=p(50),p(95),p(99),avg \
-#          k6 run -o experimental-prometheus-rw --tag testid=$(date +%s) k6/postings.js
+# One-shot cash stress (deposit + withdrawal + recon → 3 reports):
+#   ./scripts/k6-cash-stress.sh
+# k6 TPS → Prometheus remote write (dashboard testid dropdown)
 
 name: pgledger
 

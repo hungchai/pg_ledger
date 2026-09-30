@@ -22,9 +22,7 @@ dependencies {
     implementation("org.mybatis:mybatis:3.5.19")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    testImplementation(platform("org.testcontainers:testcontainers-bom:1.21.4"))
-    testImplementation("org.testcontainers:junit-jupiter")
-    testImplementation("org.testcontainers:postgresql")
+    testImplementation("io.zonky.test:embedded-postgres:2.2.0")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.16")
 }
 
@@ -42,8 +40,6 @@ tasks.withType<JavaCompile> {
 tasks.test {
     useJUnitPlatform()
     workingDir = rootProject.projectDir
-    // Docker 29 rejects the API version docker-java negotiates by default.
-    systemProperty("api.version", "1.44")
 }
 
 tasks.register("printTestClasspath") {

@@ -2,7 +2,8 @@ FROM eclipse-temurin:21-jdk AS build
 WORKDIR /src
 COPY settings.gradle.kts build.gradle.kts ./
 COPY gradlew ./
-COPY gradle/wrapper/gradle-wrapper.properties gradle/wrapper/
+COPY gradle/wrapper/ gradle/wrapper/
+RUN chmod +x gradlew
 COPY pgledger-core pgledger-core
 COPY pgledger-client-sdk pgledger-client-sdk
 COPY pgledger-restful pgledger-restful

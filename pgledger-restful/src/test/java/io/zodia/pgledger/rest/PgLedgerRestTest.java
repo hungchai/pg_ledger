@@ -12,6 +12,8 @@ import io.zodia.pgledger.client.PgLedgerClient;
 import io.zodia.pgledger.client.PgLedgerClientConfig;
 import io.zodia.pgledger.client.PgLedgerClientException;
 import org.apache.shardingsphere.infra.hint.HintManager;
+import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -19,8 +21,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.utility.DockerImageName;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
@@ -48,7 +48,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Spring Boot REST against one Testcontainers PostgreSQL (writer+reader share it).
+ * Spring Boot REST against Embedded Postgres (writer+reader share one primary).
  * Schema comes from {@code PostgresLedgerStore.migrate} on context start (V001/V002).
  * Streaming replica remains covered by {@link PgLedgerStressTest} + docker compose.
  */
@@ -56,20 +56,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         classes = PgLedgerServerMain.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class PgLedgerRestTest {
-    // Same image major as docker-compose.yml writer (postgres:16). One primary; reads see writes immediately.
-    private static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(DockerImageName.parse("postgres:16"))
-            .withDatabaseName("pgledger")
-            .withUsername("pgledger")
-            .withPassword("pgledger")
-            .withReuse(false);
     private static final AtomicLong IDS = new AtomicLong();
+    private static final EmbeddedPostgres POSTGRES;
+    private static final String JDBC_URL;
 
     static {
         try {
-            POSTGRES.start();
-        } catch (IllegalStateException e) {
-            throw new ExceptionInInitializerError(new IllegalStateException(
-                    "Docker is required for PgLedgerRestTest (Testcontainers PostgreSQL). Is the daemon running?", e));
+            POSTGRES = EmbeddedPostgres.builder().setPort(0).start();
+            JDBC_URL = POSTGRES.getJdbcUrl("postgres", "postgres");
+        } catch (Exception e) {
+            throw new ExceptionInInitializerError(e);
         }
     }
 
@@ -81,10 +77,15 @@ class PgLedgerRestTest {
 
     @DynamicPropertySource
     static void datasourceProps(DynamicPropertyRegistry registry) {
-        registry.add("pgledger.writer-jdbc-url", POSTGRES::getJdbcUrl);
-        registry.add("pgledger.reader-jdbc-url", POSTGRES::getJdbcUrl);
-        registry.add("pgledger.jdbc-user", POSTGRES::getUsername);
-        registry.add("pgledger.jdbc-password", POSTGRES::getPassword);
+        registry.add("pgledger.writer-jdbc-url", () -> JDBC_URL);
+        registry.add("pgledger.reader-jdbc-url", () -> JDBC_URL);
+        registry.add("pgledger.jdbc-user", () -> "postgres");
+        registry.add("pgledger.jdbc-password", () -> "postgres");
+    }
+
+    @AfterAll
+    static void stopPostgres() throws Exception {
+        POSTGRES.close();
     }
 
     @Test
@@ -388,9 +389,9 @@ class PgLedgerRestTest {
 
     private static PGSimpleDataSource dataSource() {
         PGSimpleDataSource dataSource = new PGSimpleDataSource();
-        dataSource.setURL(POSTGRES.getJdbcUrl());
-        dataSource.setUser(POSTGRES.getUsername());
-        dataSource.setPassword(POSTGRES.getPassword());
+        dataSource.setURL(JDBC_URL);
+        dataSource.setUser("postgres");
+        dataSource.setPassword("postgres");
         dataSource.setConnectTimeout(5);
         return dataSource;
     }

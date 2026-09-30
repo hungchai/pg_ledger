@@ -27,9 +27,7 @@ dependencies {
     testImplementation(project(":pgledger-client-sdk"))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("org.postgresql:postgresql")
-    testImplementation(platform("org.testcontainers:testcontainers-bom:1.20.4"))
-    testImplementation("org.testcontainers:junit-jupiter")
-    testImplementation("org.testcontainers:postgresql")
+    testImplementation("io.zonky.test:embedded-postgres:2.2.0")
 }
 
 tasks.withType<JavaCompile> {

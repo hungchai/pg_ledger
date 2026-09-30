@@ -18,6 +18,134 @@ Schema scripts (`V001`/`V002`) are idempotent and also run on API/stress startup
 
 After stress finishes it prints a TPS summary (per-level lines plus total ops, wall duration, TPS, latency percentiles) to stdout and writes `pgledger-restful/build/reports/pgledger-stress-tps.txt` (override with `-Dpgledger.stress.report=...`, blank disables the file). Tunables: `-Dpgledger.stress.levels=50,100,200`, `-Dpgledger.stress.posts=20`, `-Dpgledger.stress.maxLagMs=15000`.
 
+## k6 cash stress (deposit + withdrawal)
+
+One-shot wipe, start Compose (API + Prometheus + Grafana), run deposit then withdrawal (with gas reserve/settle), then recon. Needs `docker`, `k6`, and `curl`.
+
+```bash
+# defaults: 20 VUs, 60s, 100 CASH accounts
+./scripts/k6-cash-stress.sh
+
+# same flags as jraft test-cycle
+./scripts/k6-cash-stress.sh --vus 50 --duration 2m
+./scripts/k6-cash-stress.sh --vus 20 --duration 60s --no-wipe --no-build
+./scripts/k6-cash-stress.sh --help
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--vus N` | `20` | Virtual users |
+| `--duration M` | `60s` | k6 duration (`60s`, `2m`, …) |
+| `--accounts N` | `100` | `CASH-000` … accounts × ETH/BTC/USDT |
+| `--base-url URL` | `http://127.0.0.1:8080` | API base |
+| `--no-wipe` | off | Skip `docker compose down -v` |
+| `--no-build` | off | `compose up` without `--build` |
+| `--fund-rounds N` | `30` | Seed deposits per account/ccy before withdrawal |
+
+Reports (three files under `reports/<run-id>/`, also `reports/latest/`):
+
+1. `01-deposit.txt` — deposit TPS / latency  
+2. `02-withdrawal.txt` — withdraw + `LIQUID→GAS_FEE` reserve + settle  
+3. `03-recon.txt` — money conservation / orphans / versions  
+
+Grafana: http://localhost:3000 (`admin` / `pgledger`), dashboard **pgledger**. Pick testid `deposit-*` or `withdrawal-*` for API TPS. RFQ is not in this run yet.
+
+Recon alone (API/DB already up): `./scripts/recon.sh` or `./scripts/recon.sh reports/latest/03-recon.txt`.
+
+## Deployment
+
+Compose in this repo is the supported **local / demo** stack (writer primary, streaming reader, API, Prometheus, Grafana). It is not a hardened production topology (default passwords, exposed Postgres ports).
+
+### Prerequisites
+
+- Docker Engine + Compose v2
+- For jar-only deploys: JDK 21 (build) / JRE 21 (run), and a Postgres 16 primary (+ optional hot standby)
+
+### Compose (API image + databases + metrics)
+
+```bash
+# first time or after code/SQL changes
+docker compose up -d --build
+
+# later
+docker compose up -d
+
+# stop (keep data)
+docker compose down
+
+# wipe volumes and re-run initdb (V001/V002 + replication setup)
+docker compose down -v && docker compose up -d --build
+```
+
+The API image is built from the root `Dockerfile` (`./gradlew :pgledger-restful:bootJar`). The build context must include `gradle/wrapper/gradle-wrapper.jar`.
+
+| Service | URL / port | Notes |
+|---|---|---|
+| API | http://127.0.0.1:8080 | Health: `GET /health` |
+| Writer Postgres | localhost:5432 | Primary; init mounts `db/V001`, `db/V002` |
+| Reader Postgres | localhost:5433 | Streaming replica (`pg_is_in_recovery() = t`) |
+| Prometheus | http://127.0.0.1:9090 | |
+| Grafana | http://127.0.0.1:3000 | `admin` / `pgledger` |
+
+Wait until writer, reader, and api are healthy (`docker compose ps`). Reader depends on writer replication being enabled.
+
+### Environment variables (API)
+
+Every API instance is **stateless**. Set the same variables on every replica:
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `PGLEDGER_WRITER_JDBC_URL` | yes | — | Primary JDBC URL |
+| `PGLEDGER_READER_JDBC_URL` | yes | — | Replica JDBC URL (may equal writer for single-node) |
+| `PGLEDGER_JDBC_USER` | yes | — | DB user |
+| `PGLEDGER_JDBC_PASSWORD` | yes | — | DB password |
+| `PGLEDGER_BANK_POOL_SIZE` | no | `8` | Bank shard pool size when auto-created |
+| `PORT` | no | `8080` | HTTP listen port |
+
+Compose sets writer/reader URLs to the service hostnames `writer` / `reader`. Outside Compose, point them at your primary and standby (e.g. `jdbc:postgresql://db-primary:5432/pgledger`).
+
+### Schema
+
+- Empty Compose volumes: Postgres runs `db/V001__ledger.sql` and `db/V002__functions.sql` on first init.
+- Every API process also runs the same scripts on the **writer** at startup (idempotent; safe with multiple instances starting together).
+- Breaking schema changes on an old volume: wipe with `docker compose down -v`, then bring the stack back up.
+
+### Run the jar against an existing Postgres
+
+```bash
+./gradlew :pgledger-restful:bootJar
+export PGLEDGER_WRITER_JDBC_URL=jdbc:postgresql://localhost:5432/pgledger
+export PGLEDGER_READER_JDBC_URL=jdbc:postgresql://localhost:5433/pgledger
+export PGLEDGER_JDBC_USER=pgledger
+export PGLEDGER_JDBC_PASSWORD=pgledger
+java -jar pgledger-restful/build/libs/pgledger-restful-*.jar
+```
+
+Or build/run the image alone once the databases are reachable:
+
+```bash
+docker build -t pgledger-api .
+docker run --rm -p 8080:8080 \
+  -e PGLEDGER_WRITER_JDBC_URL=jdbc:postgresql://host.docker.internal:5432/pgledger \
+  -e PGLEDGER_READER_JDBC_URL=jdbc:postgresql://host.docker.internal:5433/pgledger \
+  -e PGLEDGER_JDBC_USER=pgledger \
+  -e PGLEDGER_JDBC_PASSWORD=pgledger \
+  pgledger-api
+```
+
+### Multi-instance
+
+- Scale horizontally behind a load balancer; no sticky sessions.
+- Writes always go to the writer URL; balance/journal reads use the reader URL (ShardingSphere + `X-Pgledger-Role`).
+- Registry cache is in-process (refresh every 60s). A type created on one instance is visible on that instance immediately; other instances see it after refresh.
+- Do not point the writer URL at a replica. Writer and reader URLs may be identical only for single-node embeds/tests.
+
+### Observability
+
+- Grafana dashboard **pgledger** (provisioned under `grafana/`).
+- Postgres exporters: writer `:9187`, reader `:9188`.
+- Cash stress reports: `./scripts/k6-cash-stress.sh` → `reports/<run-id>/`.
+
 ## Local stack (Compose)
 
 | | Host | Port | Database | User | Password |
@@ -26,12 +154,10 @@ After stress finishes it prints a TPS summary (per-level lines plus total ops, w
 | Reader | localhost | 5433 | pgledger | pgledger | pgledger |
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
-The API is `http://localhost:8080`. Writes use the writer. Balance and journal reads use the reader. Header `X-Pgledger-Role` is `writer` or `reader`. A business rejection is HTTP 422.
-
-Each API process keeps an in-process cache of the four registries. It loads them at startup and refetches every 60 seconds. A request does not `SELECT` those tables. Only the refresh does. A row inserted in Postgres shows up on the next refresh, within a minute. A balance type created by this process is remembered immediately. Every instance needs `PGLEDGER_WRITER_JDBC_URL`, `PGLEDGER_READER_JDBC_URL`, `PGLEDGER_JDBC_USER`, and `PGLEDGER_JDBC_PASSWORD`. `PORT` defaults to 8080. Schema scripts run on the writer at startup and can run on every instance at the same time.
+The API is `http://localhost:8080`. Writes use the writer. Balance and journal reads use the reader. Header `X-Pgledger-Role` is `writer` or `reader`. A business rejection is HTTP 422. See **Deployment** for env vars, wipe, and jar-only runs.
 
 ```bash
 curl -s http://localhost:8080/health

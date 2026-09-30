@@ -172,15 +172,35 @@
       "gridPos": { "h": 3, "w": 24, "x": 0, "y": 23 },
       "options": {
         "mode": "markdown",
-        "content": "k6 HTTP. Run with `K6_PROMETHEUS_RW_TREND_STATS=p(50),p(95),p(99),avg k6 run -o experimental-prometheus-rw --tag testid=$(date +%s) k6/postings.js`. Latency is successful `POST /api/v1/postings` only."
+        "content": "k6 API TPS. Run `./scripts/k6-cash-stress.sh`. Pick **testid** `deposit-*` or `withdrawal-*`. Panels split deposits / withdrawals / postings (gas reserve+settle)."
       }
     },
     {
       "id": 13,
       "type": "stat",
-      "title": "POST /postings / s",
+      "title": "deposits / s",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*deposits\"}[1m]))" }]
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "withdrawals / s",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 }, "overrides": [] },
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*withdrawals\"}[1m]))" }]
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "postings / s",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 26 },
       "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 }, "overrides": [] },
       "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
       "targets": [{ "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*postings\"}[1m]))" }]
@@ -188,42 +208,22 @@
     {
       "id": 14,
       "type": "stat",
-      "title": "p50",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(k6_http_req_duration_p50{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000" }]
-    },
-    {
-      "id": 15,
-      "type": "stat",
-      "title": "p95",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000" }]
-    },
-    {
-      "id": 16,
-      "type": "stat",
-      "title": "p99",
+      "title": "p95 deposit",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 4, "x": 12, "y": 26 },
       "fieldConfig": { "defaults": { "unit": "ms", "decimals": 1 }, "overrides": [] },
       "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(k6_http_req_duration_p99{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000" }]
+      "targets": [{ "refId": "A", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}) * 1000" }]
     },
     {
-      "id": 17,
+      "id": 15,
       "type": "stat",
-      "title": "HTTP error rate",
+      "title": "p95 withdraw",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 4, "w": 4, "x": 16, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "percentunit", "decimals": 2 }, "overrides": [] },
+      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 1 }, "overrides": [] },
       "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(k6_http_req_failed_rate{testid=~\"$testid\", name=~\".*postings\"})" }]
+      "targets": [{ "refId": "A", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}) * 1000" }]
     },
     {
       "id": 18,
@@ -238,27 +238,29 @@
     {
       "id": 19,
       "type": "timeseries",
-      "title": "HTTP requests / s",
+      "title": "API TPS by route",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
       "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
-        { "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*postings\"}[1m]))", "legendFormat": "POST /postings" }
+        { "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*deposits\"}[1m]))", "legendFormat": "deposits" },
+        { "refId": "B", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*withdrawals\"}[1m]))", "legendFormat": "withdrawals" },
+        { "refId": "C", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*postings\"}[1m]))", "legendFormat": "postings" }
       ]
     },
     {
       "id": 20,
       "type": "timeseries",
-      "title": "POST latency",
+      "title": "API latency p95",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
       "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "targets": [
-        { "refId": "A", "expr": "max(k6_http_req_duration_p50{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000", "legendFormat": "p50" },
-        { "refId": "B", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000", "legendFormat": "p95" },
-        { "refId": "C", "expr": "max(k6_http_req_duration_p99{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000", "legendFormat": "p99" }
+        { "refId": "A", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}) * 1000", "legendFormat": "deposit p95" },
+        { "refId": "B", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}) * 1000", "legendFormat": "withdraw p95" },
+        { "refId": "C", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000", "legendFormat": "posting p95" }
       ]
     }
   ]
