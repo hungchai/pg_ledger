@@ -1,0 +1,834 @@
+openapi: 3.0.3
+info:
+  title: pg_ledger API
+  description: |
+    Stateless double-entry ledger HTTP API backed by Postgres.
+
+    - Writes route to the primary (`X-Pgledger-Role: writer`).
+    - Balance and journal reads route to a streaming replica (`X-Pgledger-Role: reader`).
+    - Business-rule rejections return HTTP **422** with `{"error":"<message>"}`.
+    - Amounts are unbounded `NUMERIC` (JSON numbers). Balance-type fields accept a
+      **code** (e.g. `LIQUID`) or numeric **id**.
+    - Request bodies are capped at **1 MiB**.
+    - No authentication is required by the server.
+  version: 1.0.0
+  contact:
+    name: zodia
+    url: https://github.com/hungchai/pg_ledger
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local Docker Compose / default PORT
+
+tags:
+  - name: health
+    description: Liveness probe
+  - name: balance-types
+    description: Balance type registry
+  - name: accounts
+    description: Account balance rows (create, soft-delete, query)
+  - name: postings
+    description: Double-entry transfers
+  - name: cash
+    description: Deposit / withdrawal against the BANK pool
+  - name: journals
+    description: Transfer journal pagination
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      operationId: health
+      summary: Liveness
+      description: Returns process liveness. Does not set `X-Pgledger-Role`.
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              example:
+                status: UP
+
+  /api/v1/balance-types:
+    get:
+      tags: [balance-types]
+      operationId: listBalanceTypes
+      summary: List balance types
+      responses:
+        "200":
+          description: All registered balance types
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleReader"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BalanceType"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      tags: [balance-types]
+      operationId: createBalanceType
+      summary: Create balance type
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBalanceType"
+            examples:
+              locked:
+                summary: Hold bucket for RFQ
+                value:
+                  code: LOCKED
+                  name: Locked
+              signed:
+                summary: Explicit sign policy
+                value:
+                  code: GAS_FEE
+                  name: Gas fee
+                  description: Allows both signs
+                  allowNegative: true
+                  allowPositive: true
+      responses:
+        "200":
+          description: Created balance type
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleWriter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceType"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/LedgerViolation"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/accounts:
+    post:
+      tags: [accounts]
+      operationId: createAccount
+      summary: Create account balance
+      description: |
+        Creates one balance row for `(accountId, balanceType, currency)`.
+        Blank `accountClass` defaults to `CLIENT`. Duplicate create → **422**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccount"
+            examples:
+              client:
+                value:
+                  accountId: CLIENT_ACC_001
+                  balanceType: LIQUID
+                  currency: USDT
+                  name: Client 1 LIQUID
+              company:
+                value:
+                  accountId: LP_DESK
+                  balanceType: LIQUID
+                  currency: USDT
+                  name: LP desk
+                  accountClass: COMPANY
+      responses:
+        "200":
+          description: Created account balance
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleWriter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/LedgerViolation"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/accounts/delete:
+    post:
+      tags: [accounts]
+      operationId: deleteAccount
+      summary: Soft-delete account balance
+      description: Marks the balance row deleted. Subsequent mutations against it return **422**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteAccount"
+            example:
+              accountId: CLIENT_ACC_001
+              balanceType: LIQUID
+              currency: USDT
+      responses:
+        "200":
+          description: "Soft-deleted account (`deleted: true`)"
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleWriter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/LedgerViolation"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/accounts/{accountId}/balances:
+    get:
+      tags: [accounts]
+      operationId: listAccountBalances
+      summary: List all balances for an account
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      responses:
+        "200":
+          description: Zero or more balance rows for the account
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleReader"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Account"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/balances:
+    get:
+      tags: [accounts]
+      operationId: getBalance
+      summary: Get a single balance
+      parameters:
+        - name: accountId
+          in: query
+          required: true
+          schema:
+            type: string
+          example: CLIENT_ACC_001
+        - name: balanceType
+          in: query
+          required: true
+          description: Balance type code or numeric id
+          schema:
+            type: string
+          example: LIQUID
+        - name: currency
+          in: query
+          required: true
+          schema:
+            type: string
+          example: USDT
+      responses:
+        "200":
+          description: Matching account balance
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleReader"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Account"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: No matching balance row
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleReader"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: not found
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/postings:
+    post:
+      tags: [postings]
+      operationId: post
+      summary: Transfer between accounts
+      description: |
+        Double-entry posting. `amount` must be **> 0**.
+        Same `requestId` + same payload replays the original transfer.
+        Optional `bizType` defaults to `TRANSFER` in the database.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Posting"
+            example:
+              requestId: wd-demo-1-reserve
+              fromAccountId: CLIENT_ACC_001
+              fromBalanceType: LIQUID
+              toAccountId: CLIENT_ACC_001
+              toBalanceType: GAS_FEE
+              currency: USDT
+              amount: 1
+              bizReference: wd-demo-1
+              bizType: TRANSFER
+      responses:
+        "200":
+          description: Created (or replayed) transfer
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleWriter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transfer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/LedgerViolation"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/deposits:
+    post:
+      tags: [cash]
+      operationId: deposit
+      summary: Deposit from BANK pool
+      description: |
+        Credits the client account from a BANK shard.
+        Ensures the BANK pool exists. Resulting transfer has `bizType: DEPOSIT`.
+        Same `requestId` + same payload is idempotent (replay).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CashMovement"
+            example:
+              requestId: dep-1
+              accountId: CLIENT_ACC_001
+              balanceType: LIQUID
+              currency: USDT
+              amount: 100
+      responses:
+        "200":
+          description: "Deposit transfer (`bizType: DEPOSIT`)"
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleWriter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transfer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/LedgerViolation"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/withdrawals:
+    post:
+      tags: [cash]
+      operationId: withdraw
+      summary: Withdraw to BANK pool
+      description: |
+        Debits the client account to a BANK shard.
+        Resulting transfer has `bizType: WITHDRAWAL`.
+        Same `requestId` + same payload is idempotent (replay).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CashMovement"
+            example:
+              requestId: wd-demo-1-principal
+              accountId: CLIENT_ACC_001
+              balanceType: LIQUID
+              currency: USDT
+              amount: 10
+      responses:
+        "200":
+          description: "Withdrawal transfer (`bizType: WITHDRAWAL`)"
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleWriter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Transfer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/LedgerViolation"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/journals:
+    get:
+      tags: [journals]
+      operationId: listJournals
+      summary: Paginated transfer journal
+      parameters:
+        - name: page
+          in: query
+          required: false
+          description: Zero-based page index (default `0`, must be ≥ 0)
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: size
+          in: query
+          required: false
+          description: Page size (default `50`, range `1`–`200`)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: Journal page
+          headers:
+            X-Pgledger-Role:
+              $ref: "#/components/headers/PgledgerRoleReader"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JournalPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  headers:
+    PgledgerRoleWriter:
+      description: Set to `writer` for write-path responses
+      schema:
+        type: string
+        enum: [writer]
+      example: writer
+    PgledgerRoleReader:
+      description: Set to `reader` for read-path responses
+      schema:
+        type: string
+        enum: [reader]
+      example: reader
+
+  parameters:
+    AccountIdPath:
+      name: accountId
+      in: path
+      required: true
+      schema:
+        type: string
+      example: CLIENT_ACC_001
+
+  responses:
+    BadRequest:
+      description: |
+        Malformed / empty / oversized JSON, missing required query params,
+        or out-of-range `page`/`size`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: bad request
+    LedgerViolation:
+      description: Business-rule violation (SQL RAISE / ledger policy)
+      headers:
+        X-Pgledger-Role:
+          $ref: "#/components/headers/PgledgerRoleWriter"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            insufficientFunds:
+              value:
+                error: Balance type LIQUID does not allow negative balance (...)
+            duplicate:
+              value:
+                error: account already exists
+            deleted:
+              value:
+                error: Account is deleted (...)
+    InternalError:
+      description: Unexpected server failure
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: internal error
+    NotFound:
+      description: Unknown path or HTTP method
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: not found
+
+  schemas:
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [UP]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+
+    CreateBalanceType:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: Unique balance type code
+          example: LOCKED
+        name:
+          type: string
+          description: Display name; defaults to `code` when omitted
+          example: Locked
+        description:
+          type: string
+          nullable: true
+        allowNegative:
+          type: boolean
+          description: When null, defaults to `false`
+          default: false
+        allowPositive:
+          type: boolean
+          description: When null, defaults to `true`
+          default: true
+
+    BalanceType:
+      type: object
+      required:
+        - id
+        - code
+        - name
+        - allowNegative
+        - allowPositive
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: integer
+          format: int32
+        code:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        allowNegative:
+          type: boolean
+        allowPositive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    CreateAccount:
+      type: object
+      required: [accountId, balanceType, currency]
+      properties:
+        accountId:
+          type: string
+          example: CLIENT_ACC_001
+        balanceType:
+          type: string
+          description: Balance type code or numeric id
+          example: LIQUID
+        currency:
+          type: string
+          example: USDT
+        name:
+          type: string
+          description: Defaults to `accountId` when omitted
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Arbitrary JSON object
+        accountClass:
+          type: string
+          description: Blank or omitted → `CLIENT`
+          example: COMPANY
+
+    DeleteAccount:
+      type: object
+      required: [accountId, balanceType, currency]
+      properties:
+        accountId:
+          type: string
+        balanceType:
+          type: string
+          description: Balance type code or numeric id
+        currency:
+          type: string
+
+    CashMovement:
+      type: object
+      required: [requestId, accountId, balanceType, currency, amount]
+      properties:
+        requestId:
+          type: string
+          description: Idempotency key for the cash movement
+          example: dep-1
+        accountId:
+          type: string
+          example: CLIENT_ACC_001
+        balanceType:
+          oneOf:
+            - type: string
+            - type: integer
+          description: Balance type code or numeric id (JSON string or number)
+          example: LIQUID
+        currency:
+          type: string
+          example: USDT
+        amount:
+          type: number
+          description: Must be strictly greater than zero
+          exclusiveMinimum: 0
+          example: 100
+
+    Posting:
+      type: object
+      required:
+        - fromAccountId
+        - fromBalanceType
+        - toAccountId
+        - toBalanceType
+        - currency
+        - amount
+        - requestId
+      properties:
+        fromAccountId:
+          type: string
+        fromBalanceType:
+          oneOf:
+            - type: string
+            - type: integer
+          description: Balance type code or numeric id
+        toAccountId:
+          type: string
+        toBalanceType:
+          oneOf:
+            - type: string
+            - type: integer
+          description: Balance type code or numeric id
+        currency:
+          type: string
+        amount:
+          type: number
+          description: Must be strictly greater than zero
+          exclusiveMinimum: 0
+        requestId:
+          type: string
+          description: Idempotency key
+        bizReference:
+          type: string
+          nullable: true
+          description: Optional external business reference
+        bizType:
+          type: string
+          nullable: true
+          description: Optional; database defaults to `TRANSFER`
+          example: TRANSFER
+
+    Account:
+      type: object
+      required:
+        - id
+        - accountId
+        - balanceType
+        - name
+        - currency
+        - balance
+        - version
+        - allowNegativeBalance
+        - allowPositiveBalance
+        - createdAt
+        - updatedAt
+        - accountClass
+        - deleted
+      properties:
+        id:
+          type: string
+          description: Internal balance row id
+        accountId:
+          type: string
+        balanceType:
+          type: string
+          description: Balance type code
+        name:
+          type: string
+        currency:
+          type: string
+        balance:
+          type: number
+        version:
+          type: integer
+          format: int64
+        allowNegativeBalance:
+          type: boolean
+        allowPositiveBalance:
+          type: boolean
+        metadata:
+          type: object
+          additionalProperties: true
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        accountClass:
+          type: string
+        deleted:
+          type: boolean
+
+    Entry:
+      type: object
+      required:
+        - id
+        - accountId
+        - balanceType
+        - currency
+        - amount
+        - previousBalance
+        - currentBalance
+        - version
+        - createdAt
+      properties:
+        id:
+          type: string
+        accountId:
+          type: string
+        balanceType:
+          type: integer
+          format: int32
+          description: Balance type numeric id
+        currency:
+          type: string
+        amount:
+          type: number
+        previousBalance:
+          type: number
+        currentBalance:
+          type: number
+        version:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+
+    Transfer:
+      type: object
+      required:
+        - id
+        - fromAccountId
+        - fromBalanceType
+        - toAccountId
+        - toBalanceType
+        - currency
+        - amount
+        - createdAt
+        - eventAt
+        - requestId
+        - bizType
+        - entries
+      properties:
+        id:
+          type: string
+        fromAccountId:
+          type: string
+        fromBalanceType:
+          type: integer
+          format: int32
+          description: Balance type numeric id
+        toAccountId:
+          type: string
+        toBalanceType:
+          type: integer
+          format: int32
+          description: Balance type numeric id
+        currency:
+          type: string
+        amount:
+          type: number
+        createdAt:
+          type: string
+          format: date-time
+        eventAt:
+          type: string
+          format: date-time
+        requestId:
+          type: string
+        bizType:
+          type: string
+          description: e.g. `TRANSFER`, `DEPOSIT`, `WITHDRAWAL`
+        bizReference:
+          type: string
+          nullable: true
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/Entry"
+
+    JournalPage:
+      type: object
+      required: [page, size, total, hasNext, transfers]
+      properties:
+        page:
+          type: integer
+          format: int32
+        size:
+          type: integer
+          format: int32
+        total:
+          type: integer
+          format: int64
+        hasNext:
+          type: boolean
+        transfers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transfer"

@@ -76,6 +76,8 @@ Compose is a **local / demo** stack (default passwords, exposed Postgres ports) 
 
 ## HTTP API
 
+OpenAPI 3 (Swagger) machine-readable spec: [`docs/openapi.yaml`](docs/openapi.yaml).
+
 ### Endpoints
 
 | Method | Path | Role | Description |
