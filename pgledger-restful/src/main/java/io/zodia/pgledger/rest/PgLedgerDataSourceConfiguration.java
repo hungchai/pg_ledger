@@ -120,6 +120,7 @@ class PgLedgerDataSourceConfiguration {
         config.setMaximumPoolSize(10);
         config.setMinimumIdle(1);
         config.setConnectionTimeout(5_000L);
+        config.setConnectionInitSql("SET TIME ZONE 'UTC'");
         return new HikariDataSource(config);
     }
 

@@ -1,6 +1,6 @@
 # pg_ledger design brief
 
-Short facts for another session. Usage examples are in `README.md`.
+Short facts for another session. Setup and HTTP usage: root `README.md`. Tables and SQL: `docs/schema-and-sql.md`.
 
 Postgres only. No Kafka. No Redis.
 

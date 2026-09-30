@@ -4,6 +4,14 @@
 -- Registries use a 4-byte id. Hot tables store that id. There are no foreign keys.
 -- Shard business ids stay text: BANK-{currency code}-{balance type code}-{n}.
 
+-- TIMESTAMPTZ is always stored as UTC; pin the database session timezone so
+-- clients (psql, DBeaver, JDBC) show and interpret wall times as UTC.
+DO $$
+BEGIN
+  EXECUTE format('ALTER DATABASE %I SET timezone TO %L', current_database(), 'UTC');
+END $$;
+SET timezone TO 'UTC';
+
 -- UUID to ULID text. Ids are stored as text, so the reverse (ULID to UUID) is not loaded.
 
 CREATE OR REPLACE FUNCTION format_ulid(bytes bytea) RETURNS text AS $$

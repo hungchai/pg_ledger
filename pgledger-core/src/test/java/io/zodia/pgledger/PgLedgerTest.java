@@ -11,12 +11,12 @@ import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerViolation;
 import io.zodia.pgledger.store.PostgresLedgerStore;
 import io.zodia.pgledger.store.SqlScripts;
-import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.postgresql.ds.PGSimpleDataSource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
@@ -43,20 +43,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 class PgLedgerTest {
-    /** In-process Postgres (zonky). No Docker. Stress/compose still cover streaming replica. */
-    private static EmbeddedPostgres POSTGRES;
+    // Same image major as docker-compose.yml writer (postgres:16). One primary; reads see writes immediately.
+    private static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(DockerImageName.parse("postgres:16"))
+            .withDatabaseName("pgledger")
+            .withUsername("pgledger")
+            .withPassword("pgledger")
+            .withReuse(false);
     private static final AtomicLong IDS = new AtomicLong();
 
     @BeforeAll
-    static void startPostgres() throws Exception {
-        POSTGRES = EmbeddedPostgres.builder().setPort(0).start();
-    }
-
-    @AfterAll
-    static void stopPostgres() throws Exception {
-        if (POSTGRES != null) {
-            POSTGRES.close();
-            POSTGRES = null;
+    static void startPostgres() {
+        try {
+            POSTGRES.start();
+        } catch (IllegalStateException e) {
+            throw new IllegalStateException(
+                    "Docker is required for PgLedgerTest (Testcontainers PostgreSQL). Is the daemon running?", e);
         }
     }
 
@@ -819,9 +820,9 @@ class PgLedgerTest {
 
     private static DataSource dataSource() {
         PGSimpleDataSource dataSource = new PGSimpleDataSource();
-        dataSource.setURL(POSTGRES.getJdbcUrl("postgres", "postgres"));
-        dataSource.setUser("postgres");
-        dataSource.setPassword("postgres");
+        dataSource.setURL(POSTGRES.getJdbcUrl());
+        dataSource.setUser(POSTGRES.getUsername());
+        dataSource.setPassword(POSTGRES.getPassword());
         dataSource.setConnectTimeout(5);
         return dataSource;
     }
