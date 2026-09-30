@@ -17,8 +17,10 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * In-process copy of the four registries. Loaded at startup and replaced every
- * {@link #REFRESH_SECONDS}. Request threads read this snapshot and do not query
- * the registry tables. A row inserted by another session appears on the next refresh.
+ * {@link #REFRESH_SECONDS} from the <strong>reader</strong> DataSource. Request
+ * threads read this snapshot and do not query the registry tables. A row written
+ * on the primary appears after replication lag plus at most one refresh interval;
+ * types created by this process are {@link #remember remembered} immediately.
  */
 public final class RegistryCache implements AutoCloseable {
     public static final int REFRESH_SECONDS = 60;
@@ -43,7 +45,7 @@ public final class RegistryCache implements AutoCloseable {
 
     public RegistryCache(DataSource dataSource) {
         if (dataSource == null) {
-            throw new IllegalArgumentException("writer is required");
+            throw new IllegalArgumentException("dataSource is required");
         }
         this.dataSource = dataSource;
         this.snapshot = load();

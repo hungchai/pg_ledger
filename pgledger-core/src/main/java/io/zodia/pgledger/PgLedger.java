@@ -76,7 +76,7 @@ public final class PgLedger implements AutoCloseable {
             throw new IllegalArgumentException("writer and reader are required");
         }
         PostgresLedgerStore.migrate(writer);
-        RegistryCache registries = new RegistryCache(writer);
+        RegistryCache registries = new RegistryCache(reader);
         PostgresLedgerStore writerStore = new PostgresLedgerStore(writer, false, registries);
         PostgresLedgerStore readerStore = new PostgresLedgerStore(reader, false, registries);
         return new PgLedger(writerStore, readerStore, registries, bankPoolSize);
