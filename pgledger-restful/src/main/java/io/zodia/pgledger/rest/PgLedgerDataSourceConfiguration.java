@@ -125,7 +125,7 @@ class PgLedgerDataSourceConfiguration {
 
     /**
      * Writer must be a primary. Reader must be a streaming replica unless both
-     * JDBC URLs are identical (single-node Testcontainers / local primary).
+     * JDBC URLs are identical (Embedded Postgres / single-node local primary).
      */
     private static void requireRoles(DataSource writer, DataSource reader, PgLedgerProperties properties)
             throws SQLException {

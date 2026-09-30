@@ -60,8 +60,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * Stress against docker compose writer :5432 and streaming reader :5433
- * (not Testcontainers — use {@code PgLedgerTest} / {@code PgLedgerRestTest} for that).
+ * Stress against docker compose writer :5432 and streaming reader :5433.
+ * Core/REST unit tests use Embedded Postgres instead.
  * Starts its own HTTP server. Truncates ledger tables in {@code @BeforeAll}.
  *
  * <p>docker compose up -d &amp;&amp; gradle :pgledger-restful:stressTest

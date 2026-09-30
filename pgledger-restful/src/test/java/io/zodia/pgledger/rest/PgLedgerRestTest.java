@@ -12,7 +12,6 @@ import io.zodia.pgledger.client.PgLedgerClient;
 import io.zodia.pgledger.client.PgLedgerClientConfig;
 import io.zodia.pgledger.client.PgLedgerClientException;
 import org.apache.shardingsphere.infra.hint.HintManager;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
 import org.postgresql.ds.PGSimpleDataSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,6 +19,8 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
@@ -45,19 +46,32 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * REST integration against Testcontainers primary + streaming replica.
- * Does not use docker compose; see {@link PgLedgerStressTest} for that.
+ * Spring Boot REST against one Testcontainers PostgreSQL (writer+reader share it).
+ * Schema comes from {@code PostgresLedgerStore.migrate} on context start (V001/V002).
+ * Streaming replica remains covered by {@link PgLedgerStressTest} + docker compose.
  */
 @SpringBootTest(
         classes = PgLedgerServerMain.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class PgLedgerRestTest {
-    private static final long CATCH_UP_NS = 15_000_000_000L;
+    // Same image major as docker-compose.yml writer (postgres:16). One primary; reads see writes immediately.
+    private static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(DockerImageName.parse("postgres:16"))
+            .withDatabaseName("pgledger")
+            .withUsername("pgledger")
+            .withPassword("pgledger")
+            .withReuse(false);
     private static final AtomicLong IDS = new AtomicLong();
-    private static final PostgresReplicaCluster CLUSTER = PostgresReplicaCluster.start();
+
+    static {
+        try {
+            POSTGRES.start();
+        } catch (IllegalStateException e) {
+            throw new ExceptionInInitializerError(new IllegalStateException(
+                    "Docker is required for PgLedgerRestTest (Testcontainers PostgreSQL). Is the daemon running?", e));
+        }
+    }
 
     @LocalServerPort
     private int port;
@@ -66,21 +80,16 @@ class PgLedgerRestTest {
     private DataSource dataSource;
 
     @DynamicPropertySource
-    static void jdbcProperties(DynamicPropertyRegistry registry) {
-        registry.add("pgledger.writer-jdbc-url", CLUSTER::writerJdbcUrl);
-        registry.add("pgledger.reader-jdbc-url", CLUSTER::readerJdbcUrl);
-        registry.add("pgledger.jdbc-user", CLUSTER::username);
-        registry.add("pgledger.jdbc-password", CLUSTER::password);
-    }
-
-    @AfterAll
-    static void stopCluster() {
-        CLUSTER.close();
+    static void datasourceProps(DynamicPropertyRegistry registry) {
+        registry.add("pgledger.writer-jdbc-url", POSTGRES::getJdbcUrl);
+        registry.add("pgledger.reader-jdbc-url", POSTGRES::getJdbcUrl);
+        registry.add("pgledger.jdbc-user", POSTGRES::getUsername);
+        registry.add("pgledger.jdbc-password", POSTGRES::getPassword);
     }
 
     @Test
-    void readsHitReplicaAndWritesHitPrimary() throws Exception {
-        assertTrue(recovery(false));
+    void writesAndReadsHitSamePrimary() throws Exception {
+        assertFalse(recovery(false));
         assertFalse(recovery(true));
     }
 
@@ -365,30 +374,11 @@ class PgLedgerRestTest {
     }
 
     private static final class Nodes implements AutoCloseable {
-        private final DataSource writer;
-        private final DataSource reader;
-
-        private Nodes() throws SQLException {
-            writer = dataSource(CLUSTER.writerJdbcUrl());
-            reader = dataSource(CLUSTER.readerJdbcUrl());
-            if (queryBoolean(writer, "SELECT pg_is_in_recovery()")) {
-                throw new IllegalStateException("writer url is a replica");
-            }
-            if (!queryBoolean(reader, "SELECT pg_is_in_recovery()")) {
-                throw new IllegalStateException("reader url is not a replica");
-            }
+        private Nodes() {
         }
 
-        private void awaitCatchUp() throws Exception {
-            long start = System.nanoTime();
-            String lsn = queryText(writer, "SELECT pg_current_wal_lsn()::text");
-            while (System.nanoTime() - start < CATCH_UP_NS) {
-                if (replayed(reader, lsn)) {
-                    return;
-                }
-                Thread.sleep(20L);
-            }
-            fail("reader did not replay " + lsn);
+        private void awaitCatchUp() {
+            // Single primary: writer and reader share one JDBC URL, so writes are already visible.
         }
 
         @Override
@@ -396,46 +386,11 @@ class PgLedgerRestTest {
         }
     }
 
-    private static boolean replayed(DataSource dataSource, String lsn) throws SQLException {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement("""
-                     SELECT pg_is_in_recovery()
-                        AND coalesce(pg_last_wal_replay_lsn() >= ?::pg_lsn, false)
-                     """)) {
-            ps.setString(1, lsn);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() && rs.getBoolean(1);
-            }
-        }
-    }
-
-    private static String queryText(DataSource dataSource, String sql) throws SQLException {
-        try (Connection conn = dataSource.getConnection();
-             Statement statement = conn.createStatement();
-             ResultSet rs = statement.executeQuery(sql)) {
-            if (!rs.next()) {
-                throw new IllegalStateException(sql);
-            }
-            return rs.getString(1);
-        }
-    }
-
-    private static boolean queryBoolean(DataSource dataSource, String sql) throws SQLException {
-        try (Connection conn = dataSource.getConnection();
-             Statement statement = conn.createStatement();
-             ResultSet rs = statement.executeQuery(sql)) {
-            if (!rs.next()) {
-                throw new IllegalStateException(sql);
-            }
-            return rs.getBoolean(1);
-        }
-    }
-
-    private static PGSimpleDataSource dataSource(String url) {
+    private static PGSimpleDataSource dataSource() {
         PGSimpleDataSource dataSource = new PGSimpleDataSource();
-        dataSource.setURL(url);
-        dataSource.setUser(CLUSTER.username());
-        dataSource.setPassword(CLUSTER.password());
+        dataSource.setURL(POSTGRES.getJdbcUrl());
+        dataSource.setUser(POSTGRES.getUsername());
+        dataSource.setPassword(POSTGRES.getPassword());
         dataSource.setConnectTimeout(5);
         return dataSource;
     }
@@ -444,7 +399,7 @@ class PgLedgerRestTest {
      * Transfers involving the client, read from the writer so no replica lag.
      */
     private long journalCountFor(String clientId) throws SQLException {
-        try (Connection conn = dataSource(CLUSTER.writerJdbcUrl()).getConnection();
+        try (Connection conn = dataSource().getConnection();
              PreparedStatement ps = conn.prepareStatement("""
                      SELECT count(DISTINCT t.id)
                      FROM pgledger_transfers t

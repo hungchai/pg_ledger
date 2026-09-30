@@ -40,12 +40,11 @@ tasks.test {
     useJUnitPlatform {
         excludeTags("stress")
     }
-    // Repo-root docker/ scripts for Testcontainers primary+replica (PgLedgerRestTest).
     workingDir = rootProject.projectDir
 }
 
 tasks.register<Test>("stressTest") {
-    description = "Writer/reader HTTP stress against docker compose :5432/:5433. Prints TPS report. Not Testcontainers."
+    description = "Writer/reader HTTP stress against docker compose :5432/:5433. Prints TPS report."
     group = "verification"
     testClassesDirs = sourceSets["test"].output.classesDirs
     classpath = sourceSets["test"].runtimeClasspath

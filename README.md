@@ -6,15 +6,13 @@ Writes go to the writer. Balance and entry reads go to the reader.
 
 ## Tests
 
-Docker daemon required for all of these. Compose is only for stress (and local API).
-
 | Suite | How Postgres is provided | Command |
 |---|---|---|
-| Core (`PgLedgerTest`) | Testcontainers (single `postgres:16`) | `./gradlew :pgledger-core:test` |
-| REST (`PgLedgerRestTest`) | Testcontainers (primary + streaming replica) | `./gradlew :pgledger-restful:test` |
+| Core (`PgLedgerTest`) | Embedded Postgres (zonky, no Docker) | `./gradlew :pgledger-core:test` |
+| REST (`PgLedgerRestTest`) | Embedded Postgres (single primary for writer+reader URLs) | `./gradlew :pgledger-restful:test` |
 | Stress (`PgLedgerStressTest`) | Docker Compose on localhost `5432` / `5433` | `docker compose up -d` then `./gradlew :pgledger-restful:stressTest` |
 
-`PgLedgerTest` and `PgLedgerRestTest` never use Compose. `stressTest` is excluded from `:pgledger-restful:test` and expects the Compose writer/reader.
+Core and REST do not need Docker. Stress needs Compose (real writer/reader replica) and is excluded from `:pgledger-restful:test`.
 
 Schema scripts (`V001`/`V002`) are idempotent and also run on API/stress startup. Compose `initdb` only runs on an empty volume. If a long-lived volume predates a breaking schema move and migrate still fails, wipe and recreate: `docker compose down -v && docker compose up -d`.
 
