@@ -675,7 +675,7 @@ BEGIN
         IF NOT FOUND THEN
             RETURN NULL;
         END IF;
-        v_size := pgledger_ensure_bank_pool(v_currency, v_code, p_balance_type_id, 8, TRUE);
+        v_size := pgledger_ensure_bank_pool(v_currency, v_code, p_balance_type_id, 400, TRUE);
     ELSE
         v_size := v_max + 1;
     END IF;
