@@ -97,16 +97,19 @@ BEGIN
 END
 $do$;
 
+DROP FUNCTION IF EXISTS pgledger_resolve_balance(TEXT, INT, INT);
+
 CREATE OR REPLACE FUNCTION pgledger_resolve_balance(
     p_account_id TEXT,
     p_balance_type_id INT,
-    p_currency_id INT
+    p_currency_id INT,
+    p_auto_create BOOLEAN DEFAULT TRUE
 ) RETURNS pgledger_accounts
 AS $$
 DECLARE
     found_row pgledger_accounts;
-    other_code TEXT;
     asked_code TEXT;
+    v_class_id INT;
 BEGIN
     SELECT * INTO found_row
     FROM pgledger_accounts
@@ -122,17 +125,34 @@ BEGIN
         RETURN found_row;
     END IF;
 
-    SELECT c.code INTO other_code
-    FROM pgledger_accounts a
-    JOIN pgledger_currencies c ON c.id = a.currency_id
-    WHERE a.account_id = p_account_id
-      AND a.balance_type_id = p_balance_type_id
-      AND NOT a.deleted
-    ORDER BY c.code
-    LIMIT 1;
-    IF FOUND THEN
+    IF NOT COALESCE(p_auto_create, TRUE) THEN
         SELECT code INTO asked_code FROM pgledger_currencies WHERE id = p_currency_id;
-        RAISE EXCEPTION 'Cannot transfer between different currencies (% and %)', other_code, asked_code;
+        RAISE EXCEPTION 'Account not found (account_id=%, balance_type=%, currency=%)',
+            p_account_id, p_balance_type_id, asked_code;
+    END IF;
+
+    -- Auto-create the missing balance row so deposits/postings do not fail when
+    -- the (account_id, balance_type, currency) triple was never registered.
+    -- New account ids get class CLIENT; existing ids keep their class.
+    SELECT id INTO v_class_id FROM pgledger_account_classes WHERE code = 'CLIENT';
+    INSERT INTO pgledger_accounts (
+        account_id, balance_type_id, name, currency_id,
+        metadata, created_at, updated_at, account_class_id
+    )
+    SELECT p_account_id, p_balance_type_id, p_account_id, p_currency_id,
+           NULL, now(), now(), COALESCE(
+               (SELECT a.account_class_id FROM pgledger_accounts a
+                WHERE a.account_id = p_account_id
+                LIMIT 1), v_class_id)
+    ON CONFLICT (account_id, balance_type_id, currency_id) DO NOTHING;
+
+    SELECT * INTO found_row
+    FROM pgledger_accounts
+    WHERE account_id = p_account_id
+      AND balance_type_id = p_balance_type_id
+      AND currency_id = p_currency_id;
+    IF FOUND THEN
+        RETURN found_row;
     END IF;
 
     SELECT code INTO asked_code FROM pgledger_currencies WHERE id = p_currency_id;
@@ -218,6 +238,8 @@ DROP FUNCTION IF EXISTS pgledger_create_transfer(TEXT, TEXT, TEXT, TEXT, TEXT, N
 DROP FUNCTION IF EXISTS pgledger_create_transfer(TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC, TIMESTAMPTZ, TEXT, TEXT, TEXT);
 DROP FUNCTION IF EXISTS pgledger_create_transfers(VARIADIC transfer_request[]);
 DROP FUNCTION IF EXISTS pgledger_create_transfers(transfer_request[], TIMESTAMPTZ, JSONB);
+DROP FUNCTION IF EXISTS pgledger_create_transfers(transfer_request[], TIMESTAMPTZ, TEXT, TEXT, TEXT);
+DROP FUNCTION IF EXISTS pgledger_create_transfers(transfer_request[], TIMESTAMPTZ, TEXT, TEXT, TEXT, BOOLEAN);
 
 -- Balance type arguments are ids. This function does not read pgledger_balance_types.
 CREATE OR REPLACE FUNCTION pgledger_create_transfers(
@@ -225,7 +247,8 @@ CREATE OR REPLACE FUNCTION pgledger_create_transfers(
     p_event_at TIMESTAMPTZ DEFAULT NULL,
     p_biz_reference TEXT DEFAULT NULL,
     p_request_id TEXT DEFAULT NULL,
-    p_biz_type TEXT DEFAULT 'TRANSFER'
+    p_biz_type TEXT DEFAULT 'TRANSFER',
+    p_auto_create BOOLEAN DEFAULT TRUE
 )
 RETURNS SETOF pgledger_transfers_view
 AS $$
@@ -334,17 +357,13 @@ BEGIN
             RAISE EXCEPTION 'Amount (%) must be positive', req.amount;
         END IF;
 
-        from_row := pgledger_resolve_balance(req.from_account_id, req.from_balance_type, v_currency_ids[v_ord]);
-        to_row := pgledger_resolve_balance(req.to_account_id, req.to_balance_type, v_currency_ids[v_ord]);
+        from_row := pgledger_resolve_balance(
+            req.from_account_id, req.from_balance_type, v_currency_ids[v_ord], COALESCE(p_auto_create, TRUE));
+        to_row := pgledger_resolve_balance(
+            req.to_account_id, req.to_balance_type, v_currency_ids[v_ord], COALESCE(p_auto_create, TRUE));
 
         IF from_row.id = to_row.id THEN
             RAISE EXCEPTION 'Cannot transfer to the same account (id=%)', from_row.id;
-        END IF;
-
-        IF from_row.currency_id IS DISTINCT FROM to_row.currency_id THEN
-            RAISE EXCEPTION 'Cannot transfer between different currencies (% and %)',
-                (SELECT code FROM pgledger_currencies WHERE id = from_row.currency_id),
-                (SELECT code FROM pgledger_currencies WHERE id = to_row.currency_id);
         END IF;
 
         all_ids := array_append(all_ids, from_row.id);
@@ -369,8 +388,12 @@ BEGIN
           AND balance_type_id = req.from_balance_type
           AND currency_id = v_currency_ids[v_ord];
         IF NOT FOUND THEN
-            RAISE EXCEPTION 'Account not found (account_id=%, balance_type=%, currency=%)',
-                req.from_account_id, req.from_balance_type, btrim(req.currency);
+            IF NOT COALESCE(p_auto_create, TRUE) THEN
+                RAISE EXCEPTION 'Account not found (account_id=%, balance_type=%, currency=%)',
+                    req.from_account_id, req.from_balance_type, btrim(req.currency);
+            END IF;
+            from_row := pgledger_resolve_balance(
+                req.from_account_id, req.from_balance_type, v_currency_ids[v_ord]);
         END IF;
 
         SELECT * INTO to_row
@@ -379,8 +402,12 @@ BEGIN
           AND balance_type_id = req.to_balance_type
           AND currency_id = v_currency_ids[v_ord];
         IF NOT FOUND THEN
-            RAISE EXCEPTION 'Account not found (account_id=%, balance_type=%, currency=%)',
-                req.to_account_id, req.to_balance_type, btrim(req.currency);
+            IF NOT COALESCE(p_auto_create, TRUE) THEN
+                RAISE EXCEPTION 'Account not found (account_id=%, balance_type=%, currency=%)',
+                    req.to_account_id, req.to_balance_type, btrim(req.currency);
+            END IF;
+            to_row := pgledger_resolve_balance(
+                req.to_account_id, req.to_balance_type, v_currency_ids[v_ord]);
         END IF;
 
         IF from_row.id = to_row.id THEN
@@ -413,12 +440,6 @@ BEGIN
         RETURNING * INTO to_row;
 
         PERFORM pgledger_check_account_balance_constraints(to_row);
-
-        IF from_row.currency_id IS DISTINCT FROM to_row.currency_id THEN
-            RAISE EXCEPTION 'Cannot transfer between different currencies (% and %)',
-                (SELECT code FROM pgledger_currencies WHERE id = from_row.currency_id),
-                (SELECT code FROM pgledger_currencies WHERE id = to_row.currency_id);
-        END IF;
 
         INSERT INTO pgledger_transfers (
             from_account_id, to_account_id, amount, created_at, event_at, request_id, biz_type_id, biz_reference
@@ -468,7 +489,8 @@ CREATE OR REPLACE FUNCTION pgledger_create_transfer(
     p_event_at TIMESTAMPTZ DEFAULT NULL,
     p_biz_reference TEXT DEFAULT NULL,
     p_request_id TEXT DEFAULT NULL,
-    p_biz_type TEXT DEFAULT 'TRANSFER'
+    p_biz_type TEXT DEFAULT 'TRANSFER',
+    p_auto_create BOOLEAN DEFAULT TRUE
 )
 RETURNS SETOF pgledger_transfers_view
 AS $$
@@ -489,7 +511,8 @@ BEGIN
         p_event_at => p_event_at,
         p_biz_reference => p_biz_reference,
         p_request_id => p_request_id,
-        p_biz_type => p_biz_type
+        p_biz_type => p_biz_type,
+        p_auto_create => p_auto_create
     );
 END;
 $$ LANGUAGE plpgsql;

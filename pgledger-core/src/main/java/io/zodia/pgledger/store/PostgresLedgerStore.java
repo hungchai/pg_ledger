@@ -249,7 +249,7 @@ public final class PostgresLedgerStore implements LedgerStore {
                 }
                 sql.append("ROW(?,?,?,?,?,?)::transfer_request");
             }
-            sql.append("]::transfer_request[], NULL, ?, ?, ?)");
+            sql.append("]::transfer_request[], NULL, ?, ?, ?, ?)");
             try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
                 int index = 1;
                 for (int i = 0; i < legs.size(); i++) {
@@ -264,9 +264,15 @@ public final class PostgresLedgerStore implements LedgerStore {
                 ps.setString(index++, first.bizReference());
                 ps.setString(index++, requestId);
                 if (first.bizType() == null || first.bizType().isBlank()) {
-                    ps.setNull(index, Types.VARCHAR);
+                    ps.setNull(index++, Types.VARCHAR);
                 } else {
-                    ps.setString(index, first.bizType());
+                    ps.setString(index++, first.bizType());
+                }
+                Boolean autoCreate = first.autoCreate();
+                if (autoCreate == null) {
+                    ps.setNull(index++, Types.BOOLEAN);
+                } else {
+                    ps.setBoolean(index++, autoCreate.booleanValue());
                 }
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {

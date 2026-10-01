@@ -1,0 +1,638 @@
+openapi: 3.1.0
+info:
+  title: pg_ledger API
+  version: 0.1.0
+  description: |
+    Stateless double-entry ledger backed by Postgres only (no Kafka, no Redis).
+
+    Writes are served by the primary (writer); balance and journal reads are
+    served by a streaming replica (reader). Every response carries an
+    `X-Pgledger-Role` header (`writer` or `reader`). Business rejections are
+    HTTP 422 with an `error` message.
+
+    Idempotency: every write carries a `requestId`. Replaying the same
+    `requestId` with the same payload returns the original rows without
+    re-posting; the same `requestId` with a different payload is rejected.
+
+    Amounts are unbounded `NUMERIC` serialized as JSON numbers/strings.
+    Balance-type fields accept a registry code (`LIQUID`) or numeric id (`1`).
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local Compose stack
+tags:
+  - name: health
+  - name: balance-types
+  - name: accounts
+  - name: postings
+  - name: cash
+  - name: reads
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      operationId: health
+      summary: Liveness
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [UP]
+
+  /api/v1/balance-types:
+    post:
+      tags: [balance-types]
+      operationId: createBalanceType
+      summary: Create a balance type (writer)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBalanceType'
+      responses:
+        '200':
+          description: Created (or replayed) balance type
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceType'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Violation' }
+    get:
+      tags: [balance-types]
+      operationId: listBalanceTypes
+      summary: List balance types (reader)
+      responses:
+        '200':
+          description: All balance types
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BalanceType'
+
+  /api/v1/accounts:
+    post:
+      tags: [accounts]
+      operationId: createAccount
+      summary: Create one account balance row (writer)
+      description: |
+        One row is one `(accountId, balanceType, currency)` balance. Duplicate
+        create returns 422, so re-running setup scripts is safe.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccount'
+      responses:
+        '200':
+          description: Created account balance
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Violation' }
+
+  /api/v1/accounts/delete:
+    post:
+      tags: [accounts]
+      operationId: deleteAccount
+      summary: Soft-delete an account balance (writer)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteAccount'
+      responses:
+        '200':
+          description: Deleted account balance
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Violation' }
+
+  /api/v1/postings:
+    post:
+      tags: [postings]
+      operationId: post
+      summary: Post a transfer (writer); batch form is atomic multi-leg
+      description: |
+        Single leg: send `fromAccountId`/`toAccountId` fields.
+
+        Multi-leg (e.g. RFQ hold + pay): send `legs`. All legs share one
+        `requestId` and post in **one** SQL call (`pgledger_create_transfers`),
+        so they commit or roll back together.
+
+        `autoCreate` (single-leg and batch): create missing
+        `(account, balanceType, currency)` rows on the fly. Default `true`
+        (null means true) for deposits/withdrawals; set `false` on plain
+        postings when a typo should fail loudly.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/Posting'
+                - $ref: '#/components/schemas/PostingBatch'
+      responses:
+        '200':
+          description: Single leg returns a Transfer; batch returns an array of Transfers
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Transfer'
+                  - type: array
+                    items:
+                      $ref: '#/components/schemas/Transfer'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Violation' }
+
+  /api/v1/deposits:
+    post:
+      tags: [cash]
+      operationId: deposit
+      summary: Deposit from the BANK pool (writer)
+      description: |
+        Debits a hashed `BANK-{currency}-{type}-{n}` shard and credits the
+        client balance. Biz type `DEPOSIT`. Missing client balance rows are
+        auto-created.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashMovement'
+      responses:
+        '200':
+          description: Posted deposit transfer
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Violation' }
+
+  /api/v1/withdrawals:
+    post:
+      tags: [cash]
+      operationId: withdraw
+      summary: Withdrawal to the BANK pool (writer)
+      description: |
+        Debits the client balance and credits a `BANK` shard. Biz type
+        `WITHDRAWAL`. Missing client balance rows are auto-created.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CashMovement'
+      responses:
+        '200':
+          description: Posted withdrawal transfer
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Violation' }
+
+  /api/v1/balances:
+    get:
+      tags: [reads]
+      operationId: getBalance
+      summary: Single balance (reader)
+      parameters:
+        - name: accountId
+          in: query
+          required: true
+          schema: { type: string }
+        - name: balanceType
+          in: query
+          required: true
+          schema: { type: string }
+          description: Code or numeric id
+        - name: currency
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The balance row
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/balances/query:
+    post:
+      tags: [reads]
+      operationId: queryBalances
+      summary: Balance query across accounts (reader)
+      description: |
+        One or more account ids, optional balance-type / currency filters.
+        A missing filter means "all balance types" / "all currencies".
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BalanceQuery'
+      responses:
+        '200':
+          description: Matching balance rows
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Account'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Violation' }
+
+  /api/v1/accounts/{accountId}/balances:
+    get:
+      tags: [reads]
+      operationId: accountBalances
+      summary: All balances for one account (reader)
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Balance rows for the account
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Account'
+
+  /api/v1/journals:
+    get:
+      tags: [reads]
+      operationId: journals
+      summary: Journal page (reader)
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: size
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Page of transfers with entries
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JournalPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+components:
+  headers:
+    Role:
+      description: Which Postgres role served the response
+      schema:
+        type: string
+        enum: [writer, reader]
+
+  responses:
+    BadRequest:
+      description: Malformed body or missing parameter
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Unknown path or balance
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Violation:
+      description: Business rejection (duplicate key, insufficient sign policy, unknown registry code, idempotency conflict)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+
+    CreateBalanceType:
+      type: object
+      required: [code, name]
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        allowNegative:
+          type: boolean
+          default: false
+        allowPositive:
+          type: boolean
+          default: true
+
+    BalanceType:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        allowNegative: { type: boolean }
+        allowPositive: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CreateAccount:
+      type: object
+      required: [accountId, balanceType, currency]
+      properties:
+        accountId:
+          type: string
+          description: Business id; `BANK` is reserved for the shard pool
+        balanceType:
+          description: Code or numeric id
+          oneOf:
+            - { type: string }
+            - { type: integer }
+        currency: { type: string }
+        name: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+        accountClass:
+          type: string
+          description: Registry code, default `CLIENT`
+
+    DeleteAccount:
+      type: object
+      required: [accountId, balanceType, currency]
+      properties:
+        accountId: { type: string }
+        balanceType:
+          oneOf:
+            - { type: string }
+            - { type: integer }
+        currency: { type: string }
+
+    CashMovement:
+      type: object
+      required: [requestId, accountId, balanceType, currency, amount]
+      properties:
+        requestId: { type: string }
+        accountId: { type: string }
+        balanceType:
+          description: Code or numeric id
+          oneOf:
+            - { type: string }
+            - { type: integer }
+        currency: { type: string }
+        amount:
+          $ref: '#/components/schemas/Amount'
+
+    Posting:
+      type: object
+      required: [fromAccountId, fromBalanceType, toAccountId, toBalanceType, currency, amount, requestId]
+      properties:
+        fromAccountId: { type: string }
+        fromBalanceType:
+          description: Code or numeric id
+          oneOf:
+            - { type: string }
+            - { type: integer }
+        toAccountId: { type: string }
+        toBalanceType:
+          oneOf:
+            - { type: string }
+            - { type: integer }
+        currency: { type: string }
+        amount:
+          $ref: '#/components/schemas/Amount'
+        requestId: { type: string }
+        bizReference:
+          type: string
+          nullable: true
+        bizType:
+          type: string
+          description: Registry code; defaults to `TRANSFER` in SQL
+        autoCreate:
+          type: boolean
+          nullable: true
+          description: Create missing balance rows on the fly; null means true
+
+    PostingBatch:
+      type: object
+      required: [requestId, legs]
+      properties:
+        requestId: { type: string }
+        bizReference:
+          type: string
+          nullable: true
+        bizType:
+          type: string
+          nullable: true
+        autoCreate:
+          type: boolean
+          nullable: true
+          description: Create missing balance rows on the fly; null means true
+        legs:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/PostingLeg'
+
+    PostingLeg:
+      type: object
+      required: [fromAccountId, fromBalanceType, toAccountId, toBalanceType, currency, amount]
+      properties:
+        fromAccountId: { type: string }
+        fromBalanceType:
+          oneOf:
+            - { type: string }
+            - { type: integer }
+        toAccountId: { type: string }
+        toBalanceType:
+          oneOf:
+            - { type: string }
+            - { type: integer }
+        currency: { type: string }
+        amount:
+          $ref: '#/components/schemas/Amount'
+
+    BalanceQuery:
+      type: object
+      required: [accountIds]
+      properties:
+        accountIds:
+          type: array
+          minItems: 1
+          items: { type: string }
+        balanceType:
+          nullable: true
+          oneOf:
+            - { type: string }
+            - { type: integer }
+        currency:
+          type: string
+          nullable: true
+
+    Account:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Internal id (`pgla_...`)
+        accountId: { type: string }
+        balanceType: { type: string }
+        name: { type: string }
+        currency: { type: string }
+        balance:
+          $ref: '#/components/schemas/Amount'
+        version:
+          type: integer
+          format: int64
+          description: Incremented on every posting
+        allowNegativeBalance: { type: boolean }
+        allowPositiveBalance: { type: boolean }
+        metadata:
+          type: object
+          additionalProperties: true
+          nullable: true
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        accountClass: { type: string }
+        deleted: { type: boolean }
+
+    Entry:
+      type: object
+      description: One journal line; two per transfer
+      properties:
+        id: { type: string }
+        accountId:
+          type: string
+          description: Internal account id the entry hit
+        balanceType: { type: integer }
+        currency: { type: string }
+        amount:
+          $ref: '#/components/schemas/Amount'
+        previousBalance:
+          $ref: '#/components/schemas/Amount'
+        currentBalance:
+          $ref: '#/components/schemas/Amount'
+        version:
+          type: integer
+          format: int64
+        createdAt: { type: string, format: date-time }
+
+    Transfer:
+      type: object
+      properties:
+        id: { type: string }
+        fromAccountId: { type: string }
+        fromBalanceType:
+          type: integer
+          description: Balance-type id that was stored
+        toAccountId: { type: string }
+        toBalanceType: { type: integer }
+        currency: { type: string }
+        amount:
+          $ref: '#/components/schemas/Amount'
+        createdAt: { type: string, format: date-time }
+        eventAt:
+          type: string
+          format: date-time
+          nullable: true
+        requestId:
+          type: string
+          description: Idempotency key shared by every leg of the call
+        bizType:
+          type: string
+          nullable: true
+        bizReference:
+          type: string
+          nullable: true
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/Entry'
+
+    JournalPage:
+      type: object
+      properties:
+        page: { type: integer }
+        size: { type: integer }
+        total: { type: integer, format: int64 }
+        hasNext: { type: boolean }
+        transfers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Transfer'
+
+    Amount:
+      description: Unbounded NUMERIC
+      oneOf:
+        - type: number
+        - type: string

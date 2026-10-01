@@ -86,12 +86,14 @@ Compose is a **local / demo** stack (default passwords, exposed Postgres ports) 
 | `GET` | `/api/v1/balance-types` | reader | List balance types |
 | `POST` | `/api/v1/accounts` | writer | Create account balance |
 | `POST` | `/api/v1/accounts/delete` | writer | Soft-delete account balance |
-| `POST` | `/api/v1/postings` | writer | Transfer between accounts |
+| `POST` | `/api/v1/postings` | writer | Transfer (single-leg) or atomic multi-leg batch (`legs`) |
 | `POST` | `/api/v1/deposits` | writer | Credit from BANK pool |
 | `POST` | `/api/v1/withdrawals` | writer | Debit to BANK pool |
 | `POST` | `/api/v1/balances/query` | reader | Balance query: multi accountId, optional filters |
 | `GET` | `/api/v1/accounts/{accountId}/balances` | reader | All balances for account |
 | `GET` | `/api/v1/journals?page=&size=` | reader | Journal page |
+
+Full request/response contract: [openapi.yaml](openapi.yaml).
 
 ---
 
@@ -162,6 +164,8 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/balances/query \
 
 Same `requestId` + same payload replays the original transfer (no double credit).
 
+Deposit and withdrawal auto-create the client balance row when `(accountId, balanceType, currency)` is not registered yet (new rows start at 0, class CLIENT; an existing accountId keeps its class). A plain `POST /api/v1/postings` does the same by default; pass `"autoCreate":false` to fail with `Account not found` instead (typos should fail loudly). Currency and balance type must already exist in the registries. There is no cross-currency rejection: a missing currency row for the same account is just another missing row and gets created; a transfer where both sides auto-create on different currencies would only fail if the same row cannot serve both sides — every posting leg carries one currency for both from and to, so both rows always end up in that currency.
+
 ### 2. Withdrawal with gas fee
 
 Matches `k6/withdrawal.js`: reserve estimated gas on the client, withdraw principal to `BANK`, then settle gas to the bank `GAS_FEE` bucket (settle may leave client `GAS_FEE` negative — type allows both signs).
@@ -221,53 +225,38 @@ curl -s 'http://127.0.0.1:8080/api/v1/accounts/CLIENT_ACC_001/balances'
 
 After the three steps (starting from 100 USDT LIQUID): LIQUID ≈ 89, GAS_FEE ≈ −1 (1 reserved − 2 settled).
 
-### 3. RFQ (multi-leg fill)
+### 3. RFQ (multi-leg fill, atomic)
 
-RFQ hold + pay in **one atomic DB call** via `pgledger_create_transfers` (same `request_id` on every leg). HTTP `/api/v1/postings` is single-leg only — use SQL for atomic RFQ, or two sequential posts if eventual consistency across legs is OK.
+RFQ hold + pay in **one HTTP call** — `POST /api/v1/postings` with `legs`. All legs share one `requestId` and post in **one SQL call** (`pgledger_create_transfers`), so they commit or roll back together.
 
 ```text
 Leg A  CLIENT_ACC_001 (LIQUID) ──40──► CLIENT_ACC_001 (LOCKED)   hold buyer funds
 Leg B  CLIENT_ACC_002 (LIQUID) ──25──► LP_DESK        (LIQUID)   pay LP
 ```
 
-Run on the **writer**:
-
 ```bash
-docker compose exec -T writer psql -U pgledger -d pgledger <<'SQL'
-SELECT * FROM pgledger_create_transfers(
-    p_transfer_requests => ARRAY[
-        ('CLIENT_ACC_001',
-         (SELECT id FROM pgledger_balance_types WHERE code = 'LIQUID'),
-         'CLIENT_ACC_001',
-         (SELECT id FROM pgledger_balance_types WHERE code = 'LOCKED'),
-         'USDT', 40),
-        ('CLIENT_ACC_002',
-         (SELECT id FROM pgledger_balance_types WHERE code = 'LIQUID'),
-         'LP_DESK',
-         (SELECT id FROM pgledger_balance_types WHERE code = 'LIQUID'),
-         'USDT', 25)
-    ]::transfer_request[],
-    p_request_id => 'rfq-1'
-);
-SQL
+curl -s -X POST http://127.0.0.1:8080/api/v1/postings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "requestId": "rfq-1",
+    "bizType": "TRANSFER",
+    "legs": [
+      {"fromAccountId":"CLIENT_ACC_001","fromBalanceType":"LIQUID","toAccountId":"CLIENT_ACC_001","toBalanceType":"LOCKED","currency":"USDT","amount":40},
+      {"fromAccountId":"CLIENT_ACC_002","fromBalanceType":"LIQUID","toAccountId":"LP_DESK","toBalanceType":"LIQUID","currency":"USDT","amount":25}
+    ]
+  }'
 
 curl -s 'http://127.0.0.1:8080/api/v1/accounts/CLIENT_ACC_001/balances'
 curl -s 'http://127.0.0.1:8080/api/v1/balances?accountId=LP_DESK&balanceType=LIQUID&currency=USDT'
 ```
 
-Replay with the same `p_request_id` returns the original rows and does not post again.
+Replay with the same `requestId` returns the original rows and does not post again.
 
-**HTTP approximation** (not atomic across legs):
+The same call in SQL (`p_transfer_requests`, writer) is documented in [docs/schema-and-sql.md](docs/schema-and-sql.md).
 
-```bash
-curl -s -X POST http://127.0.0.1:8080/api/v1/postings \
-  -H 'Content-Type: application/json' \
-  -d '{"requestId":"rfq-http-hold","fromAccountId":"CLIENT_ACC_001","fromBalanceType":"LIQUID","toAccountId":"CLIENT_ACC_001","toBalanceType":"LOCKED","currency":"USDT","amount":40,"bizType":"TRANSFER"}'
+#### Auto-create
 
-curl -s -X POST http://127.0.0.1:8080/api/v1/postings \
-  -H 'Content-Type: application/json' \
-  -d '{"requestId":"rfq-http-pay","fromAccountId":"CLIENT_ACC_002","fromBalanceType":"LIQUID","toAccountId":"LP_DESK","toBalanceType":"LIQUID","currency":"USDT","amount":25,"bizType":"TRANSFER"}'
-```
+Postings, deposits, and withdrawals accept `"autoCreate": true/false` (null = true). With auto-create, a missing `(account, balanceType, currency)` row is created on the fly — new account ids get class `CLIENT`, existing ids keep their class. Deposits/withdrawals always auto-create. For plain postings where a typo'd account id should fail loudly, send `"autoCreate": false` (422 `Account not found`).
 
 ### 4. Inspect journal
 

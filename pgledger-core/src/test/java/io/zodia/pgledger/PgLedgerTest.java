@@ -209,10 +209,23 @@ class PgLedgerTest {
             assertEquals(0, new BigDecimal("10").compareTo(ledger.balance(client, available, "USD").balance()));
             assertEquals(journalsBefore + 1L, ledger.journals(0, 1).total());
 
+            // eurSink has no EUR row yet. autoCreate=false on plain postings
+            // surfaces the missing row instead of silently creating it.
             LedgerViolation currency = assertThrows(LedgerViolation.class,
                     () -> ledger.post(new Posting(
-                            client, available, eurSink, available, "EUR", BigDecimal.ONE, id("REQ"), null)));
-            assertTrue(currency.getMessage().contains("Cannot transfer between different currencies"));
+                            client, available, eurSink, available, "EUR", BigDecimal.ONE, id("REQ"), null, null, false)));
+            assertTrue(currency.getMessage().contains("Account not found"));
+            // Fund the client EUR row first (company is a BANK and may go negative);
+            // the company EUR row itself is auto-created here.
+            ledger.post(new Posting(
+                    company, available, client, available, "EUR", new BigDecimal("5"), id("REQ"), null, null, true));
+            // With autoCreate the missing eurSink EUR row is created on the fly;
+            // both sides stay in EUR and the transfer commits.
+            Transfer eurMove = ledger.post(new Posting(
+                    client, available, eurSink, available, "EUR", BigDecimal.ONE, id("REQ"), null, null, true));
+            assertEquals(0, new BigDecimal("4").compareTo(ledger.balance(client, available, "EUR").balance()));
+            assertEquals(0, BigDecimal.ONE.compareTo(ledger.balance(eurSink, available, "EUR").balance()));
+            assertNotNull(eurMove.id());
 
             LedgerViolation missing = assertThrows(LedgerViolation.class,
                     () -> ledger.post(posting(prefix + "NOPE", available, company, available, "USD", "1")));
@@ -800,7 +813,8 @@ class PgLedgerTest {
 
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
                                    String currency, String amount) {
-        return new Posting(fromAccount, fromType, toAccount, toType, currency, new BigDecimal(amount), id("REQ"), null);
+        return new Posting(fromAccount, fromType, toAccount, toType, currency,
+                new BigDecimal(amount), id("REQ"), null, null, false);
     }
 
     private static String id(String prefix) {

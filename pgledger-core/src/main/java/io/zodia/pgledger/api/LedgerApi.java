@@ -55,6 +55,11 @@ public final class LedgerApi {
             BigDecimal amount) {
     }
 
+    /**
+     * Posting legs. {@code autoCreate} creates missing (account, balanceType,
+     * currency) rows on the fly; default true for deposit/withdrawal, false for
+     * plain postings where a typo should fail loudly.
+     */
     public record Posting(
             String fromAccountId,
             @JsonDeserialize(using = NumberAsTextDeserializer.class) String fromBalanceType,
@@ -64,7 +69,9 @@ public final class LedgerApi {
             BigDecimal amount,
             String requestId,
             String bizReference,
-            String bizType) {
+            String bizType,
+            Boolean autoCreate) {
+
         public Posting(
                 String fromAccountId,
                 String fromBalanceType,
@@ -75,7 +82,21 @@ public final class LedgerApi {
                 String requestId,
                 String bizReference) {
             this(fromAccountId, fromBalanceType, toAccountId, toBalanceType,
-                    currency, amount, requestId, bizReference, null);
+                    currency, amount, requestId, bizReference, null, null);
+        }
+
+        public Posting(
+                String fromAccountId,
+                String fromBalanceType,
+                String toAccountId,
+                String toBalanceType,
+                String currency,
+                BigDecimal amount,
+                String requestId,
+                String bizReference,
+                String bizType) {
+            this(fromAccountId, fromBalanceType, toAccountId, toBalanceType,
+                    currency, amount, requestId, bizReference, bizType, null);
         }
     }
 
@@ -91,13 +112,18 @@ public final class LedgerApi {
 
     /**
      * Atomic multi-leg posting. One {@code requestId}, one SQL {@code pgledger_create_transfers}.
-     * Single-leg callers keep using {@link Posting}.
+     * Single-leg callers keep using {@link Posting}. {@code autoCreate} null means true.
      */
     public record PostingBatch(
             String requestId,
             String bizReference,
             String bizType,
-            List<PostingLeg> legs) {
+            List<PostingLeg> legs,
+            Boolean autoCreate) {
+
+        public PostingBatch(String requestId, String bizReference, String bizType, List<PostingLeg> legs) {
+            this(requestId, bizReference, bizType, legs, null);
+        }
     }
 
     public record Account(

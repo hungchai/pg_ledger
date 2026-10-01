@@ -200,7 +200,8 @@ public final class PgLedger implements AutoCloseable {
                         posting.toAccountId(),
                         posting.toBalanceType(),
                         posting.currency(),
-                        posting.amount()))));
+                        posting.amount())),
+                posting.autoCreate()));
         return transfers.get(0);
     }
 
@@ -251,7 +252,8 @@ public final class PgLedger implements AutoCloseable {
                     amount,
                     requestId,
                     bizReference,
-                    bizType));
+                    bizType,
+                    batch.autoCreate()));
         }
         return writer.post(List.copyOf(resolved));
     }
@@ -312,7 +314,7 @@ public final class PgLedger implements AutoCloseable {
         }
         return post(new Posting(
                 from, Integer.toString(typeId), to, Integer.toString(typeId), currency, amount,
-                movement.requestId().strip(), null, bizType));
+                movement.requestId().strip(), null, bizType, true));
     }
 
     private static int poolSize(int poolSize) {
