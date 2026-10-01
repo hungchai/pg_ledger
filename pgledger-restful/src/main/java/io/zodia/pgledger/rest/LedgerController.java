@@ -2,6 +2,7 @@ package io.zodia.pgledger.rest;
 
 import io.zodia.pgledger.PgLedger;
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.BalanceQuery;
 import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
@@ -104,6 +105,15 @@ final class LedgerController {
             return HttpResponses.of(404, PgLedgerServer.READER, HttpResponses.NOT_FOUND);
         }
         return HttpResponses.of(200, PgLedgerServer.READER, LedgerJson.writeBytes(account));
+    }
+
+    @PostMapping("/api/v1/balances/query")
+    ResponseEntity<byte[]> balancesQuery(@RequestBody(required = false) byte[] body) {
+        BalanceQuery query = read(body, BalanceQuery.class);
+        if (query.accountIds() == null || query.accountIds().isEmpty()) {
+            throw new BadRequestException();
+        }
+        return HttpResponses.of(200, PgLedgerServer.READER, LedgerJson.writeBytes(reads.balancesQuery(query)));
     }
 
     @GetMapping("/api/v1/journals")

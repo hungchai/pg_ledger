@@ -39,6 +39,40 @@ public class LedgerReadService {
         return List.copyOf(sorted);
     }
 
+    /**
+     * Multi-account balance query. Optional filters: null or blank balanceType /
+     * currency means all. Unknown codes yield an empty result, not an error.
+     */
+    public List<Account> balancesQuery(io.zodia.pgledger.api.LedgerApi.BalanceQuery query) {
+        List<String> ids = query.accountIds() == null ? List.of() : query.accountIds();
+        ArrayList<String> cleaned = new ArrayList<>(ids.size());
+        for (String id : ids) {
+            if (id != null && !id.isBlank()) {
+                cleaned.add(id.strip());
+            }
+        }
+        if (cleaned.isEmpty()) {
+            throw new io.zodia.pgledger.store.LedgerViolation("accountIds is required");
+        }
+        Integer typeId = query.balanceType() == null || query.balanceType().isBlank()
+                ? null
+                : registries.findBalanceTypeId(query.balanceType());
+        Integer currencyId = query.currency() == null || query.currency().isBlank()
+                ? null
+                : registries.currencyId(query.currency());
+        if ((query.balanceType() != null && !query.balanceType().isBlank() && typeId == null)
+                || (query.currency() != null && !query.currency().isBlank() && currencyId == null)) {
+            return List.of();
+        }
+        List<LedgerReadMapper.AccountRow> rows =
+                mapper.balancesQuery(cleaned.toArray(new String[0]), typeId, currencyId);
+        ArrayList<Account> result = new ArrayList<>(rows.size());
+        for (LedgerReadMapper.AccountRow row : rows) {
+            result.add(toAccount(row));
+        }
+        return List.copyOf(result);
+    }
+
     public Account balance(String accountId, String balanceType, String currency) {
         Integer typeId = registries.findBalanceTypeId(balanceType);
         Integer currencyId = registries.currencyId(currency);

@@ -89,7 +89,7 @@ Compose is a **local / demo** stack (default passwords, exposed Postgres ports) 
 | `POST` | `/api/v1/postings` | writer | Transfer between accounts |
 | `POST` | `/api/v1/deposits` | writer | Credit from BANK pool |
 | `POST` | `/api/v1/withdrawals` | writer | Debit to BANK pool |
-| `GET` | `/api/v1/balances?accountId=&balanceType=&currency=` | reader | Single balance |
+| `POST` | `/api/v1/balances/query` | reader | Balance query: multi accountId, optional filters |
 | `GET` | `/api/v1/accounts/{accountId}/balances` | reader | All balances for account |
 | `GET` | `/api/v1/journals?page=&size=` | reader | Journal page |
 
@@ -153,6 +153,11 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/deposits \
   -d '{"requestId":"dep-2","accountId":"CLIENT_ACC_002","balanceType":"LIQUID","currency":"USDT","amount":80}'
 
 curl -s 'http://127.0.0.1:8080/api/v1/balances?accountId=CLIENT_ACC_001&balanceType=LIQUID&currency=USDT'
+
+# Balance query: multi-account, optional filters; omit balanceType/currency for all
+curl -s -X POST http://127.0.0.1:8080/api/v1/balances/query \
+  -H 'Content-Type: application/json' \
+  -d '{"accountIds":["CLIENT_ACC_001","CLIENT_ACC_002"],"balanceType":"LIQUID","currency":"USDT"}'
 ```
 
 Same `requestId` + same payload replays the original transfer (no double credit).

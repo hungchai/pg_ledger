@@ -147,4 +147,15 @@ public final class LedgerApi {
 
     public record JournalPage(int page, int size, long total, boolean hasNext, List<Transfer> transfers) {
     }
+
+    /**
+     * Balance query: one or more account ids, optional balance-type / currency
+     * filters. Codes or numeric ids are both accepted. A missing filter means
+     * "all balance types" / "all currencies".
+     */
+    public record BalanceQuery(
+            List<String> accountIds,
+            String balanceType,
+            String currency) {
+    }
 }

@@ -47,6 +47,7 @@ public interface LedgerReadMapper {
             FROM pgledger_accounts a
             JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
             JOIN pgledger_account_classes ac ON ac.id = a.account_class_id
+            JOIN pgledger_currencies c ON c.id = a.currency_id
             """;
 
     @Select("SELECT " + ACCOUNT_COLUMNS + ACCOUNT_JOINS + " WHERE a.account_id = #{accountId}")
@@ -103,6 +104,32 @@ public interface LedgerReadMapper {
     BigDecimal bankPosition(@Param("classId") int classId,
                             @Param("balanceTypeId") int balanceTypeId,
                             @Param("currencyId") int currencyId);
+
+    @Select("SELECT " + ACCOUNT_COLUMNS + ACCOUNT_JOINS + """
+            WHERE a.account_id = ANY (#{accountIds}::text[])
+              AND (#{balanceTypeId}::int IS NULL OR a.balance_type_id = #{balanceTypeId})
+              AND (#{currencyId}::int IS NULL OR a.currency_id = #{currencyId})
+            ORDER BY a.account_id, bt.code, c.code
+            """)
+    @ConstructorArgs({
+            @Arg(column = "id", javaType = String.class),
+            @Arg(column = "account_id", javaType = String.class),
+            @Arg(column = "balance_type_id", javaType = int.class),
+            @Arg(column = "name", javaType = String.class),
+            @Arg(column = "currency_id", javaType = int.class),
+            @Arg(column = "balance", javaType = BigDecimal.class),
+            @Arg(column = "version", javaType = long.class),
+            @Arg(column = "allow_negative_balance", javaType = boolean.class),
+            @Arg(column = "allow_positive_balance", javaType = boolean.class),
+            @Arg(column = "metadata", javaType = String.class, jdbcType = JdbcType.VARCHAR),
+            @Arg(column = "created_at", javaType = java.time.Instant.class),
+            @Arg(column = "updated_at", javaType = java.time.Instant.class),
+            @Arg(column = "account_class_id", javaType = int.class),
+            @Arg(column = "deleted", javaType = boolean.class),
+    })
+    List<AccountRow> balancesQuery(@Param("accountIds") String[] accountIds,
+                                   @Param("balanceTypeId") Integer balanceTypeId,
+                                   @Param("currencyId") Integer currencyId);
 
     @Select("SELECT count(*) FROM pgledger_transfers")
     long journalCount();
