@@ -223,8 +223,8 @@ CREATE INDEX IF NOT EXISTS pgledger_accounts_currency_id_idx ON pgledger_account
 CREATE INDEX IF NOT EXISTS pgledger_accounts_account_class_id_idx ON pgledger_accounts (account_class_id);
 CREATE INDEX IF NOT EXISTS pgledger_accounts_balance_currency_idx ON pgledger_accounts (balance_type_id, currency_id);
 
-CREATE TABLE IF NOT EXISTS pgledger_transfers (
-    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pglt'),
+CREATE TABLE IF NOT EXISTS pgledger_transfers_part (
+    id TEXT NOT NULL DEFAULT pgledger_generate_id('pglt'),
     from_account_id TEXT NOT NULL,
     to_account_id TEXT NOT NULL,
     amount NUMERIC NOT NULL,
@@ -233,29 +233,76 @@ CREATE TABLE IF NOT EXISTS pgledger_transfers (
     request_id TEXT,
     biz_type_id INT NOT NULL,
     biz_reference TEXT,
-    CHECK (amount > 0 AND from_account_id != to_account_id)
-);
+    CHECK (amount > 0 AND from_account_id != to_account_id),
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
 
-CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_idx ON pgledger_transfers (request_id);
-CREATE INDEX IF NOT EXISTS pgledger_transfers_biz_type_id_idx ON pgledger_transfers (biz_type_id);
-CREATE INDEX IF NOT EXISTS pgledger_transfers_from_account_id_idx ON pgledger_transfers (from_account_id);
-CREATE INDEX IF NOT EXISTS pgledger_transfers_to_account_id_idx ON pgledger_transfers (to_account_id);
-CREATE INDEX IF NOT EXISTS pgledger_transfers_event_at_idx ON pgledger_transfers (event_at);
-CREATE INDEX IF NOT EXISTS pgledger_transfers_created_at_idx ON pgledger_transfers (created_at DESC, id DESC);
+-- ShardingSphere 5.5.2 only loads TABLE/VIEW from JDBC metadata; a partitioned
+-- parent reports PARTITIONED TABLE and becomes invisible to it. The auto-
+-- updatable view keeps the legacy name readable and writable for every caller.
+CREATE OR REPLACE VIEW pgledger_transfers AS
+SELECT id, from_account_id, to_account_id, amount, created_at, event_at,
+       request_id, biz_type_id, biz_reference
+FROM pgledger_transfers_part;
 
-CREATE TABLE IF NOT EXISTS pgledger_entries (
-    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pgle'),
+CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_idx ON pgledger_transfers_part (request_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_biz_type_id_idx ON pgledger_transfers_part (biz_type_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_from_account_id_idx ON pgledger_transfers_part (from_account_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_to_account_id_idx ON pgledger_transfers_part (to_account_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_event_at_idx ON pgledger_transfers_part (event_at);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_created_at_idx ON pgledger_transfers_part (created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS pgledger_entries_part (
+    id TEXT NOT NULL DEFAULT pgledger_generate_id('pgle'),
     account_id TEXT NOT NULL,
     transfer_id TEXT NOT NULL,
     amount NUMERIC NOT NULL,
     account_previous_balance NUMERIC NOT NULL,
     account_current_balance NUMERIC NOT NULL,
     account_version BIGINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL
-);
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
 
-CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries (account_id);
-CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries (transfer_id);
+CREATE OR REPLACE VIEW pgledger_entries AS
+SELECT id, account_id, transfer_id, amount, account_previous_balance,
+       account_current_balance, account_version, created_at
+FROM pgledger_entries_part;
+
+CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries_part (account_id);
+CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries_part (transfer_id);
+
+-- Monthly partitions for the append-only ledger tables. Old months become
+-- DROP-able archive units; vacuum and index maintenance run per month.
+-- Callers insert with now(); ensure partitions exist before month boundaries.
+CREATE OR REPLACE FUNCTION pgledger_ensure_month_partitions(p_ahead INT DEFAULT 2)
+RETURNS VOID
+AS $$
+DECLARE
+    v_month DATE := date_trunc('month', CURRENT_DATE)::date;
+    v_i INT;
+    v_from DATE;
+    v_to DATE;
+    v_suffix TEXT;
+BEGIN
+    IF p_ahead IS NULL OR p_ahead < 0 THEN
+        p_ahead := 0;
+    END IF;
+    FOR v_i IN 0 .. p_ahead LOOP
+        v_from := v_month + make_interval(months => v_i);
+        v_to := v_from + make_interval(months => 1);
+        v_suffix := to_char(v_from, 'YYYY_MM');
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS pgledger_transfers_%1$s PARTITION OF pgledger_transfers_part FOR VALUES FROM (%2$L) TO (%3$L)',
+            v_suffix, v_from, v_to);
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS pgledger_entries_%1$s PARTITION OF pgledger_entries_part FOR VALUES FROM (%2$L) TO (%3$L)',
+            v_suffix, v_from, v_to);
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql VOLATILE;
+
+SELECT pgledger_ensure_month_partitions(2);
 
 -- The old view had no flag columns. Functions with the old
 -- pgledger_create_balance_type signature depend on that shape, so drop it with
