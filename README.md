@@ -90,10 +90,10 @@ Compose is a **local / demo** stack (default passwords, exposed Postgres ports) 
 | `POST` | `/api/v1/deposits` | writer | Credit from BANK pool |
 | `POST` | `/api/v1/withdrawals` | writer | Debit to BANK pool |
 | `POST` | `/api/v1/balances/query` | reader | Balance query: multi accountId, optional filters |
-| `GET` | `/api/v1/accounts/{accountId}/balances` | reader | All balances for account |
+| `GET` | `/api/v1/accounts/{accountId}/balances` | reader | All balances for one account (prefer the query endpoint) |
 | `GET` | `/api/v1/journals?page=&size=` | reader | Journal page |
 
-Full request/response contract: [openapi.yaml](openapi.yaml).
+Full request/response contract: [openapi.yaml](openapi.yaml). Rendered Swagger UI (GitHub Pages): https://hungchai.github.io/pg_ledger/ — auto-publishes on push to `main`/`dev` when the spec changes.
 
 ---
 
@@ -160,6 +160,11 @@ curl -s 'http://127.0.0.1:8080/api/v1/balances?accountId=CLIENT_ACC_001&balanceT
 curl -s -X POST http://127.0.0.1:8080/api/v1/balances/query \
   -H 'Content-Type: application/json' \
   -d '{"accountIds":["CLIENT_ACC_001","CLIENT_ACC_002"],"balanceType":"LIQUID","currency":"USDT"}'
+
+# One account, all balance types/currencies (same as above with a single id)
+curl -s -X POST http://127.0.0.1:8080/api/v1/balances/query \
+  -H 'Content-Type: application/json' \
+  -d '{"accountIds":["CLIENT_ACC_001"]}'
 ```
 
 Same `requestId` + same payload replays the original transfer (no double credit).
@@ -220,7 +225,7 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/postings \
     \"bizType\": \"TRANSFER\"
   }"
 
-curl -s 'http://127.0.0.1:8080/api/v1/accounts/CLIENT_ACC_001/balances'
+curl -s -X POST http://127.0.0.1:8080/api/v1/balances/query -H 'Content-Type: application/json' -d '{"accountIds":["CLIENT_ACC_001"]}'
 ```
 
 After the three steps (starting from 100 USDT LIQUID): LIQUID ≈ 89, GAS_FEE ≈ −1 (1 reserved − 2 settled).
@@ -246,7 +251,7 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/postings \
     ]
   }'
 
-curl -s 'http://127.0.0.1:8080/api/v1/accounts/CLIENT_ACC_001/balances'
+curl -s -X POST http://127.0.0.1:8080/api/v1/balances/query -H 'Content-Type: application/json' -d '{"accountIds":["CLIENT_ACC_001"]}'
 curl -s 'http://127.0.0.1:8080/api/v1/balances?accountId=LP_DESK&balanceType=LIQUID&currency=USDT'
 ```
 

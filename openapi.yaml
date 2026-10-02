@@ -26,6 +26,7 @@ tags:
   - name: postings
   - name: cash
   - name: reads
+security: []
 
 paths:
   /health:
@@ -298,6 +299,9 @@ paths:
       tags: [reads]
       operationId: accountBalances
       summary: All balances for one account (reader)
+      description: |
+        Prefer `POST /api/v1/balances/query`, which covers this case with a
+        single account id and adds optional balance-type / currency filters.
       parameters:
         - name: accountId
           in: path
@@ -400,7 +404,7 @@ components:
         id: { type: integer }
         code: { type: string }
         name: { type: string }
-        description: { type: string, nullable: true }
+        description: { type: [string, 'null'] }
         allowNegative: { type: boolean }
         allowPositive: { type: boolean }
         createdAt: { type: string, format: date-time }
@@ -473,14 +477,12 @@ components:
           $ref: '#/components/schemas/Amount'
         requestId: { type: string }
         bizReference:
-          type: string
-          nullable: true
+          type: [string, 'null']
         bizType:
           type: string
           description: Registry code; defaults to `TRANSFER` in SQL
         autoCreate:
-          type: boolean
-          nullable: true
+          type: [boolean, 'null']
           description: Create missing balance rows on the fly; null means true
 
     PostingBatch:
@@ -489,14 +491,11 @@ components:
       properties:
         requestId: { type: string }
         bizReference:
-          type: string
-          nullable: true
+          type: [string, 'null']
         bizType:
-          type: string
-          nullable: true
+          type: [string, 'null']
         autoCreate:
-          type: boolean
-          nullable: true
+          type: [boolean, 'null']
           description: Create missing balance rows on the fly; null means true
         legs:
           type: array
@@ -531,13 +530,12 @@ components:
           minItems: 1
           items: { type: string }
         balanceType:
-          nullable: true
           oneOf:
             - { type: string }
             - { type: integer }
+            - { type: 'null' }
         currency:
-          type: string
-          nullable: true
+          type: [string, 'null']
 
     Account:
       type: object
@@ -558,9 +556,8 @@ components:
         allowNegativeBalance: { type: boolean }
         allowPositiveBalance: { type: boolean }
         metadata:
-          type: object
+          type: [object, 'null']
           additionalProperties: true
-          nullable: true
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
         accountClass: { type: string }
@@ -602,18 +599,15 @@ components:
           $ref: '#/components/schemas/Amount'
         createdAt: { type: string, format: date-time }
         eventAt:
-          type: string
+          type: [string, 'null']
           format: date-time
-          nullable: true
         requestId:
           type: string
           description: Idempotency key shared by every leg of the call
         bizType:
-          type: string
-          nullable: true
+          type: [string, 'null']
         bizReference:
-          type: string
-          nullable: true
+          type: [string, 'null']
         entries:
           type: array
           items:
