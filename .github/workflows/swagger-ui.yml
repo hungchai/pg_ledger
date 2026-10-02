@@ -2,7 +2,7 @@ name: Swagger UI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, feat/pg-ledger-first-cut]
     paths:
       - 'openapi.yaml'
       - '.github/workflows/swagger-ui.yml'
