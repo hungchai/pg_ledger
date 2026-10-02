@@ -312,10 +312,13 @@ BEGIN
             req.to_account_id, req.to_balance_type, btrim(req.currency), v_request_id);
         p_transfer_requests[v_ord] := req;
     END LOOP;
-    SELECT COALESCE(array_agg(id ORDER BY id), ARRAY[]::TEXT[])
+    -- Shard-local idempotency check: one request lives on exactly one shard,
+    -- so dedup reads that shard's index instead of scanning the UNION view.
+    EXECUTE format(
+        'SELECT COALESCE(array_agg(id ORDER BY id), ARRAY[]::TEXT[]) FROM pgledger_transfers_%s WHERE request_id = $1',
+        pgledger_request_shard(v_request_id))
     INTO v_existing_ids
-    FROM pgledger_transfers
-    WHERE request_id = v_request_id;
+    USING v_request_id;
     v_count := COALESCE(array_length(v_existing_ids, 1), 0);
     IF v_count > 0 THEN
         IF v_count <> array_length(p_transfer_requests, 1) THEN
@@ -332,7 +335,7 @@ BEGIN
             FROM pgledger_transfers t
             JOIN pgledger_accounts fa ON fa.id = t.from_account_id
             JOIN pgledger_accounts ta ON ta.id = t.to_account_id
-            WHERE t.id = v_existing_ids[v_ord];
+            WHERE t.id = v_existing_ids[v_ord] AND t.request_id = v_request_id;
             IF v_existing_amount IS DISTINCT FROM req.amount
                 OR v_existing_biz IS DISTINCT FROM v_biz_type_id
                 OR v_from_account IS DISTINCT FROM btrim(req.from_account_id)
@@ -441,38 +444,44 @@ BEGIN
 
         PERFORM pgledger_check_account_balance_constraints(to_row);
 
-        INSERT INTO pgledger_transfers (
-            from_account_id, to_account_id, amount, created_at, event_at, request_id, biz_type_id, biz_reference
-        )
-        VALUES (
-            from_row.id, to_row.id, req.amount, now(), coalesce(p_event_at, now()),
-            v_request_id, v_biz_type_id, v_biz_reference
-        )
-        RETURNING pgledger_transfers.id INTO transfer_id;
+        -- Routed inserts: request's shard for the transfer, same shard for both
+        -- entries so a request's rows stay colocated for shard-local reads.
+        EXECUTE format(
+            'INSERT INTO pgledger_transfers_%1$s (
+                from_account_id, to_account_id, amount, created_at, event_at, request_id, biz_type_id, biz_reference
+            )
+            VALUES ($1, $2, $3, now(), $4, $5, $6, $7)
+            RETURNING id',
+            pgledger_request_shard(v_request_id))
+        INTO transfer_id
+        USING from_row.id, to_row.id, req.amount, coalesce(p_event_at, now()),
+              v_request_id, v_biz_type_id, v_biz_reference;
 
         transfer_ids := array_append(transfer_ids, transfer_id);
 
-        INSERT INTO pgledger_entries (
-            account_id, transfer_id, amount, account_previous_balance, account_current_balance, account_version, created_at
-        )
-        VALUES (
-            from_row.id, transfer_id, -req.amount,
-            from_row.balance + req.amount, from_row.balance, from_row.version, now()
-        );
+        EXECUTE format(
+            'INSERT INTO pgledger_entries_%1$s (
+                account_id, transfer_id, amount, account_previous_balance, account_current_balance, account_version, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, now())',
+            pgledger_request_shard(v_request_id))
+        USING from_row.id, transfer_id, -req.amount,
+              from_row.balance + req.amount, from_row.balance, from_row.version;
 
-        INSERT INTO pgledger_entries (
-            account_id, transfer_id, amount, account_previous_balance, account_current_balance, account_version, created_at
-        )
-        VALUES (
-            to_row.id, transfer_id, req.amount,
-            to_row.balance - req.amount, to_row.balance, to_row.version, now()
-        );
+        EXECUTE format(
+            'INSERT INTO pgledger_entries_%1$s (
+                account_id, transfer_id, amount, account_previous_balance, account_current_balance, account_version, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, now())',
+            pgledger_request_shard(v_request_id))
+        USING to_row.id, transfer_id, req.amount,
+              to_row.balance - req.amount, to_row.balance, to_row.version;
     END LOOP;
-
     RETURN QUERY
     SELECT *
     FROM pgledger_transfers_view
     WHERE id = ANY(transfer_ids)
+      AND request_id = v_request_id
     ORDER BY id;
 END;
 $$ LANGUAGE plpgsql;
