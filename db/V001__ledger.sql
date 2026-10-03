@@ -223,7 +223,7 @@ CREATE INDEX IF NOT EXISTS pgledger_accounts_currency_id_idx ON pgledger_account
 CREATE INDEX IF NOT EXISTS pgledger_accounts_account_class_id_idx ON pgledger_accounts (account_class_id);
 CREATE INDEX IF NOT EXISTS pgledger_accounts_balance_currency_idx ON pgledger_accounts (balance_type_id, currency_id);
 
-CREATE TABLE pgledger_transfers_template (
+CREATE TABLE IF NOT EXISTS pgledger_transfers (
     id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pglt'),
     from_account_id TEXT NOT NULL,
     to_account_id TEXT NOT NULL,
@@ -236,7 +236,14 @@ CREATE TABLE pgledger_transfers_template (
     CHECK (amount > 0 AND from_account_id != to_account_id)
 );
 
-CREATE TABLE pgledger_entries_template (
+CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_idx ON pgledger_transfers (request_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_biz_type_id_idx ON pgledger_transfers (biz_type_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_from_account_id_idx ON pgledger_transfers (from_account_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_to_account_id_idx ON pgledger_transfers (to_account_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_event_at_idx ON pgledger_transfers (event_at);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_created_at_idx ON pgledger_transfers (created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS pgledger_entries (
     id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pgle'),
     account_id TEXT NOT NULL,
     transfer_id TEXT NOT NULL,
@@ -247,46 +254,8 @@ CREATE TABLE pgledger_entries_template (
     created_at TIMESTAMPTZ NOT NULL
 );
 
--- Application-level table sharding for the append-only ledger tables. Shard is
--- routed by hashtext(request_id): one request lands on exactly one transfers
--- shard and its entries on the same-numbered entries shard. Writers route
--- inside pgledger_create_transfers; readers use the UNION ALL views below on
--- the legacy names. pgledger_transfers_view/_entries_view in this file keep
--- joining the view names, so no SQL below this line changes.
-CREATE OR REPLACE FUNCTION pgledger_shard_count() RETURNS INT AS $$ SELECT 8 $$ LANGUAGE sql STABLE;
-
-CREATE OR REPLACE FUNCTION pgledger_request_shard(p_request_id TEXT) RETURNS INT
-AS $$
-    SELECT abs(hashtext(p_request_id)) % pgledger_shard_count()
-$$ LANGUAGE sql IMMUTABLE;
-
-DO $do$
-DECLARE
-    v_i INT;
-BEGIN
-    FOR v_i IN 0 .. pgledger_shard_count() - 1 LOOP
-        EXECUTE format('CREATE TABLE IF NOT EXISTS pgledger_transfers_%1$s (LIKE pgledger_transfers_template INCLUDING ALL)', v_i);
-        EXECUTE format('CREATE TABLE IF NOT EXISTS pgledger_entries_%1$s (LIKE pgledger_entries_template INCLUDING ALL)', v_i);
-    END LOOP;
-END
-$do$;
-
-CREATE OR REPLACE VIEW pgledger_transfers AS
-SELECT * FROM pgledger_transfers_0 UNION ALL SELECT * FROM pgledger_transfers_1
-UNION ALL SELECT * FROM pgledger_transfers_2 UNION ALL SELECT * FROM pgledger_transfers_3
-UNION ALL SELECT * FROM pgledger_transfers_4 UNION ALL SELECT * FROM pgledger_transfers_5
-UNION ALL SELECT * FROM pgledger_transfers_6 UNION ALL SELECT * FROM pgledger_transfers_7;
-
-CREATE OR REPLACE VIEW pgledger_entries AS
-SELECT * FROM pgledger_entries_0 UNION ALL SELECT * FROM pgledger_entries_1
-UNION ALL SELECT * FROM pgledger_entries_2 UNION ALL SELECT * FROM pgledger_entries_3
-UNION ALL SELECT * FROM pgledger_entries_4 UNION ALL SELECT * FROM pgledger_entries_5
-UNION ALL SELECT * FROM pgledger_entries_6 UNION ALL SELECT * FROM pgledger_entries_7;
-
--- Indexes live on the shard tables (LIKE ... INCLUDING ALL copies them from
--- the templates). Views cannot be indexed; keep the legacy index names below
--- meaningless for now and document that lookups go through per-shard indexes.
-CREATE INDEX IF NOT EXISTS pgledger_transfers_template_request_id_idx ON pgledger_transfers_template (request_id);
+CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries (account_id);
+CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries (transfer_id);
 
 -- The old view had no flag columns. Functions with the old
 -- pgledger_create_balance_type signature depend on that shape, so drop it with
