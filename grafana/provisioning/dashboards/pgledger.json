@@ -1,267 +1,1025 @@
 {
-  "uid": "pgledger",
-  "title": "pgledger",
-  "tags": ["pgledger", "postgres", "k6"],
-  "timezone": "browser",
-  "schemaVersion": 39,
-  "refresh": "5s",
-  "graphTooltip": 1,
-  "time": { "from": "now-15m", "to": "now" },
-  "templating": {
-    "list": [
-      {
-        "name": "testid",
-        "label": "testid",
-        "type": "query",
-        "datasource": { "type": "prometheus", "uid": "prometheus" },
-        "definition": "label_values(k6_vus, testid)",
-        "query": { "qryType": 1, "query": "label_values(k6_vus, testid)", "refId": "A" },
-        "includeAll": true,
-        "allValue": ".*",
-        "multi": false,
-        "refresh": 2,
-        "sort": 2,
-        "current": { "text": "All", "value": "$__all" }
-      }
-    ]
-  },
-  "panels": [
-    {
-      "id": 1,
-      "type": "text",
-      "title": "",
-      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
-      "options": {
-        "mode": "markdown",
-        "content": "Postgres is scraped every 5s. **Transfers/s** is new `pgledger_transfers` rows. **Commits/s** is every transaction, including the exporter. k6 HTTP panels fill when you remote-write a run. Widen the range if a panel is empty."
-      }
+ "uid": "pgledger",
+ "title": "pgledger",
+ "tags": [
+  "pgledger",
+  "postgres",
+  "k6"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "refresh": "5s",
+ "graphTooltip": 1,
+ "time": {
+  "from": "now-15m",
+  "to": "now"
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "testid",
+    "label": "testid",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prometheus"
     },
-    {
-      "id": 2,
-      "type": "stat",
-      "title": "Writer transfers/s",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 3 },
-      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "clamp_min(delta(pgledger_rows_n{rel=\"transfers\",role=\"writer\"}[1m]), 0) / 60" }]
+    "definition": "label_values(k6_vus, testid)",
+    "query": {
+     "qryType": 1,
+     "query": "label_values(k6_vus, testid)",
+     "refId": "A"
     },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "Writer commits/s",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 3 },
-      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "sum(rate(pg_stat_database_xact_commit{datname=\"pgledger\",role=\"writer\"}[1m]))" }]
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "Reader commits/s",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 3 },
-      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "sum(rate(pg_stat_database_xact_commit{datname=\"pgledger\",role=\"reader\"}[1m]))" }]
-    },
-    {
-      "id": 5,
-      "type": "stat",
-      "title": "Writer sessions",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 3 },
-      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value" },
-      "targets": [
-        { "refId": "A", "expr": "sum(pg_stat_activity_count{datname=\"pgledger\",role=\"writer\"})" },
-        { "refId": "B", "expr": "max(pg_settings_max_connections{role=\"writer\"})" }
-      ]
-    },
-    {
-      "id": 6,
-      "type": "stat",
-      "title": "Reader replay lag",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 3 },
-      "fieldConfig": { "defaults": { "unit": "s", "decimals": 2 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(pgledger_replay_replay_lag_seconds{role=\"reader\"})" }]
-    },
-    {
-      "id": 7,
-      "type": "stat",
-      "title": "Transfer rows behind",
-      "description": "Writer transfer count minus reader transfer count.",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 3 },
-      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(pgledger_rows_n{rel=\"transfers\",role=\"writer\"}) - max(pgledger_rows_n{rel=\"transfers\",role=\"reader\"})" }]
-    },
-    {
-      "id": 8,
-      "type": "timeseries",
-      "title": "Transactions / s",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "targets": [
-        { "refId": "A", "expr": "clamp_min(delta(pgledger_rows_n{rel=\"transfers\",role=\"writer\"}[1m]), 0) / 60", "legendFormat": "writer transfers" },
-        { "refId": "B", "expr": "sum(rate(pg_stat_database_xact_commit{datname=\"pgledger\",role=\"writer\"}[1m]))", "legendFormat": "writer commits" },
-        { "refId": "C", "expr": "sum(rate(pg_stat_database_xact_rollback{datname=\"pgledger\",role=\"writer\"}[1m]))", "legendFormat": "writer rollbacks" },
-        { "refId": "D", "expr": "sum(rate(pg_stat_database_xact_commit{datname=\"pgledger\",role=\"reader\"}[1m]))", "legendFormat": "reader commits" }
-      ]
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "Sessions",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
-      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "targets": [
-        { "refId": "A", "expr": "sum(pg_stat_activity_count{datname=\"pgledger\",role=\"writer\"})", "legendFormat": "writer" },
-        { "refId": "B", "expr": "sum(pg_stat_activity_count{datname=\"pgledger\",role=\"writer\",state=\"active\"})", "legendFormat": "writer active" },
-        { "refId": "C", "expr": "sum(pg_stat_activity_count{datname=\"pgledger\",role=\"reader\"})", "legendFormat": "reader" },
-        { "refId": "D", "expr": "max(pg_settings_max_connections{role=\"writer\"})", "legendFormat": "max_connections" }
-      ]
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "Replica lag",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "targets": [
-        { "refId": "A", "expr": "max(pgledger_replay_replay_lag_seconds{role=\"reader\"})", "legendFormat": "reader replay lag" },
-        { "refId": "B", "expr": "max(pgledger_replay_replay_lag_seconds{role=\"writer\"})", "legendFormat": "writer view of replay lag" }
-      ]
-    },
-    {
-      "id": 11,
-      "type": "timeseries",
-      "title": "Deadlocks and cache",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
-      "fieldConfig": {
-        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } },
-        "overrides": [
-          { "matcher": { "id": "byName", "options": "cache hit" }, "properties": [{ "id": "unit", "value": "percentunit" }] }
-        ]
-      },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "targets": [
-        { "refId": "A", "expr": "sum(increase(pg_stat_database_deadlocks{datname=\"pgledger\",role=\"writer\"}[1m]))", "legendFormat": "writer deadlocks" },
-        {
-          "refId": "B",
-          "expr": "sum(rate(pg_stat_database_blks_hit{datname=\"pgledger\",role=\"writer\"}[5m])) / clamp_min(sum(rate(pg_stat_database_blks_hit{datname=\"pgledger\",role=\"writer\"}[5m])) + sum(rate(pg_stat_database_blks_read{datname=\"pgledger\",role=\"writer\"}[5m])), 1)",
-          "legendFormat": "cache hit"
-        }
-      ]
-    },
-    {
-      "id": 12,
-      "type": "text",
-      "title": "",
-      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 23 },
-      "options": {
-        "mode": "markdown",
-        "content": "k6 API TPS. Run `./scripts/k6-cash-stress.sh`. Pick **testid** `deposit-*` or `withdrawal-*`. Panels split deposits / withdrawals / postings (gas reserve+settle)."
-      }
-    },
-    {
-      "id": 13,
-      "type": "stat",
-      "title": "deposits / s",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*deposits\"}[1m]))" }]
-    },
-    {
-      "id": 21,
-      "type": "stat",
-      "title": "withdrawals / s",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*withdrawals\"}[1m]))" }]
-    },
-    {
-      "id": 22,
-      "type": "stat",
-      "title": "postings / s",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*postings\"}[1m]))" }]
-    },
-    {
-      "id": 14,
-      "type": "stat",
-      "title": "p95 deposit",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}) * 1000" }]
-    },
-    {
-      "id": 15,
-      "type": "stat",
-      "title": "p95 withdraw",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 1 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}) * 1000" }]
-    },
-    {
-      "id": 18,
-      "type": "stat",
-      "title": "VUs",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 26 },
-      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] },
-      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [{ "refId": "A", "expr": "max(k6_vus{testid=~\"$testid\"})" }]
-    },
-    {
-      "id": 19,
-      "type": "timeseries",
-      "title": "API TPS by route",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
-      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "targets": [
-        { "refId": "A", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*deposits\"}[1m]))", "legendFormat": "deposits" },
-        { "refId": "B", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*withdrawals\"}[1m]))", "legendFormat": "withdrawals" },
-        { "refId": "C", "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*postings\"}[1m]))", "legendFormat": "postings" }
-      ]
-    },
-    {
-      "id": 20,
-      "type": "timeseries",
-      "title": "API latency p95",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
-      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": true } }, "overrides": [] },
-      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "targets": [
-        { "refId": "A", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}) * 1000", "legendFormat": "deposit p95" },
-        { "refId": "B", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}) * 1000", "legendFormat": "withdraw p95" },
-        { "refId": "C", "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000", "legendFormat": "posting p95" }
-      ]
+    "includeAll": true,
+    "allValue": ".*",
+    "multi": false,
+    "refresh": 2,
+    "sort": 2,
+    "current": {
+     "text": "All",
+     "value": "$__all"
     }
+   }
   ]
+ },
+ "panels": [
+  {
+   "id": 1,
+   "type": "text",
+   "title": "",
+   "gridPos": {
+    "h": 3,
+    "w": 24,
+    "x": 0,
+    "y": 0
+   },
+   "options": {
+    "mode": "markdown",
+    "content": "Postgres is scraped every 5s. **Transfers/s** is new `pgledger_transfers` rows. **Commits/s** is every transaction, including the exporter. k6 HTTP panels fill when you remote-write a run. Widen the range if a panel is empty."
+   }
+  },
+  {
+   "id": 2,
+   "type": "stat",
+   "title": "Writer transfers/s",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 3
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "clamp_min(delta(pgledger_rows_n{rel=\"transfers\",role=\"writer\"}[1m]), 0) / 60"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "type": "stat",
+   "title": "Writer commits/s",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 3
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(pg_stat_database_xact_commit{datname=\"pgledger\",role=\"writer\"}[1m]))"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "stat",
+   "title": "Reader commits/s",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 3
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(pg_stat_database_xact_commit{datname=\"pgledger\",role=\"reader\"}[1m]))"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Writer sessions",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 3
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    },
+    "textMode": "value"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(pg_stat_activity_count{datname=\"pgledger\",role=\"writer\"})"
+    },
+    {
+     "refId": "B",
+     "expr": "max(pg_settings_max_connections{role=\"writer\"})"
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type": "stat",
+   "title": "Reader replay lag",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 3
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "decimals": 2
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(pgledger_replay_replay_lag_seconds{role=\"reader\"})"
+    }
+   ]
+  },
+  {
+   "id": 7,
+   "type": "stat",
+   "title": "Transfer rows behind",
+   "description": "Writer transfer count minus reader transfer count.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 3
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(pgledger_rows_n{rel=\"transfers\",role=\"writer\"}) - max(pgledger_rows_n{rel=\"transfers\",role=\"reader\"})"
+    }
+   ]
+  },
+  {
+   "id": 8,
+   "type": "timeseries",
+   "title": "Transactions / s",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 7
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 10,
+      "spanNulls": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "clamp_min(delta(pgledger_rows_n{rel=\"transfers\",role=\"writer\"}[1m]), 0) / 60",
+     "legendFormat": "writer transfers"
+    },
+    {
+     "refId": "B",
+     "expr": "sum(rate(pg_stat_database_xact_commit{datname=\"pgledger\",role=\"writer\"}[1m]))",
+     "legendFormat": "writer commits"
+    },
+    {
+     "refId": "C",
+     "expr": "sum(rate(pg_stat_database_xact_rollback{datname=\"pgledger\",role=\"writer\"}[1m]))",
+     "legendFormat": "writer rollbacks"
+    },
+    {
+     "refId": "D",
+     "expr": "sum(rate(pg_stat_database_xact_commit{datname=\"pgledger\",role=\"reader\"}[1m]))",
+     "legendFormat": "reader commits"
+    }
+   ]
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Sessions",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 7
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 10,
+      "spanNulls": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(pg_stat_activity_count{datname=\"pgledger\",role=\"writer\"})",
+     "legendFormat": "writer"
+    },
+    {
+     "refId": "B",
+     "expr": "sum(pg_stat_activity_count{datname=\"pgledger\",role=\"writer\",state=\"active\"})",
+     "legendFormat": "writer active"
+    },
+    {
+     "refId": "C",
+     "expr": "sum(pg_stat_activity_count{datname=\"pgledger\",role=\"reader\"})",
+     "legendFormat": "reader"
+    },
+    {
+     "refId": "D",
+     "expr": "max(pg_settings_max_connections{role=\"writer\"})",
+     "legendFormat": "max_connections"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Replica lag",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 15
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 10,
+      "spanNulls": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(pgledger_replay_replay_lag_seconds{role=\"reader\"})",
+     "legendFormat": "reader replay lag"
+    },
+    {
+     "refId": "B",
+     "expr": "max(pgledger_replay_replay_lag_seconds{role=\"writer\"})",
+     "legendFormat": "writer view of replay lag"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "Deadlocks and cache",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 15
+   },
+   "fieldConfig": {
+    "defaults": {
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 10,
+      "spanNulls": true
+     }
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "cache hit"
+      },
+      "properties": [
+       {
+        "id": "unit",
+        "value": "percentunit"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(increase(pg_stat_database_deadlocks{datname=\"pgledger\",role=\"writer\"}[1m]))",
+     "legendFormat": "writer deadlocks"
+    },
+    {
+     "refId": "B",
+     "expr": "sum(rate(pg_stat_database_blks_hit{datname=\"pgledger\",role=\"writer\"}[5m])) / clamp_min(sum(rate(pg_stat_database_blks_hit{datname=\"pgledger\",role=\"writer\"}[5m])) + sum(rate(pg_stat_database_blks_read{datname=\"pgledger\",role=\"writer\"}[5m])), 1)",
+     "legendFormat": "cache hit"
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "type": "text",
+   "title": "",
+   "gridPos": {
+    "h": 3,
+    "w": 24,
+    "x": 0,
+    "y": 23
+   },
+   "options": {
+    "mode": "markdown",
+    "content": "k6 API TPS. Run `./scripts/k6-cash-stress.sh`. Pick **testid** `deposit-*` or `withdrawal-*`. Panels split deposits / withdrawals / postings (gas reserve+settle)."
+   }
+  },
+  {
+   "id": 13,
+   "type": "stat",
+   "title": "deposits / s",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 0,
+    "y": 26
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*deposits\"}[1m]))"
+    }
+   ]
+  },
+  {
+   "id": 21,
+   "type": "stat",
+   "title": "withdrawals / s",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 4,
+    "y": 26
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*withdrawals\"}[1m]))"
+    }
+   ]
+  },
+  {
+   "id": 22,
+   "type": "stat",
+   "title": "postings / s",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 8,
+    "y": 26
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*postings\"}[1m]))"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "stat",
+   "title": "p95 deposit",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 12,
+    "y": 26
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}) * 1000"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "type": "stat",
+   "title": "p95 withdraw",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 16,
+    "y": 26
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "decimals": 1
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "area",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}) * 1000"
+    }
+   ]
+  },
+  {
+   "id": 18,
+   "type": "stat",
+   "title": "VUs",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 4,
+    "w": 4,
+    "x": 20,
+    "y": 26
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "none",
+     "decimals": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ]
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(k6_vus{testid=~\"$testid\"})"
+    }
+   ]
+  },
+  {
+   "id": 19,
+   "type": "timeseries",
+   "title": "API TPS by route",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 30
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 10,
+      "spanNulls": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*deposits\"}[1m]))",
+     "legendFormat": "deposits"
+    },
+    {
+     "refId": "B",
+     "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*withdrawals\"}[1m]))",
+     "legendFormat": "withdrawals"
+    },
+    {
+     "refId": "C",
+     "expr": "sum(rate(k6_http_reqs_total{testid=~\"$testid\", name=~\".*postings\"}[1m]))",
+     "legendFormat": "postings"
+    }
+   ]
+  },
+  {
+   "id": 20,
+   "type": "timeseries",
+   "title": "API latency p95",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 30
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 10,
+      "spanNulls": true
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "deposit p95"
+    },
+    {
+     "refId": "B",
+     "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "withdraw p95"
+    },
+    {
+     "refId": "C",
+     "expr": "max(k6_http_req_duration_p95{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "posting p95"
+    }
+   ]
+  },
+  {
+   "id": 23,
+   "type": "timeseries",
+   "title": "API latency deposit (min/max/mean/p95)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 0,
+    "y": 38
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 5,
+      "spanNulls": true,
+      "lineInterpolation": "linear"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "min(k6_http_req_duration_min{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "min"
+    },
+    {
+     "refId": "B",
+     "expr": "max(k6_http_req_duration_max{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "max"
+    },
+    {
+     "refId": "C",
+     "expr": "(sum(rate(k6_http_req_duration_sum{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}[2m])) / clamp_min(sum(rate(k6_http_req_duration_count{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}[2m])), 0.001)) * 1000",
+     "legendFormat": "mean"
+    },
+    {
+     "refId": "D",
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(k6_http_req_duration_bucket{testid=~\"$testid\", name=~\".*deposits\", expected_response=\"true\"}[2m]))) * 1000",
+     "legendFormat": "p95"
+    }
+   ]
+  },
+  {
+   "id": 24,
+   "type": "timeseries",
+   "title": "API latency withdraw (min/max/mean/p95)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 38
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 5,
+      "spanNulls": true,
+      "lineInterpolation": "linear"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "min(k6_http_req_duration_min{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "min"
+    },
+    {
+     "refId": "B",
+     "expr": "max(k6_http_req_duration_max{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "max"
+    },
+    {
+     "refId": "C",
+     "expr": "(sum(rate(k6_http_req_duration_sum{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}[2m])) / clamp_min(sum(rate(k6_http_req_duration_count{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}[2m])), 0.001)) * 1000",
+     "legendFormat": "mean"
+    },
+    {
+     "refId": "D",
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(k6_http_req_duration_bucket{testid=~\"$testid\", name=~\".*withdrawals\", expected_response=\"true\"}[2m]))) * 1000",
+     "legendFormat": "p95"
+    }
+   ]
+  },
+  {
+   "id": 25,
+   "type": "timeseries",
+   "title": "API latency posting (min/max/mean/p95)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 38
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ms",
+     "custom": {
+      "drawStyle": "line",
+      "fillOpacity": 5,
+      "spanNulls": true,
+      "lineInterpolation": "linear"
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi"
+    }
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "min(k6_http_req_duration_min{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "min"
+    },
+    {
+     "refId": "B",
+     "expr": "max(k6_http_req_duration_max{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}) * 1000",
+     "legendFormat": "max"
+    },
+    {
+     "refId": "C",
+     "expr": "(sum(rate(k6_http_req_duration_sum{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}[2m])) / clamp_min(sum(rate(k6_http_req_duration_count{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}[2m])), 0.001)) * 1000",
+     "legendFormat": "mean"
+    },
+    {
+     "refId": "D",
+     "expr": "histogram_quantile(0.95, sum by (le) (rate(k6_http_req_duration_bucket{testid=~\"$testid\", name=~\".*postings\", expected_response=\"true\"}[2m]))) * 1000",
+     "legendFormat": "p95"
+    }
+   ]
+  }
+ ]
 }
