@@ -119,6 +119,7 @@ public class LedgerReadService {
         int bizTypeId = row.bizTypeId();
         return new Transfer(
                 row.transferId(),
+                row.transferSeq() == null ? 0L : row.transferSeq().longValue(),
                 row.fromAccountId(),
                 row.fromBalanceTypeId(),
                 row.toAccountId(),
@@ -151,6 +152,7 @@ public class LedgerReadService {
     private static Transfer withEntries(Transfer transfer, List<Entry> entries) {
         return new Transfer(
                 transfer.id(),
+                transfer.seq(),
                 transfer.fromAccountId(),
                 transfer.fromBalanceType(),
                 transfer.toAccountId(),

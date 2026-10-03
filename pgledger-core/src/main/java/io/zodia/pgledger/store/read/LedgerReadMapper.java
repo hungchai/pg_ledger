@@ -145,6 +145,7 @@ public interface LedgerReadMapper {
             SELECT
                 page.total_count,
                 t.id AS transfer_id,
+                t.seq AS transfer_seq,
                 fa.account_id AS from_account_id,
                 fa.balance_type_id AS from_balance_type_id,
                 ta.account_id AS to_account_id,
@@ -182,6 +183,7 @@ public interface LedgerReadMapper {
     @ConstructorArgs({
             @Arg(column = "total_count", javaType = long.class),
             @Arg(column = "transfer_id", javaType = String.class),
+            @Arg(column = "transfer_seq", javaType = Long.class),
             @Arg(column = "from_account_id", javaType = String.class),
             @Arg(column = "from_balance_type_id", javaType = int.class),
             @Arg(column = "to_account_id", javaType = String.class),
@@ -213,6 +215,7 @@ public interface LedgerReadMapper {
     record JournalRow(
             long totalCount,
             String transferId,
+            Long transferSeq,
             String fromAccountId,
             int fromBalanceTypeId,
             String toAccountId,

@@ -1,12 +1,14 @@
 package io.zodia.pgledger.store;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.BalanceSnapshot;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.Entry;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.SnapshotMovement;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.read.LedgerReadSql;
 
@@ -47,6 +49,20 @@ public final class PostgresLedgerStore implements LedgerStore {
     private static final String CREATE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
             + " FROM pgledger_create_account(?, ?, ?, ?, CAST(? AS jsonb), ?)";
     private static final String ENSURE_BANK_POOL = "SELECT pgledger_ensure_bank_pool(?, ?, ?, ?, ?)";
+    private static final String CUT_SNAPSHOT = "SELECT pgledger_cut_balance_snapshot(?)";
+    private static final String SNAPSHOTS = """
+            SELECT s.snapshot_hour, a.account_id, bt.code AS balance_type, c.code AS currency,
+                   ac.code AS account_class, s.year, s.month, s.day, s.hour,
+                   s.balance, s.previous_balance, s.version, s.deleted
+            FROM pgledger_balance_snapshots s
+            JOIN pgledger_accounts a ON a.id = s.account_pk
+            JOIN pgledger_balance_types bt ON bt.id = s.balance_type_id
+            JOIN pgledger_currencies c ON c.id = s.currency_id
+            JOIN pgledger_account_classes ac ON ac.id = s.account_class_id
+            WHERE s.snapshot_hour = ?
+            ORDER BY a.account_id, bt.code, c.code
+            """;
+    private static final String SNAPSHOT_MOVEMENTS = "SELECT * FROM pgledger_snapshot_movements(?, ?)";
     private static final String DELETE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
             + " FROM pgledger_delete_account(?, ?, ?)";
     private static final String ACCOUNT_ID_COLUMNS = """
@@ -75,6 +91,7 @@ public final class PostgresLedgerStore implements LedgerStore {
     private static final String LOAD_TRANSFER = """
             SELECT
                 t.id AS transfer_id,
+                t.seq AS transfer_seq,
                 fa.account_id AS from_account_id,
                 fa.balance_type_id AS from_balance_type_id,
                 ta.account_id AS to_account_id,
@@ -106,6 +123,7 @@ public final class PostgresLedgerStore implements LedgerStore {
     private static final String LOAD_TRANSFERS_BY_REQUEST = """
             SELECT
                 t.id AS transfer_id,
+                t.seq AS transfer_seq,
                 fa.account_id AS from_account_id,
                 fa.balance_type_id AS from_balance_type_id,
                 ta.account_id AS to_account_id,
@@ -371,6 +389,86 @@ public final class PostgresLedgerStore implements LedgerStore {
     }
 
     @Override
+    public long cutBalanceSnapshot(Instant hour) {
+        if (hour == null) {
+            throw new LedgerViolation("snapshot hour is required");
+        }
+        return write(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(CUT_SNAPSHOT)) {
+                ps.setTimestamp(1, Timestamp.from(hour));
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new LedgerException("pgledger_cut_balance_snapshot returned no row");
+                    }
+                    return rs.getLong(1);
+                }
+            }
+        });
+    }
+
+    @Override
+    public List<BalanceSnapshot> snapshots(Instant hour) {
+        if (hour == null) {
+            throw new LedgerViolation("snapshot hour is required");
+        }
+        return read(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(SNAPSHOTS)) {
+                ps.setTimestamp(1, Timestamp.from(hour));
+                try (ResultSet rs = ps.executeQuery()) {
+                    ArrayList<BalanceSnapshot> rows = new ArrayList<>();
+                    while (rs.next()) {
+                        rows.add(new BalanceSnapshot(
+                                instant(rs, "snapshot_hour"),
+                                rs.getString("account_id"),
+                                rs.getString("balance_type"),
+                                rs.getString("currency"),
+                                rs.getString("account_class"),
+                                rs.getInt("year"),
+                                rs.getInt("month"),
+                                rs.getInt("day"),
+                                rs.getInt("hour"),
+                                rs.getBigDecimal("balance"),
+                                rs.getBigDecimal("previous_balance"),
+                                rs.getLong("version"),
+                                rs.getBoolean("deleted")));
+                    }
+                    return List.copyOf(rows);
+                }
+            }
+        });
+    }
+
+    @Override
+    public List<SnapshotMovement> snapshotMovements(Instant fromHour, Instant toHour) {
+        if (fromHour == null) {
+            throw new LedgerViolation("from hour is required");
+        }
+        return read(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(SNAPSHOT_MOVEMENTS)) {
+                ps.setTimestamp(1, Timestamp.from(fromHour));
+                if (toHour == null) {
+                    ps.setNull(2, Types.TIMESTAMP);
+                } else {
+                    ps.setTimestamp(2, Timestamp.from(toHour));
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    ArrayList<SnapshotMovement> rows = new ArrayList<>();
+                    while (rs.next()) {
+                        rows.add(new SnapshotMovement(
+                                rs.getString("balance_type"),
+                                rs.getString("currency"),
+                                rs.getString("account_class"),
+                                rs.getBigDecimal("opening_balance"),
+                                rs.getBigDecimal("closing_balance"),
+                                rs.getBigDecimal("movement")));
+                    }
+                    return List.copyOf(rows);
+                }
+            }
+        });
+    }
+
+    @Override
     public void close() {
     }
 
@@ -594,6 +692,7 @@ public final class PostgresLedgerStore implements LedgerStore {
         int bizTypeId = rs.getInt("biz_type_id");
         return new Transfer(
                 id,
+                rs.getLong("transfer_seq"),
                 rs.getString("from_account_id"),
                 rs.getInt("from_balance_type_id"),
                 rs.getString("to_account_id"),
@@ -611,6 +710,7 @@ public final class PostgresLedgerStore implements LedgerStore {
     private static Transfer withEntries(Transfer transfer, List<Entry> entries) {
         return new Transfer(
                 transfer.id(),
+                transfer.seq(),
                 transfer.fromAccountId(),
                 transfer.fromBalanceType(),
                 transfer.toAccountId(),

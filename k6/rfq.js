@@ -29,6 +29,7 @@ const rfqAmounts = {
 };
 
 export const options = {
+  setupTimeout: '30m',
   scenarios: {
     rfq: {
       executor: 'constant-vus',

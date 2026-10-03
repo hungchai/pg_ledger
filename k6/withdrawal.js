@@ -30,6 +30,7 @@ const reportPath = __ENV.REPORT_PATH || 'reports/latest/02-withdrawal.txt';
 const fundRounds = Number(__ENV.FUND_ROUNDS || 30);
 
 export const options = {
+  setupTimeout: '30m',
   scenarios: {
     withdrawals: {
       executor: 'constant-vus',

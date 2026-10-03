@@ -1,6 +1,7 @@
 package io.zodia.pgledger;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.BalanceSnapshot;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
 import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
@@ -9,6 +10,7 @@ import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
 import io.zodia.pgledger.api.LedgerApi.PostingBatch;
 import io.zodia.pgledger.api.LedgerApi.PostingLeg;
+import io.zodia.pgledger.api.LedgerApi.SnapshotMovement;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerStore;
 import io.zodia.pgledger.store.LedgerViolation;
@@ -18,6 +20,7 @@ import org.postgresql.ds.PGSimpleDataSource;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -271,6 +274,33 @@ public final class PgLedger implements AutoCloseable {
             throw new IllegalArgumentException("page and size");
         }
         return reader.journals(page, size);
+    }
+
+    /** Cuts the hourly snapshot on the writer (must be a full UTC hour). */
+    public long cutBalanceSnapshot(Instant hour) {
+        if (hour == null) {
+            throw new LedgerViolation("snapshot hour is required");
+        }
+        if (hour.getEpochSecond() % 3600 != 0) {
+            throw new LedgerViolation("snapshot hour must be a full UTC hour (minute and second 0)");
+        }
+        return writer.cutBalanceSnapshot(hour);
+    }
+
+    /** Snapshot rows for one hour, read from the reader. */
+    public List<BalanceSnapshot> snapshots(Instant hour) {
+        if (hour == null) {
+            throw new LedgerViolation("snapshot hour is required");
+        }
+        return reader.snapshots(hour);
+    }
+
+    /** Movement between snapshot hours; toHour null = latest, from the reader. */
+    public List<SnapshotMovement> snapshotMovements(Instant fromHour, Instant toHour) {
+        if (fromHour == null) {
+            throw new LedgerViolation("from hour is required");
+        }
+        return reader.snapshotMovements(fromHour, toHour);
     }
 
     @Override

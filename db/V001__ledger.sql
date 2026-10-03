@@ -94,9 +94,12 @@ BEGIN
 END
 $$ LANGUAGE plpgsql VOLATILE;
 
-CREATE OR REPLACE FUNCTION pgledger_generate_id(prefix TEXT) RETURNS TEXT
+-- Internal ids are plain ULID text (uuidv7 -> 26-char Crockford base32):
+-- lexicographic order equals time order, so ORDER BY id is a time sort.
+-- The entity type is clear from the table / log context; no prefix needed.
+CREATE OR REPLACE FUNCTION pgledger_generate_id() RETURNS TEXT
 AS $$
-    SELECT prefix || '_' || uuid_to_ulid(pgledger_uuidv7())
+    SELECT uuid_to_ulid(pgledger_uuidv7())
 $$ LANGUAGE sql VOLATILE;
 
 
@@ -202,7 +205,7 @@ SELECT setval(
 );
 
 CREATE TABLE IF NOT EXISTS pgledger_accounts (
-    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pgla'),
+    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id(),
     account_id TEXT NOT NULL,
     balance_type_id INT NOT NULL,
     name TEXT NOT NULL,
@@ -224,7 +227,8 @@ CREATE INDEX IF NOT EXISTS pgledger_accounts_account_class_id_idx ON pgledger_ac
 CREATE INDEX IF NOT EXISTS pgledger_accounts_balance_currency_idx ON pgledger_accounts (balance_type_id, currency_id);
 
 CREATE TABLE IF NOT EXISTS pgledger_transfers (
-    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pglt'),
+    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id(),
+    seq BIGINT,
     from_account_id TEXT NOT NULL,
     to_account_id TEXT NOT NULL,
     amount NUMERIC NOT NULL,
@@ -236,6 +240,20 @@ CREATE TABLE IF NOT EXISTS pgledger_transfers (
     CHECK (amount > 0 AND from_account_id != to_account_id)
 );
 
+-- Global ledger order. Holes are normal (CACHE), order is not. Written once at
+-- insert; never updated. Replay/reconciliation cursors key off this column.
+CREATE SEQUENCE IF NOT EXISTS pgledger_transfer_seq CACHE 64;
+
+-- Backfill rows written before the column existed, then make it NOT NULL and
+-- unique so seq doubles as a stable cursor. Idempotent for existing volumes.
+UPDATE pgledger_transfers
+SET seq = nextval('pgledger_transfer_seq')
+WHERE seq IS NULL
+  AND id IN (SELECT id FROM pgledger_transfers WHERE seq IS NULL ORDER BY created_at, id FOR UPDATE);
+
+CREATE UNIQUE INDEX IF NOT EXISTS pgledger_transfers_seq_key ON pgledger_transfers (seq);
+ALTER TABLE pgledger_transfers ALTER COLUMN seq SET DEFAULT nextval('pgledger_transfer_seq');
+
 CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_idx ON pgledger_transfers (request_id);
 CREATE INDEX IF NOT EXISTS pgledger_transfers_biz_type_id_idx ON pgledger_transfers (biz_type_id);
 CREATE INDEX IF NOT EXISTS pgledger_transfers_from_account_id_idx ON pgledger_transfers (from_account_id);
@@ -244,7 +262,7 @@ CREATE INDEX IF NOT EXISTS pgledger_transfers_event_at_idx ON pgledger_transfers
 CREATE INDEX IF NOT EXISTS pgledger_transfers_created_at_idx ON pgledger_transfers (created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS pgledger_entries (
-    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id('pgle'),
+    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id(),
     account_id TEXT NOT NULL,
     transfer_id TEXT NOT NULL,
     amount NUMERIC NOT NULL,
@@ -256,6 +274,34 @@ CREATE TABLE IF NOT EXISTS pgledger_entries (
 
 CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries (account_id);
 CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries (transfer_id);
+
+-- Hourly balance snapshots, always cut on UTC hour boundaries. One row per
+-- (snapshot_hour, account row). previous_balance is the closing balance of the
+-- prior snapshot for the same row (0 when none), so net movement over any
+-- span is SUM(balance - previous_balance) between the two boundary hours.
+CREATE TABLE IF NOT EXISTS pgledger_balance_snapshots (
+    snapshot_hour TIMESTAMPTZ NOT NULL,
+    account_pk TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    balance_type_id INT NOT NULL,
+    currency_id INT NOT NULL,
+    account_class_id INT NOT NULL,
+    year INT NOT NULL,
+    month INT NOT NULL,
+    day INT NOT NULL,
+    hour INT NOT NULL,
+    balance NUMERIC NOT NULL,
+    previous_balance NUMERIC NOT NULL,
+    version BIGINT NOT NULL,
+    deleted BOOLEAN NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (snapshot_hour, account_pk)
+);
+
+CREATE INDEX IF NOT EXISTS pgledger_balance_snapshots_dims_idx
+    ON pgledger_balance_snapshots (snapshot_hour, balance_type_id, currency_id, account_class_id);
+CREATE INDEX IF NOT EXISTS pgledger_balance_snapshots_account_idx
+    ON pgledger_balance_snapshots (account_id, snapshot_hour DESC);
 
 -- The old view had no flag columns. Functions with the old
 -- pgledger_create_balance_type signature depend on that shape, so drop it with
@@ -322,6 +368,7 @@ ALTER TABLE pgledger_accounts DROP COLUMN IF EXISTS allow_positive_balance;
 CREATE OR REPLACE VIEW pgledger_transfers_view AS
 SELECT
     t.id,
+    t.seq,
     t.from_account_id,
     t.to_account_id,
     t.amount,

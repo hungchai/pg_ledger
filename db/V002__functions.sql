@@ -442,9 +442,10 @@ BEGIN
         PERFORM pgledger_check_account_balance_constraints(to_row);
 
         INSERT INTO pgledger_transfers (
-            from_account_id, to_account_id, amount, created_at, event_at, request_id, biz_type_id, biz_reference
+            seq, from_account_id, to_account_id, amount, created_at, event_at, request_id, biz_type_id, biz_reference
         )
         VALUES (
+            nextval('pgledger_transfer_seq'),
             from_row.id, to_row.id, req.amount, now(), coalesce(p_event_at, now()),
             v_request_id, v_biz_type_id, v_biz_reference
         )
@@ -777,4 +778,153 @@ BEGIN
     SELECT * FROM pgledger_accounts_view WHERE id = v_id;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ---------------------------------------------------------------- snapshots --
+
+-- Cuts an hourly snapshot for the given UTC hour (must be :00, seconds 0).
+-- One row per live account balance row; previous_balance comes from the last
+-- earlier snapshot of the same account_pk. Safe to re-run for the same hour:
+-- existing rows for that hour are replaced inside one transaction.
+CREATE OR REPLACE FUNCTION pgledger_cut_balance_snapshot(p_hour TIMESTAMPTZ)
+RETURNS BIGINT
+AS $$
+DECLARE
+    v_hour TIMESTAMPTZ := date_trunc('hour', p_hour);
+    v_count BIGINT;
+BEGIN
+    IF date_trunc('hour', v_hour) <> v_hour THEN
+        RAISE EXCEPTION 'snapshot hour must be a full hour';
+    END IF;
+
+    CREATE TEMP TABLE pgledger_snapshot_cut ON COMMIT DROP AS
+    SELECT a.id AS account_pk,
+           a.balance,
+           a.version,
+           COALESCE(prev.previous_balance, 0) AS previous_balance
+    FROM pgledger_accounts a
+    LEFT JOIN LATERAL (
+        SELECT s.balance AS previous_balance
+        FROM pgledger_balance_snapshots s
+        WHERE s.account_pk = a.id
+          AND s.snapshot_hour < v_hour
+        ORDER BY s.snapshot_hour DESC
+        LIMIT 1
+    ) prev ON TRUE
+    WHERE NOT a.deleted;
+
+    DELETE FROM pgledger_balance_snapshots WHERE snapshot_hour = v_hour;
+
+    INSERT INTO pgledger_balance_snapshots (
+        snapshot_hour, account_pk, account_id, balance_type_id, currency_id,
+        account_class_id, year, month, day, hour,
+        balance, previous_balance, version, deleted, created_at
+    )
+    SELECT v_hour,
+           cut.account_pk,
+           a.account_id,
+           a.balance_type_id,
+           a.currency_id,
+           a.account_class_id,
+           EXTRACT(YEAR FROM v_hour AT TIME ZONE 'UTC')::int,
+           EXTRACT(MONTH FROM v_hour AT TIME ZONE 'UTC')::int,
+           EXTRACT(DAY FROM v_hour AT TIME ZONE 'UTC')::int,
+           EXTRACT(HOUR FROM v_hour AT TIME ZONE 'UTC')::int,
+           cut.balance,
+           cut.previous_balance,
+           cut.version,
+           FALSE,
+           now()
+    FROM pgledger_snapshot_cut cut
+    JOIN pgledger_accounts a ON a.id = cut.account_pk;
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Net balance movement per (balance type, currency, account class) between two
+-- snapshot hours. from_hour is the opening boundary (exclusive base), to_hour
+-- the closing boundary. A NULL to_hour uses the latest snapshot hour.
+-- movement = SUM(balance - previous_balance) over snapshot hours in
+-- (from_hour, to_hour]. Every touched account row appears with delta 0 when it
+-- only existed before from_hour, so the sums close against real balances.
+CREATE OR REPLACE FUNCTION pgledger_snapshot_movements(
+    p_from_hour TIMESTAMPTZ,
+    p_to_hour TIMESTAMPTZ DEFAULT NULL
+)
+RETURNS TABLE (
+    balance_type TEXT,
+    currency TEXT,
+    account_class TEXT,
+    opening_balance NUMERIC,
+    closing_balance NUMERIC,
+    movement NUMERIC
+)
+AS $$
+DECLARE
+    v_to TIMESTAMPTZ;
+BEGIN
+    IF p_to_hour IS NULL THEN
+        SELECT MAX(snapshot_hour) INTO v_to FROM pgledger_balance_snapshots;
+    ELSE
+        v_to := date_trunc('hour', p_to_hour);
+    END IF;
+    IF v_to IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    WITH span AS (
+        SELECT s.*
+        FROM pgledger_balance_snapshots s
+        WHERE s.snapshot_hour > date_trunc('hour', p_from_hour)
+          AND s.snapshot_hour <= v_to
+    ),
+    opening AS (
+        SELECT s.account_pk, s.balance
+        FROM pgledger_balance_snapshots s
+        WHERE s.snapshot_hour = (
+            SELECT MAX(snapshot_hour) FROM pgledger_balance_snapshots
+            WHERE snapshot_hour <= date_trunc('hour', p_from_hour)
+        )
+    ),
+    closing AS (
+        SELECT DISTINCT ON (s.account_pk) s.account_pk, s.balance
+        FROM pgledger_balance_snapshots s
+        WHERE s.snapshot_hour <= v_to
+        ORDER BY s.account_pk, s.snapshot_hour DESC
+    ),
+    totals AS (
+        SELECT
+            s.balance_type_id,
+            s.currency_id,
+            s.account_class_id,
+            SUM(s.balance - s.previous_balance) AS movement,
+            SUM(CASE WHEN s.snapshot_hour = (
+                    SELECT MIN(snapshot_hour) FROM span) THEN s.previous_balance ELSE 0 END) AS first_prev,
+            SUM(CASE WHEN s.snapshot_hour = v_to THEN s.balance ELSE 0 END) AS last_balance
+        FROM span s
+        GROUP BY s.balance_type_id, s.currency_id, s.account_class_id
+    )
+    SELECT bt.code,
+           c.code,
+           ac.code,
+           COALESCE(open_tot.opening, 0),
+           COALESCE(tot.last_balance, open_tot.opening, 0),
+           COALESCE(tot.movement, 0)
+    FROM totals tot
+    JOIN pgledger_balance_types bt ON bt.id = tot.balance_type_id
+    JOIN pgledger_currencies c ON c.id = tot.currency_id
+    JOIN pgledger_account_classes ac ON ac.id = tot.account_class_id
+    LEFT JOIN LATERAL (
+        SELECT SUM(o.balance) AS opening
+        FROM opening o
+        JOIN pgledger_accounts a ON a.id = o.account_pk
+        WHERE a.balance_type_id = tot.balance_type_id
+          AND a.currency_id = tot.currency_id
+          AND a.account_class_id = tot.account_class_id
+    ) open_tot ON TRUE
+    ORDER BY bt.code, c.code, ac.code;
+END;
+$$ LANGUAGE plpgsql STABLE;
 

@@ -101,7 +101,7 @@ INSERT INTO pgledger_biz_types (code, name) VALUES ('COIN_DEPOSIT', 'Coin deposi
 
 ### `pgledger_accounts`
 
-- `id` — internal PK (`pgla_...`). Transfers and entries store this id.
+- `id` — internal PK (ULID text, time-ordered). Transfers and entries store this id.
 - `account_id` — caller business id.
 - One row = one balance: unique `(account_id, balance_type_id, currency_id)`.
 
@@ -119,7 +119,7 @@ Sign policy lives on `pgledger_balance_types`. `pgledger_accounts_view` returns 
 
 ### `pgledger_transfers`
 
-- `id` — `pglt_...`
+- `id` — ULID text, time-ordered; `seq` — global ledger order
 - `from_account_id` / `to_account_id` — internal `pgledger_accounts.id`, not business `account_id`
 - `amount` — unbounded `NUMERIC`, must be positive; sides must differ
 
@@ -134,7 +134,7 @@ Sign policy lives on `pgledger_balance_types`. `pgledger_accounts_view` returns 
 
 ### `pgledger_entries`
 
-- `id` — `pgle_...`
+- `id` — ULID text, time-ordered
 - Two rows per transfer
 - `account_id` / `transfer_id` — internal ids
 - `amount` — unbounded `NUMERIC`; negative on debit, positive on credit

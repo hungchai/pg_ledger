@@ -99,6 +99,14 @@ public final class PgLedgerClient implements AutoCloseable {
         return readList(ok(exchange("GET", "/api/v1/accounts/" + encode(accountId) + "/balances", null)), Account.class);
     }
 
+    /** All balance rows for the account, optionally narrowed by type and/or currency. */
+    public List<Account> balances(String accountId, String balanceType, String currency) {
+        String path = "/api/v1/balances?" + query("accountId", accountId,
+                "balanceType", balanceType == null ? "" : balanceType,
+                "currency", currency == null ? "" : currency);
+        return readList(ok(exchange("GET", path, null)), Account.class);
+    }
+
     public Account balance(String accountId, String balanceType, String currency) {
         String path = "/api/v1/balances?" + query(
                 "accountId", accountId,
@@ -209,7 +217,10 @@ public final class PgLedgerClient implements AutoCloseable {
     private static String query(String... pairs) {
         StringBuilder text = new StringBuilder(96);
         for (int i = 0; i < pairs.length; i += 2) {
-            if (i > 0) {
+            if (pairs[i + 1] == null || pairs[i + 1].isEmpty()) {
+                continue;
+            }
+            if (text.length() > 0) {
                 text.append('&');
             }
             text.append(encode(pairs[i])).append('=').append(encode(pairs[i + 1]));

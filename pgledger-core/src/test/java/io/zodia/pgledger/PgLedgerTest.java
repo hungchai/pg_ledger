@@ -1,12 +1,14 @@
 package io.zodia.pgledger;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.BalanceSnapshot;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
 import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.SnapshotMovement;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerViolation;
 import io.zodia.pgledger.store.PostgresLedgerStore;
@@ -24,6 +26,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -601,6 +604,98 @@ class PgLedgerTest {
             assertEquals(1, nonzero(shards));
             assertEquals(0, total.negate().compareTo(ledger.bankPosition(type, "USD")));
         }
+    }
+
+    @Test
+    @Timeout(60)
+    void hourlySnapshotsTrackBalancesAndMovements() throws Exception {
+        try (Nodes nodes = new Nodes()) {
+            PgLedger ledger = nodes.ledger;
+            String prefix = id("SNP");
+            String available = prefix + "A";
+            String client = prefix + "C";
+            String other = prefix + "O";
+            String company = prefix + "CO";
+            ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
+            ledger.createAccount(new CreateAccount(company, available, "USD", company, null, "BANK"));
+            ledger.createAccount(account(client, available, "USD"));
+            ledger.createAccount(account(other, available, "USD"));
+
+            // Work inside two consecutive full UTC hours.
+            Instant hour1 = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.HOURS)
+                    .minusSeconds(7200);
+            Instant hour2 = hour1.plusSeconds(3600);
+
+            ledger.post(posting(company, available, client, available, "USD", "100"));
+            long cut1 = ledger.cutBalanceSnapshot(hour1);
+            assertEquals(3, cut1); // company + client + other
+
+            // Activity between the two cuts: bank funds client, client pays other.
+            Transfer first = ledger.post(posting(company, available, client, available, "USD", "50"));
+            Transfer second = ledger.post(posting(client, available, other, available, "USD", "30"));
+            // Global ledger order: seq increases in commit order.
+            assertTrue(second.seq() > first.seq());
+            long cut2 = ledger.cutBalanceSnapshot(hour2);
+            assertEquals(3, cut2);
+
+            // Rows carry UTC calendar fields of their hour and prior closing balance.
+            List<BalanceSnapshot> snap2 = ledger.snapshots(hour2);
+            assertEquals(3, snap2.size());
+            BalanceSnapshot clientRow = snapshotFor(snap2, client);
+            assertEquals(hour2, clientRow.snapshotHour());
+            assertEquals(hour2.atZone(java.time.ZoneOffset.UTC).getYear(), clientRow.year());
+            assertEquals(hour2.atZone(java.time.ZoneOffset.UTC).getMonthValue(), clientRow.month());
+            assertEquals(hour2.atZone(java.time.ZoneOffset.UTC).getDayOfMonth(), clientRow.day());
+            assertEquals(hour2.atZone(java.time.ZoneOffset.UTC).getHour(), clientRow.hour());
+            // 100 (hour1 close) + 50 - 30
+            assertEquals(0, new BigDecimal("120").compareTo(clientRow.balance()));
+            assertEquals(0, new BigDecimal("100").compareTo(clientRow.previousBalance()));
+
+            // Movement 4pm-to-4pm style: net change between two snapshot hours.
+            List<SnapshotMovement> moves = ledger.snapshotMovements(hour1, hour2);
+            // client +20, other +30 -> CLIENT group nets +50; COMPANY (BANK) -50.
+            SnapshotMovement row = movementFor(moves, available, "USD", "CLIENT");
+            assertEquals(0, new BigDecimal("50").compareTo(row.movement()));
+            assertEquals(0, new BigDecimal("100").compareTo(row.openingBalance()));
+            assertEquals(0, new BigDecimal("150").compareTo(row.closingBalance()));
+
+            // COMPANY (BANK) pool funded the client: -50 in the same span.
+            SnapshotMovement bank = movementFor(moves, available, "USD", "BANK");
+            assertEquals(0, new BigDecimal("-50").compareTo(bank.movement()));
+
+            // Conservation: movements across all groups sum to zero.
+            BigDecimal total = BigDecimal.ZERO;
+            for (SnapshotMovement m : moves) {
+                total = total.add(m.movement());
+            }
+            assertEquals(0, BigDecimal.ZERO.compareTo(total));
+
+            // Re-cutting the same hour replaces rows, not duplicates.
+            long recut = ledger.cutBalanceSnapshot(hour2);
+            assertEquals(3, recut);
+            assertEquals(3, ledger.snapshots(hour2).size());
+
+            // Non-full-hour timestamps are rejected.
+            assertThrows(LedgerViolation.class, () -> ledger.cutBalanceSnapshot(hour2.plusSeconds(90)));
+        }
+    }
+
+    private static BalanceSnapshot snapshotFor(List<BalanceSnapshot> rows, String accountId) {
+        for (BalanceSnapshot row : rows) {
+            if (accountId.equals(row.accountId())) {
+                return row;
+            }
+        }
+        return fail("snapshot row for " + accountId);
+    }
+
+    private static SnapshotMovement movementFor(List<SnapshotMovement> rows, String type, String currency, String klass) {
+        for (SnapshotMovement row : rows) {
+            if (type.equals(row.balanceType()) && currency.equals(row.currency()) && klass.equals(row.accountClass())) {
+                return row;
+            }
+        }
+        return fail("movement row for " + type + "/" + currency + "/" + klass);
     }
 
     @Test

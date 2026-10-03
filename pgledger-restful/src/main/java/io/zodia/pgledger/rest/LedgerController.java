@@ -20,6 +20,9 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
+
 @RestController
 final class LedgerController {
     private static final int MAX_BODY = 1 << 20;
@@ -95,12 +98,23 @@ final class LedgerController {
                 () -> ledger.deleteAccount(command.accountId(), command.balanceType(), command.currency()))));
     }
 
+    /**
+     * GET /api/v1/balances — single row when all three params are given; list
+     * when balanceType and/or currency are omitted. Multiple accountIds not
+     * supported here; use POST /api/v1/balances/query for that.
+     */
     @GetMapping("/api/v1/balances")
     ResponseEntity<byte[]> balance(
-            @RequestParam(name = "accountId", required = false) String accountId,
+            @RequestParam(name = "accountId") String accountId,
             @RequestParam(name = "balanceType", required = false) String balanceType,
             @RequestParam(name = "currency", required = false) String currency) {
-        Account account = reads.balance(required(accountId), required(balanceType), required(currency));
+        String type = blank(balanceType) ? null : balanceType;
+        String ccy = blank(currency) ? null : currency;
+        if (type == null && ccy == null) {
+            return HttpResponses.of(200, PgLedgerServer.READER,
+                    LedgerJson.writeBytes(reads.balances(accountId)));
+        }
+        Account account = reads.balance(accountId, type != null ? type : "", ccy != null ? ccy : "");
         if (account == null) {
             return HttpResponses.of(404, PgLedgerServer.READER, HttpResponses.NOT_FOUND);
         }
@@ -116,6 +130,45 @@ final class LedgerController {
         return HttpResponses.of(200, PgLedgerServer.READER, LedgerJson.writeBytes(reads.balancesQuery(query)));
     }
 
+    /** Cuts the snapshot for the given UTC hour (writer). Body: {"hour":"2026-10-03T09:00:00Z"} */
+    @PostMapping("/api/v1/snapshots/cut")
+    ResponseEntity<byte[]> cutSnapshot(@RequestBody(required = false) byte[] body) {
+        JsonNode root = tree(body);
+        String raw = root.hasNonNull("hour") ? root.get("hour").asText() : null;
+        if (raw == null || raw.isBlank()) {
+            throw new BadRequestException();
+        }
+        Instant hour;
+        try {
+            hour = Instant.parse(raw.strip());
+        } catch (DateTimeParseException e) {
+            throw new BadRequestException();
+        }
+        long rows = WriteRoutes.onWriter(() -> ledger.cutBalanceSnapshot(hour));
+        return HttpResponses.of(200, PgLedgerServer.WRITER,
+                LedgerJson.writeBytes(java.util.Map.of("hour", raw.strip(), "rows", rows)));
+    }
+
+    /** Snapshot rows for one UTC hour (reader). GET /api/v1/snapshots?hour=... */
+    @GetMapping("/api/v1/snapshots")
+    ResponseEntity<byte[]> snapshots(@RequestParam(name = "hour") String hour) {
+        return HttpResponses.of(200, PgLedgerServer.READER,
+                LedgerJson.writeBytes(ledger.snapshots(parseHour(hour))));
+    }
+
+    /**
+     * Net movement between snapshot hours (reader).
+     * GET /api/v1/snapshots/movements?from=...&to=... (to optional = latest)
+     */
+    @GetMapping("/api/v1/snapshots/movements")
+    ResponseEntity<byte[]> snapshotMovements(
+            @RequestParam(name = "from") String from,
+            @RequestParam(name = "to", required = false) String to) {
+        Instant toHour = to == null || to.isBlank() ? null : parseHour(to);
+        return HttpResponses.of(200, PgLedgerServer.READER,
+                LedgerJson.writeBytes(ledger.snapshotMovements(parseHour(from), toHour)));
+    }
+
     @GetMapping("/api/v1/journals")
     ResponseEntity<byte[]> journals(
             @RequestParam(name = "page", required = false) String page,
@@ -123,6 +176,17 @@ final class LedgerController {
         int pageValue = queryInt(page, 0, 0, Integer.MAX_VALUE);
         int sizeValue = queryInt(size, PgLedger.DEFAULT_PAGE_SIZE, 1, PgLedger.MAX_PAGE_SIZE);
         return HttpResponses.of(200, PgLedgerServer.READER, LedgerJson.writeBytes(ledger.journals(pageValue, sizeValue)));
+    }
+
+    private static Instant parseHour(String raw) {
+        if (raw == null || raw.isBlank()) {
+            throw new BadRequestException();
+        }
+        try {
+            return Instant.parse(raw.strip());
+        } catch (DateTimeParseException e) {
+            throw new BadRequestException();
+        }
     }
 
     private static int queryInt(String raw, int fallback, int min, int max) {
@@ -146,6 +210,10 @@ final class LedgerController {
             throw new BadRequestException();
         }
         return value;
+    }
+
+    private static boolean blank(String value) {
+        return value == null || value.isBlank();
     }
 
     private static <T> T read(byte[] json, Class<T> type) {

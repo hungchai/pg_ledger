@@ -157,6 +157,7 @@ public final class LedgerApi {
 
     public record Transfer(
             String id,
+            long seq,
             String fromAccountId,
             int fromBalanceType,
             String toAccountId,
@@ -183,5 +184,35 @@ public final class LedgerApi {
             List<String> accountIds,
             String balanceType,
             String currency) {
+    }
+
+    /** One hourly snapshot row for a single account balance. */
+    public record BalanceSnapshot(
+            Instant snapshotHour,
+            String accountId,
+            String balanceType,
+            String currency,
+            String accountClass,
+            int year,
+            int month,
+            int day,
+            int hour,
+            BigDecimal balance,
+            BigDecimal previousBalance,
+            long version,
+            boolean deleted) {
+    }
+
+    /**
+     * Net movement between two snapshot hours: opening = closing balance at (or
+     * before) fromHour, closing = balance at toHour, movement = closing - opening.
+     */
+    public record SnapshotMovement(
+            String balanceType,
+            String currency,
+            String accountClass,
+            BigDecimal openingBalance,
+            BigDecimal closingBalance,
+            BigDecimal movement) {
     }
 }

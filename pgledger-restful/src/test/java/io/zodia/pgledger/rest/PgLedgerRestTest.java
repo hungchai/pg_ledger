@@ -294,11 +294,19 @@ class PgLedgerRestTest {
                     .build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(404, missing.statusCode());
 
+            // accountId-only: returns the account's balance rows as a list.
             HttpResponse<String> query = http.send(HttpRequest.newBuilder(base.resolve("/api/v1/balances?accountId=a"))
                     .timeout(Duration.ofSeconds(2))
                     .GET()
                     .build(), HttpResponse.BodyHandlers.ofString());
-            assertEquals(400, query.statusCode());
+            assertEquals(200, query.statusCode());
+            assertTrue(query.body().startsWith("["));
+            // Missing accountId entirely: bad request.
+            HttpResponse<String> noAccount = http.send(HttpRequest.newBuilder(base.resolve("/api/v1/balances"))
+                    .timeout(Duration.ofSeconds(2))
+                    .GET()
+                    .build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(400, noAccount.statusCode());
 
             HttpResponse<String> size = http.send(HttpRequest.newBuilder(base.resolve("/api/v1/journals?size=201"))
                     .timeout(Duration.ofSeconds(2))
