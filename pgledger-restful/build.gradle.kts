@@ -23,6 +23,8 @@ dependencies {
     implementation("org.apache.shardingsphere:shardingsphere-jdbc:5.5.2")
     implementation("org.mybatis.spring.boot:mybatis-spring-boot-starter:3.0.4")
     implementation("com.zaxxer:HikariCP")
+    implementation("net.javacrumbs.shedlock:shedlock-spring:5.16.0")
+    implementation("net.javacrumbs.shedlock:shedlock-provider-jdbc-template:5.16.0")
     runtimeOnly("org.postgresql:postgresql")
     testImplementation(project(":pgledger-client-sdk"))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
