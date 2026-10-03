@@ -4,6 +4,8 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.zodia.pgledger.PgLedger;
 import io.zodia.pgledger.store.PostgresLedgerStore;
+import io.zodia.pgledger.store.read.LedgerReadMapper;
+import io.zodia.pgledger.store.read.LedgerReadService;
 import org.apache.shardingsphere.driver.api.ShardingSphereDataSourceFactory;
 import org.apache.shardingsphere.infra.algorithm.core.config.AlgorithmConfiguration;
 import org.apache.shardingsphere.infra.config.rule.RuleConfiguration;
@@ -11,6 +13,8 @@ import org.apache.shardingsphere.readwritesplitting.config.ReadwriteSplittingRul
 import org.apache.shardingsphere.readwritesplitting.config.rule.ReadwriteSplittingDataSourceGroupRuleConfiguration;
 import org.apache.shardingsphere.readwritesplitting.transaction.TransactionalReadQueryStrategy;
 import org.apache.shardingsphere.single.config.SingleRuleConfiguration;
+import org.mybatis.spring.SqlSessionFactoryBean;
+import org.mybatis.spring.mapper.MapperFactoryBean;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -32,20 +36,21 @@ import java.util.Properties;
 class PgLedgerDataSourceConfiguration {
     @Bean(name = "writerDataSource", destroyMethod = "close")
     DataSource writerDataSource(PgLedgerProperties properties) {
-        return pool("pgledger-writer", required("PGLEDGER_WRITER_JDBC_URL", properties.writerJdbcUrl()), properties);
+        return pool("pgledger-writer", propertyOrDefault(properties.writerJdbcUrl(), "PGLEDGER_WRITER_JDBC_URL"), properties);
     }
 
     @Bean(name = "readerDataSource", destroyMethod = "close")
     DataSource readerDataSource(PgLedgerProperties properties) {
-        return pool("pgledger-reader", required("PGLEDGER_READER_JDBC_URL", properties.readerJdbcUrl()), properties);
+        return pool("pgledger-reader", propertyOrDefault(properties.readerJdbcUrl(), "PGLEDGER_READER_JDBC_URL"), properties);
     }
 
     @Bean(destroyMethod = "close")
     @Primary
     DataSource dataSource(
             @Qualifier("writerDataSource") DataSource writer,
-            @Qualifier("readerDataSource") DataSource reader) throws SQLException {
-        requireRoles(writer, reader);
+            @Qualifier("readerDataSource") DataSource reader,
+            PgLedgerProperties properties) throws SQLException {
+        requireRoles(writer, reader, properties);
         PostgresLedgerStore.migrate(writer);
         return readWriteSplitting(writer, reader);
     }
@@ -56,6 +61,36 @@ class PgLedgerDataSourceConfiguration {
                 ? PgLedger.DEFAULT_BANK_POOL_SIZE
                 : properties.bankPoolSize().intValue();
         return PgLedger.routed(dataSource, poolSize);
+    }
+
+    @Bean
+    org.apache.ibatis.session.SqlSessionFactory sqlSessionFactory(@Qualifier("dataSource") DataSource dataSource)
+            throws Exception {
+        SqlSessionFactoryBean factory = new SqlSessionFactoryBean();
+        factory.setDataSource(dataSource);
+        org.apache.ibatis.session.Configuration configuration =
+                new org.apache.ibatis.session.Configuration();
+        configuration.setMapUnderscoreToCamelCase(true);
+        configuration.setUseColumnLabel(true);
+        factory.setConfiguration(configuration);
+        return factory.getObject();
+    }
+
+    @Bean
+    MapperFactoryBean<LedgerReadMapper> ledgerReadMapper(
+            org.apache.ibatis.session.SqlSessionFactory sessionFactory) {
+        // MapperFactoryBean works with a plain SqlSessionFactory; it only needs
+        // the factory to open one session per call. Reads ride the same
+        // read/write-splitting DataSource as everything else.
+        MapperFactoryBean<LedgerReadMapper> factoryBean =
+                new MapperFactoryBean<>(LedgerReadMapper.class);
+        factoryBean.setSqlSessionFactory(sessionFactory);
+        return factoryBean;
+    }
+
+    @Bean
+    LedgerReadService ledgerReadService(LedgerReadMapper mapper, PgLedger ledger) {
+        return new LedgerReadService(mapper, ledger.registryCache());
     }
 
     private static DataSource readWriteSplitting(DataSource writer, DataSource reader) throws SQLException {
@@ -80,17 +115,28 @@ class PgLedgerDataSourceConfiguration {
         HikariConfig config = new HikariConfig();
         config.setPoolName(name);
         config.setJdbcUrl(jdbcUrl);
-        config.setUsername(required("PGLEDGER_JDBC_USER", properties.jdbcUser()));
-        config.setPassword(required("PGLEDGER_JDBC_PASSWORD", properties.jdbcPassword()));
-        config.setMaximumPoolSize(10);
+        config.setUsername(propertyOrDefault(properties.jdbcUser(), "PGLEDGER_JDBC_USER"));
+        config.setPassword(propertyOrDefault(properties.jdbcPassword(), "PGLEDGER_JDBC_PASSWORD"));
+        config.setMaximumPoolSize(properties.jdbcPoolSizeOrDefault());
         config.setMinimumIdle(1);
-        config.setConnectionTimeout(5_000L);
+        config.setConnectionTimeout(30_000L);
+        config.setConnectionInitSql("SET TIME ZONE 'UTC'");
         return new HikariDataSource(config);
     }
 
-    private static void requireRoles(DataSource writer, DataSource reader) throws SQLException {
+    /**
+     * Writer must be a primary. Reader must be a streaming replica unless both
+     * JDBC URLs are identical (Embedded Postgres / single-node local primary).
+     */
+    private static void requireRoles(DataSource writer, DataSource reader, PgLedgerProperties properties)
+            throws SQLException {
         if (recovery(writer)) {
             throw new IllegalStateException("PGLEDGER_WRITER_JDBC_URL is a replica");
+        }
+        String writerUrl = propertyOrDefault(properties.writerJdbcUrl(), "PGLEDGER_WRITER_JDBC_URL");
+        String readerUrl = propertyOrDefault(properties.readerJdbcUrl(), "PGLEDGER_READER_JDBC_URL");
+        if (writerUrl.equals(readerUrl)) {
+            return;
         }
         if (!recovery(reader)) {
             throw new IllegalStateException("PGLEDGER_READER_JDBC_URL is not a replica");
@@ -113,5 +159,14 @@ class PgLedgerDataSourceConfiguration {
             throw new IllegalStateException(name + " is required");
         }
         return value;
+    }
+
+    /**
+     * Spring property (application.yml, test DefaultProperties) wins; the
+     * environment variable is the fallback for container and plain runs. A
+     * property of "" means unset, matching the ${VAR:} placeholders in yml.
+     */
+    private static String propertyOrDefault(String property, String envName) {
+        return required(envName, property == null || property.isBlank() ? System.getenv(envName) : property);
     }
 }

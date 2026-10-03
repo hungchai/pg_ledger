@@ -1,0 +1,260 @@
+{
+  "info": {
+    "name": "pgledger",
+    "description": "pgledger REST API. Writer routes mutate the ledger; reader routes serve replicated state. Start the stack with `docker compose up -d` (API on :8080).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "balanceType",
+      "value": "LIQUID"
+    },
+    {
+      "key": "currency",
+      "value": "USDT"
+    },
+    {
+      "key": "accountId",
+      "value": "CASH-0001"
+    }
+  ],
+  "item": [
+    {
+      "name": "health",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/health"
+      }
+    },
+    {
+      "name": "registries",
+      "item": [
+        {
+          "name": "create balance type",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/balance-types",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{balanceType}}\",\n  \"name\": \"Available\",\n  \"description\": \"Spendable balance\",\n  \"allowNegative\": false,\n  \"allowPositive\": true\n}"
+            },
+            "description": "Writer. Idempotent on code."
+          }
+        },
+        {
+          "name": "list balance types",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/v1/balance-types"
+          }
+        }
+      ]
+    },
+    {
+      "name": "accounts",
+      "item": [
+        {
+          "name": "create account",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/accounts",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{accountId}}\",\n  \"balanceType\": \"{{balanceType}}\",\n  \"currency\": \"{{currency}}\",\n  \"name\": \"{{accountId}}\",\n  \"metadata\": {},\n  \"accountClass\": \"CLIENT\"\n}"
+            },
+            "description": "Writer. accountClass: CLIENT | BANK | DEALER."
+          }
+        },
+        {
+          "name": "delete account",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/accounts/delete",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountId\": \"{{accountId}}\",\n  \"balanceType\": \"{{balanceType}}\",\n  \"currency\": \"{{currency}}\"\n}"
+            },
+            "description": "Writer. Soft delete; fails while balance is non-zero."
+          }
+        },
+        {
+          "name": "get balance",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/v1/balances?accountId={{accountId}}&balanceType={{balanceType}}&currency={{currency}}",
+            "description": "Reader. 404 when the (account, balanceType, currency) row does not exist."
+          }
+        },
+        {
+          "name": "query balances (multi-account)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/balances/query",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"accountIds\": [\"{{accountId}}\", \"CASH-0002\"],\n  \"balanceType\": \"{{balanceType}}\",\n  \"currency\": \"{{currency}}\"\n}"
+            },
+            "description": "Reader. balanceType / currency optional filters."
+          }
+        }
+      ]
+    },
+    {
+      "name": "movements",
+      "item": [
+        {
+          "name": "deposit",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/deposits",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"requestId\": \"dep-demo-001\",\n  \"accountId\": \"{{accountId}}\",\n  \"balanceType\": \"{{balanceType}}\",\n  \"currency\": \"{{currency}}\",\n  \"amount\": 100.50\n}"
+            },
+            "description": "Writer. Credits CLIENT from a BANK shard. Replay with the same requestId returns the original transfer (idempotent)."
+          }
+        },
+        {
+          "name": "withdrawal",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/withdrawals",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"requestId\": \"wd-demo-001\",\n  \"accountId\": \"{{accountId}}\",\n  \"balanceType\": \"{{balanceType}}\",\n  \"currency\": \"{{currency}}\",\n  \"amount\": 10.25\n}"
+            },
+            "description": "Writer. Debits CLIENT into a BANK shard; fails on insufficient balance."
+          }
+        },
+        {
+          "name": "posting (single leg)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/postings",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"fromAccountId\": \"{{accountId}}\",\n  \"fromBalanceType\": \"{{balanceType}}\",\n  \"toAccountId\": \"CASH-0002\",\n  \"toBalanceType\": \"{{balanceType}}\",\n  \"currency\": \"{{currency}}\",\n  \"amount\": 5.00,\n  \"requestId\": \"trf-demo-001\",\n  \"bizReference\": \"order-123\",\n  \"bizType\": \"TRANSFER\"\n}"
+            },
+            "description": "Writer. Transfer between two accounts. autoCreate defaults to false: a typo'd account fails loudly."
+          }
+        },
+        {
+          "name": "posting (multi-leg batch)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/postings",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"requestId\": \"rfq-demo-001\",\n  \"bizReference\": \"rfq-123\",\n  \"bizType\": \"CO_RFQ\",\n  \"autoCreate\": true,\n  \"legs\": [\n    {\n      \"fromAccountId\": \"{{accountId}}\",\n      \"fromBalanceType\": \"{{balanceType}}\",\n      \"toAccountId\": \"DEALER-A\",\n      \"toBalanceType\": \"{{balanceType}}\",\n      \"currency\": \"{{currency}}\",\n      \"amount\": 5.00\n    },\n    {\n      \"fromAccountId\": \"DEALER-A\",\n      \"fromBalanceType\": \"{{balanceType}}\",\n      \"toAccountId\": \"{{accountId}}\",\n      \"fromBalanceType\": \"{{balanceType}}\",\n      \"currency\": \"BTC\",\n      \"amount\": 0.0001\n    }\n  ]\n}"
+            },
+            "description": "Writer. Atomic multi-leg posting: one requestId, one SQL call, one commit. All legs share requestId; replay returns the original set."
+          }
+        }
+      ]
+    },
+    {
+      "name": "snapshots",
+      "item": [
+        {
+          "name": "cut snapshot (hour)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/v1/snapshots/cut",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"hour\": \"2026-10-03T02:00:00Z\"\n}"
+            },
+            "description": "Writer. Freezes balances for one closed UTC hour. Idempotent: re-cut replaces that hour's rows in one transaction. Runs automatically at hh:05 via ShedLock."
+          }
+        },
+        {
+          "name": "snapshot rows (one hour)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/v1/snapshots?hour=2026-10-03T02:00:00Z",
+            "description": "Reader. All account rows frozen at that hour."
+          }
+        },
+        {
+          "name": "movements between hours",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/v1/snapshots/movements?from=2026-10-03T02:00:00Z&to=2026-10-03T03:00:00Z",
+            "description": "Reader. Net movement per (balanceType, currency, accountClass) in (from, to]. Omit to for latest."
+          }
+        }
+      ]
+    },
+    {
+      "name": "journal",
+      "item": [
+        {
+          "name": "list journals (paged)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/api/v1/journals?page=0&size=50",
+            "description": "Reader. Newest-first transfer journal with entries."
+          }
+        }
+      ]
+    }
+  ]
+}

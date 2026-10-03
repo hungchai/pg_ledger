@@ -8,8 +8,9 @@
 # wipe volumes and re-run init: docker compose down -v
 # max_connections=400 so 200 concurrent API calls each keep one session.
 # Grafana: http://localhost:3000  admin / pgledger
-# k6 TPS:  K6_PROMETHEUS_RW_TREND_STATS=p(50),p(95),p(99),avg \
-#          k6 run -o experimental-prometheus-rw --tag testid=$(date +%s) k6/postings.js
+# One-shot cash stress (deposit + withdrawal + recon → 3 reports):
+#   ./scripts/k6-cash-stress.sh
+# k6 TPS → Prometheus remote write (dashboard testid dropdown)
 
 name: pgledger
 
@@ -35,12 +36,15 @@ services:
       - wal_keep_size=128MB
       - -c
       - max_connections=400
+      - -c
+      - timezone=UTC
     ports:
       - "5432:5432"
     volumes:
       - writer_data:/var/lib/postgresql/data
       - ./db/V001__ledger.sql:/docker-entrypoint-initdb.d/V001__ledger.sql:ro
       - ./db/V002__functions.sql:/docker-entrypoint-initdb.d/V002__functions.sql:ro
+      - ./db/V003__shedlock.sql:/docker-entrypoint-initdb.d/V003__shedlock.sql:ro
       - ./docker/writer/zz-enable-replication.sh:/docker-entrypoint-initdb.d/zz-enable-replication.sh:ro
     shm_size: 512mb
     healthcheck:
@@ -150,7 +154,8 @@ services:
       PGLEDGER_READER_JDBC_URL: jdbc:postgresql://reader:5432/pgledger
       PGLEDGER_JDBC_USER: pgledger
       PGLEDGER_JDBC_PASSWORD: pgledger
-      PGLEDGER_BANK_POOL_SIZE: "8"
+      PGLEDGER_BANK_POOL_SIZE: "80"
+      PGLEDGER_JDBC_POOL_SIZE: "100"
       PORT: "8080"
     ports:
       - "8080:8080"

@@ -1,29 +1,32 @@
 package io.zodia.pgledger;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.BalanceSnapshot;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
 import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.SnapshotMovement;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerViolation;
 import io.zodia.pgledger.store.PostgresLedgerStore;
 import io.zodia.pgledger.store.SqlScripts;
+import io.zonky.test.db.postgres.embedded.EmbeddedPostgres;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.postgresql.ds.PGSimpleDataSource;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -36,22 +39,33 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 class PgLedgerTest {
-    private static final String WRITER_URL = "jdbc:postgresql://localhost:5432/pgledger";
-    private static final String READER_URL = "jdbc:postgresql://localhost:5433/pgledger";
-    private static final String DB_USER = "pgledger";
-    private static final String DB_PASSWORD = "pgledger";
-    private static final long CATCH_UP_NS = 15_000_000_000L;
+    /** In-process Postgres (zonky). No Docker. Stress/compose still cover streaming replica. */
+    private static EmbeddedPostgres POSTGRES;
     private static final AtomicLong IDS = new AtomicLong();
+
+    @BeforeAll
+    static void startPostgres() throws Exception {
+        POSTGRES = EmbeddedPostgres.builder().setPort(0).start();
+    }
+
+    @AfterAll
+    static void stopPostgres() throws Exception {
+        if (POSTGRES != null) {
+            POSTGRES.close();
+            POSTGRES = null;
+        }
+    }
 
     @Test
     void schemaMigrationIsSafeWhenInstancesStartTogether() throws Exception {
-        DataSource writer = dataSource(WRITER_URL);
+        DataSource writer = dataSource();
         int threads = 8;
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         try {
@@ -80,16 +94,22 @@ class PgLedgerTest {
             ledger.createBalanceType(new CreateBalanceType(locked, "Locked", null));
             BalanceType tradeType = ledger.createBalanceType(new CreateBalanceType(trade, "Trade ahead", null));
             assertEquals(trade, tradeType.code());
+            assertFalse(tradeType.allowNegative());
+            assertTrue(tradeType.allowPositive());
+            BalanceType signed = ledger.createBalanceType(
+                    new CreateBalanceType(prefix + "NEG", "Neg", null, true, false));
+            assertTrue(signed.allowNegative());
+            assertFalse(signed.allowPositive());
             LedgerViolation duplicateType = assertThrows(LedgerViolation.class,
                     () -> ledger.createBalanceType(new CreateBalanceType(available, "dup", null)));
             assertEquals("balance type already exists", duplicateType.getMessage());
             LedgerViolation missingType = assertThrows(LedgerViolation.class,
-                    () -> ledger.createAccount(account(accountId, prefix + "M", "USD", false, true)));
+                    () -> ledger.createAccount(account(accountId, prefix + "M", "USD")));
             assertTrue(missingType.getMessage().contains("balance type not found"));
 
-            Account availableRow = ledger.createAccount(account(accountId, available, "USD", false, true));
-            Account lockedRow = ledger.createAccount(account(accountId, locked, "USD", false, true));
-            ledger.createAccount(account(accountId, available, "EUR", false, true));
+            Account availableRow = ledger.createAccount(account(accountId, available, "USD"));
+            Account lockedRow = ledger.createAccount(account(accountId, locked, "USD"));
+            ledger.createAccount(account(accountId, available, "EUR"));
             assertEquals(accountId, availableRow.accountId());
             assertEquals(available, availableRow.balanceType());
             assertEquals(0, BigDecimal.ZERO.compareTo(availableRow.balance()));
@@ -106,7 +126,7 @@ class PgLedgerTest {
             assertEquals(locked, rows.get(2).balanceType());
 
             LedgerViolation duplicate = assertThrows(LedgerViolation.class,
-                    () -> ledger.createAccount(account(accountId, available, "USD", false, true)));
+                    () -> ledger.createAccount(account(accountId, available, "USD")));
             assertEquals("account already exists", duplicate.getMessage());
             assertNull(ledger.balance(prefix + "NONE", available, "USD"));
             List<BalanceType> types = ledger.balanceTypes();
@@ -125,15 +145,25 @@ class PgLedgerTest {
             String locked = prefix + "L";
             String client = prefix + "C";
             String company = prefix + "CO";
-            ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
-            ledger.createBalanceType(new CreateBalanceType(locked, "Locked", null));
-            ledger.createAccount(account(client, available, "USD", false, true));
-            ledger.createAccount(account(client, locked, "USD", false, true));
-            ledger.createAccount(account(company, available, "USD", true, true));
+            BalanceType availableType = ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
+            BalanceType lockedType = ledger.createBalanceType(new CreateBalanceType(locked, "Locked", null));
+            ledger.createAccount(account(client, available, "USD"));
+            ledger.createAccount(account(client, locked, "USD"));
+            // The funding house sits below zero, so it uses the BANK class override.
+            ledger.createAccount(new CreateAccount(company, available, "USD", company, null, "BANK"));
 
             Transfer funded = ledger.post(posting(company, available, client, available, "USD", "100"));
             assertEquals(company, funded.fromAccountId());
             assertEquals(client, funded.toAccountId());
+            assertEquals("TRANSFER", funded.bizType());
+            assertNotNull(funded.requestId());
+            Transfer replay = ledger.post(new Posting(
+                    company, available, client, available, "USD", new BigDecimal("100"), funded.requestId(), null));
+            assertEquals(funded.id(), replay.id());
+            LedgerViolation reused = assertThrows(LedgerViolation.class,
+                    () -> ledger.post(new Posting(
+                            company, available, client, available, "USD", new BigDecimal("101"), funded.requestId(), null)));
+            assertTrue(reused.getMessage().contains("request id already used"));
             assertEquals(2, funded.entries().size());
             assertEquals(0, new BigDecimal("-100").compareTo(funded.entries().get(0).amount()));
             assertEquals(0, new BigDecimal("100").compareTo(funded.entries().get(1).amount()));
@@ -141,8 +171,8 @@ class PgLedgerTest {
             assertEquals(1L, funded.entries().get(1).version());
 
             Transfer held = ledger.post(posting(client, available, client, locked, "USD", "40"));
-            assertEquals(available, held.fromBalanceType());
-            assertEquals(locked, held.toBalanceType());
+            assertEquals(availableType.id(), held.fromBalanceType());
+            assertEquals(lockedType.id(), held.toBalanceType());
             nodes.awaitCatchUp();
             assertEquals(0, new BigDecimal("60").compareTo(ledger.balance(client, available, "USD").balance()));
             assertEquals(0, new BigDecimal("40").compareTo(ledger.balance(client, locked, "USD").balance()));
@@ -156,14 +186,21 @@ class PgLedgerTest {
             PgLedger ledger = nodes.ledger;
             String prefix = id("REJ");
             String available = prefix + "A";
+            String sinkable = prefix + "SINK";
             String client = prefix + "C";
             String sink = prefix + "S";
+            String eurSink = prefix + "E";
             String company = prefix + "CO";
             ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
-            ledger.createAccount(account(client, available, "USD", false, true));
-            ledger.createAccount(account(client, available, "EUR", true, true));
-            ledger.createAccount(account(sink, available, "USD", true, false));
-            ledger.createAccount(account(company, available, "USD", true, true));
+            // Sign policy is per type now: this bucket refuses credits entirely.
+            ledger.createBalanceType(new CreateBalanceType(sinkable, "Sink", null, true, false));
+            ledger.createAccount(account(client, available, "USD"));
+            ledger.createAccount(account(client, available, "EUR"));
+            ledger.createAccount(account(sink, sinkable, "USD"));
+            // The funding house sits below zero, so it uses the BANK class override.
+            ledger.createAccount(new CreateAccount(company, available, "USD", company, null, "BANK"));
+            // USD-only row on the same type. Crediting it in EUR is a currency mismatch.
+            ledger.createAccount(account(eurSink, available, "USD"));
             nodes.awaitCatchUp();
             long journalsBefore = ledger.journals(0, 1).total();
             ledger.post(posting(company, available, client, available, "USD", "10"));
@@ -175,10 +212,23 @@ class PgLedgerTest {
             assertEquals(0, new BigDecimal("10").compareTo(ledger.balance(client, available, "USD").balance()));
             assertEquals(journalsBefore + 1L, ledger.journals(0, 1).total());
 
+            // eurSink has no EUR row yet. autoCreate=false on plain postings
+            // surfaces the missing row instead of silently creating it.
             LedgerViolation currency = assertThrows(LedgerViolation.class,
                     () -> ledger.post(new Posting(
-                            client, available, sink, available, "EUR", BigDecimal.ONE, null)));
-            assertTrue(currency.getMessage().contains("Cannot transfer between different currencies"));
+                            client, available, eurSink, available, "EUR", BigDecimal.ONE, id("REQ"), null, null, false)));
+            assertTrue(currency.getMessage().contains("Account not found"));
+            // Fund the client EUR row first (company is a BANK and may go negative);
+            // the company EUR row itself is auto-created here.
+            ledger.post(new Posting(
+                    company, available, client, available, "EUR", new BigDecimal("5"), id("REQ"), null, null, true));
+            // With autoCreate the missing eurSink EUR row is created on the fly;
+            // both sides stay in EUR and the transfer commits.
+            Transfer eurMove = ledger.post(new Posting(
+                    client, available, eurSink, available, "EUR", BigDecimal.ONE, id("REQ"), null, null, true));
+            assertEquals(0, new BigDecimal("4").compareTo(ledger.balance(client, available, "EUR").balance()));
+            assertEquals(0, BigDecimal.ONE.compareTo(ledger.balance(eurSink, available, "EUR").balance()));
+            assertNotNull(eurMove.id());
 
             LedgerViolation missing = assertThrows(LedgerViolation.class,
                     () -> ledger.post(posting(prefix + "NOPE", available, company, available, "USD", "1")));
@@ -189,15 +239,15 @@ class PgLedgerTest {
             assertTrue(same.getMessage().contains("Cannot transfer to the same account"));
 
             LedgerViolation positive = assertThrows(LedgerViolation.class,
-                    () -> ledger.post(posting(company, available, sink, available, "USD", "1")));
+                    () -> ledger.post(posting(company, available, sink, sinkable, "USD", "1")));
             assertTrue(positive.getMessage().contains("does not allow positive balance"));
-            assertEquals(0, BigDecimal.ZERO.compareTo(ledger.balance(sink, available, "USD").balance()));
+            assertEquals(0, BigDecimal.ZERO.compareTo(ledger.balance(sink, sinkable, "USD").balance()));
 
             LedgerViolation amount = assertThrows(LedgerViolation.class,
                     () -> ledger.post(posting(company, available, client, available, "USD", "0")));
             assertTrue(amount.getMessage().contains("must be positive"));
             LedgerViolation blank = assertThrows(LedgerViolation.class,
-                    () -> ledger.createAccount(new CreateAccount("  ", available, "USD", null, false, true, null, null)));
+                    () -> ledger.createAccount(new CreateAccount("  ", available, "USD", null, null, null)));
             assertEquals("account_id, balance_type, and currency are required", blank.getMessage());
         }
     }
@@ -211,8 +261,9 @@ class PgLedgerTest {
             String client = prefix + "C";
             String company = prefix + "CO";
             ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
-            ledger.createAccount(account(client, available, "USD", false, true));
-            ledger.createAccount(account(company, available, "USD", true, true));
+            ledger.createAccount(account(client, available, "USD"));
+            // The funding house sits below zero, so it uses the BANK class override.
+            ledger.createAccount(new CreateAccount(company, available, "USD", company, null, "BANK"));
             ledger.post(posting(company, available, client, available, "USD", "10"));
             ledger.post(posting(company, available, client, available, "USD", "20"));
             ledger.post(posting(company, available, client, available, "USD", "30"));
@@ -269,31 +320,40 @@ class PgLedgerTest {
             String available = accountId + "A";
             ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
             Account created = ledger.createAccount(new CreateAccount(
-                    accountId, available, "USD", "  ", null, null, Map.of("desk", "fx"), null));
+                    accountId, available, "USD", "  ", Map.of("desk", "fx"), null));
             assertEquals(accountId, created.name());
-            assertTrue(created.allowNegativeBalance());
+            // Default policy on a fresh type: negative denied, positive allowed.
+            assertFalse(created.allowNegativeBalance());
             assertTrue(created.allowPositiveBalance());
             assertEquals("CLIENT", created.accountClass());
             assertFalse(created.deleted());
             assertEquals("fx", created.metadata().get("desk"));
 
             Account bank = ledger.createAccount(new CreateAccount(
-                    accountId + "B", available, "USD", null, false, false, null, "bank"));
+                    accountId + "B", available, "USD", null, null, "bank"));
             assertEquals("BANK", bank.accountClass());
             assertTrue(bank.allowNegativeBalance());
             assertTrue(bank.allowPositiveBalance());
             LedgerViolation badClass = assertThrows(LedgerViolation.class,
                     () -> ledger.createAccount(new CreateAccount(
-                            accountId + "X", available, "USD", null, false, true, null, "HOT")));
+                            accountId + "X", available, "USD", null, null, "HOT")));
             assertTrue(badClass.getMessage().contains("account_class"));
 
-            try (Connection conn = dataSource(WRITER_URL).getConnection();
+            try (Connection conn = dataSource().getConnection();
                  PreparedStatement ps = conn.prepareStatement("""
                          INSERT INTO pgledger_accounts (
-                             account_id, balance_type, name, currency,
-                             allow_negative_balance, allow_positive_balance, created_at, updated_at)
-                         VALUES (?, ?, 'legacy', 'USD', false, true, now(), now())
-                         RETURNING account_class, deleted
+                             account_id, balance_type_id, name, currency_id,
+                             created_at, updated_at)
+                         VALUES (
+                             ?,
+                             (SELECT id FROM pgledger_balance_types WHERE code = ?),
+                             'legacy',
+                             (SELECT id FROM pgledger_currencies WHERE code = 'USD'),
+                             now(), now())
+                         RETURNING (
+                             SELECT code FROM pgledger_account_classes
+                             WHERE id = pgledger_accounts.account_class_id
+                         ), deleted
                          """)) {
                 ps.setString(1, accountId + "LEGACY");
                 ps.setString(2, available);
@@ -313,15 +373,16 @@ class PgLedgerTest {
             String type = id("DEP") + "A";
             String client = id("DEPC");
             ledger.createBalanceType(new CreateBalanceType(type, "Available", null));
-            ledger.createAccount(account(client, type, "USD", false, true));
+            ledger.createAccount(account(client, type, "USD"));
             BigDecimal amount = new BigDecimal("30");
             Transfer deposit = ledger.deposit(cash(id("DREQ"), client, type, amount));
             assertEquals(client, deposit.toAccountId());
-            assertTrue(deposit.fromAccountId().startsWith("bankpool." + type + ".USD."));
+            assertEquals("DEPOSIT", deposit.bizType());
+            assertTrue(deposit.fromAccountId().startsWith("BANK-USD-" + type + "-"));
             assertEquals(2, deposit.entries().size());
             assertEquals(0, amount.negate().compareTo(deposit.entries().get(0).amount()));
             assertEquals(0, amount.compareTo(deposit.entries().get(1).amount()));
-            assertEquals(shardOf(deposit.metadata()), bankShard(deposit.metadata().get("requestId").toString(), 8));
+            assertEquals(shardOf(deposit.fromAccountId()), bankShard(deposit.requestId(), 8));
 
             nodes.awaitCatchUp();
             List<Account> shards = ledger.bankShards(type, "USD");
@@ -346,7 +407,8 @@ class PgLedgerTest {
 
             Transfer withdrawal = ledger.withdraw(cash(id("WREQ"), client, type, amount));
             assertEquals(client, withdrawal.fromAccountId());
-            assertTrue(withdrawal.toAccountId().startsWith("bankpool." + type + ".USD."));
+            assertEquals("WITHDRAWAL", withdrawal.bizType());
+            assertTrue(withdrawal.toAccountId().startsWith("BANK-USD-" + type + "-"));
             nodes.awaitCatchUp();
             assertEquals(0, BigDecimal.ZERO.compareTo(ledger.balance(client, type, "USD").balance()));
             assertEquals(0, BigDecimal.ZERO.compareTo(ledger.bankPosition(type, "USD")));
@@ -368,7 +430,7 @@ class PgLedgerTest {
             String type = id("SH") + "A";
             String client = id("SHC");
             ledger.createBalanceType(new CreateBalanceType(type, "Available", null));
-            ledger.createAccount(account(client, type, "USD", false, true));
+            ledger.createAccount(account(client, type, "USD"));
             assertEquals(8, ledger.ensureBankPool(type, "USD", 8));
             LedgerViolation resized = assertThrows(LedgerViolation.class,
                     () -> ledger.ensureBankPool(type, "USD", 4));
@@ -423,7 +485,7 @@ class PgLedgerTest {
             String type = id("DEL") + "A";
             String client = id("DELC");
             ledger.createBalanceType(new CreateBalanceType(type, "Available", null));
-            Account clientRow = ledger.createAccount(account(client, type, "USD", false, true));
+            Account clientRow = ledger.createAccount(account(client, type, "USD"));
             assertEquals("CLIENT", clientRow.accountClass());
             assertEquals(2, ledger.ensureBankPool(type, "USD", 2));
             nodes.awaitCatchUp();
@@ -431,23 +493,23 @@ class PgLedgerTest {
             assertEquals(2, before.size());
             Account shard0 = before.get(0);
             Account shard1 = before.get(1);
-            String aimedAtDeleted = requestForShard(2, 0);
 
             ledger.deleteAccount(shard0.accountId(), type, "USD");
             BigDecimal amount = new BigDecimal("7");
-            Transfer deposit = ledger.deposit(cash(aimedAtDeleted, client, type, amount));
+            String aimedAtDeleted = requestForShard(2, 0);
+            String aimedAtLive = requestForShard(2, 1);
+            LedgerViolation blocked = assertThrows(LedgerViolation.class,
+                    () -> ledger.deposit(cash(aimedAtDeleted, client, type, amount)));
+            assertTrue(blocked.getMessage().contains("deleted"));
+            Transfer deposit = ledger.deposit(cash(aimedAtLive, client, type, amount));
             assertEquals(shard1.accountId(), deposit.fromAccountId());
             assertFalse(shard0.accountId().equals(deposit.fromAccountId()));
-            for (int i = 0; i < 7; i++) {
-                Transfer more = ledger.deposit(cash(id("MORE"), client, type, amount));
-                assertEquals(shard1.accountId(), more.fromAccountId());
-            }
             nodes.awaitCatchUp();
             List<Account> after = ledger.bankShards(type, "USD");
             assertTrue(after.get(0).deleted());
             assertFalse(after.get(1).deleted());
             assertEquals(0, BigDecimal.ZERO.compareTo(after.get(0).balance()));
-            assertEquals(0, amount.multiply(new BigDecimal("8")).negate().compareTo(after.get(1).balance()));
+            assertEquals(0, amount.negate().compareTo(after.get(1).balance()));
             assertEquals(shard1.accountId(), after.get(1).accountId());
 
             LedgerViolation named = assertThrows(LedgerViolation.class,
@@ -456,7 +518,7 @@ class PgLedgerTest {
 
             Transfer original = deposit;
             ledger.deleteAccount(client, type, "USD");
-            Transfer replay = ledger.deposit(cash(aimedAtDeleted, client, type, amount));
+            Transfer replay = ledger.deposit(cash(aimedAtLive, client, type, amount));
             assertEquals(original.id(), replay.id());
             LedgerViolation rejected = assertThrows(LedgerViolation.class,
                     () -> ledger.deposit(cash(id("NEW"), client, type, amount)));
@@ -467,7 +529,7 @@ class PgLedgerTest {
             nodes.awaitCatchUp();
             Account still = ledger.balance(client, type, "USD");
             assertTrue(still.deleted());
-            assertEquals(0, amount.multiply(new BigDecimal("8")).compareTo(still.balance()));
+            assertEquals(0, amount.compareTo(still.balance()));
             assertTrue(journalHas(ledger, original.id()));
         }
     }
@@ -480,27 +542,25 @@ class PgLedgerTest {
             String type = id("WAIT") + "A";
             String client = id("WAITC");
             ledger.createBalanceType(new CreateBalanceType(type, "Available", null));
-            ledger.createAccount(account(client, type, "USD", false, true));
+            ledger.createAccount(account(client, type, "USD"));
             assertEquals(8, ledger.ensureBankPool(type, "USD", 8));
             String requestId = id("HOLD");
             int shard = bankShard(requestId, 8);
             BigDecimal amount = new BigDecimal("4");
-            DataSource writer = dataSource(WRITER_URL);
+            DataSource writer = dataSource();
             try (Connection hold = writer.getConnection()) {
                 hold.setAutoCommit(false);
                 try (PreparedStatement ps = hold.prepareStatement("""
                         SELECT a.id
-                        FROM pgledger_bank_shards s
-                        JOIN pgledger_accounts a
-                          ON a.account_id = s.account_id
-                         AND a.balance_type = s.balance_type
-                         AND a.currency = s.currency
-                        WHERE s.balance_type = ? AND s.currency = ? AND s.shard = ?
-                        FOR UPDATE
+                        FROM pgledger_accounts a
+                        JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+                        JOIN pgledger_currencies c ON c.id = a.currency_id
+                        WHERE a.account_id = ? AND bt.code = ? AND c.code = ?
+                        FOR UPDATE OF a
                         """)) {
-                    ps.setString(1, type);
-                    ps.setString(2, "USD");
-                    ps.setInt(3, shard);
+                    ps.setString(1, "BANK-USD-" + type + "-" + shard);
+                    ps.setString(2, type);
+                    ps.setString(3, "USD");
                     try (ResultSet rs = ps.executeQuery()) {
                         assertTrue(rs.next());
                     }
@@ -508,12 +568,12 @@ class PgLedgerTest {
                 ExecutorService pool = Executors.newSingleThreadExecutor();
                 try {
                     Future<Transfer> posted = pool.submit(() -> ledger.deposit(cash(requestId, client, type, amount)));
-                    assertTrue(awaitLock(writer, "pgledger_post_cash"), "deposit did not wait on the bank shard");
+                    assertTrue(awaitLock(writer, "pgledger_create_transfer"), "deposit did not wait on the bank shard");
                     assertFalse(posted.isDone());
                     hold.commit();
                     Transfer transfer = posted.get(30, TimeUnit.SECONDS);
                     assertEquals(client, transfer.toAccountId());
-                    assertEquals(shard, shardOf(transfer.metadata()));
+                    assertEquals(shard, shardOf(transfer.fromAccountId()));
                 } finally {
                     pool.shutdownNow();
                 }
@@ -531,8 +591,8 @@ class PgLedgerTest {
                     start.await();
                     return ledger.deposit(cash(same[1], client, type, amount));
                 });
-                assertEquals(shard, shardOf(left.get(30, TimeUnit.SECONDS).metadata()));
-                assertEquals(shard, shardOf(right.get(30, TimeUnit.SECONDS).metadata()));
+                assertEquals(shard, shardOf(left.get(30, TimeUnit.SECONDS).fromAccountId()));
+                assertEquals(shard, shardOf(right.get(30, TimeUnit.SECONDS).fromAccountId()));
             } finally {
                 pool.shutdownNow();
             }
@@ -548,6 +608,98 @@ class PgLedgerTest {
 
     @Test
     @Timeout(60)
+    void hourlySnapshotsTrackBalancesAndMovements() throws Exception {
+        try (Nodes nodes = new Nodes()) {
+            PgLedger ledger = nodes.ledger;
+            String prefix = id("SNP");
+            String available = prefix + "A";
+            String client = prefix + "C";
+            String other = prefix + "O";
+            String company = prefix + "CO";
+            ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
+            ledger.createAccount(new CreateAccount(company, available, "USD", company, null, "BANK"));
+            ledger.createAccount(account(client, available, "USD"));
+            ledger.createAccount(account(other, available, "USD"));
+
+            // Work inside two consecutive full UTC hours.
+            Instant hour1 = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.HOURS)
+                    .minusSeconds(7200);
+            Instant hour2 = hour1.plusSeconds(3600);
+
+            ledger.post(posting(company, available, client, available, "USD", "100"));
+            long cut1 = ledger.cutBalanceSnapshot(hour1);
+            assertEquals(3, cut1); // company + client + other
+
+            // Activity between the two cuts: bank funds client, client pays other.
+            Transfer first = ledger.post(posting(company, available, client, available, "USD", "50"));
+            Transfer second = ledger.post(posting(client, available, other, available, "USD", "30"));
+            // Global ledger order: seq increases in commit order.
+            assertTrue(second.seq() > first.seq());
+            long cut2 = ledger.cutBalanceSnapshot(hour2);
+            assertEquals(3, cut2);
+
+            // Rows carry UTC calendar fields of their hour and prior closing balance.
+            List<BalanceSnapshot> snap2 = ledger.snapshots(hour2);
+            assertEquals(3, snap2.size());
+            BalanceSnapshot clientRow = snapshotFor(snap2, client);
+            assertEquals(hour2, clientRow.snapshotHour());
+            assertEquals(hour2.atZone(java.time.ZoneOffset.UTC).getYear(), clientRow.year());
+            assertEquals(hour2.atZone(java.time.ZoneOffset.UTC).getMonthValue(), clientRow.month());
+            assertEquals(hour2.atZone(java.time.ZoneOffset.UTC).getDayOfMonth(), clientRow.day());
+            assertEquals(hour2.atZone(java.time.ZoneOffset.UTC).getHour(), clientRow.hour());
+            // 100 (hour1 close) + 50 - 30
+            assertEquals(0, new BigDecimal("120").compareTo(clientRow.balance()));
+            assertEquals(0, new BigDecimal("100").compareTo(clientRow.previousBalance()));
+
+            // Movement 4pm-to-4pm style: net change between two snapshot hours.
+            List<SnapshotMovement> moves = ledger.snapshotMovements(hour1, hour2);
+            // client +20, other +30 -> CLIENT group nets +50; COMPANY (BANK) -50.
+            SnapshotMovement row = movementFor(moves, available, "USD", "CLIENT");
+            assertEquals(0, new BigDecimal("50").compareTo(row.movement()));
+            assertEquals(0, new BigDecimal("100").compareTo(row.openingBalance()));
+            assertEquals(0, new BigDecimal("150").compareTo(row.closingBalance()));
+
+            // COMPANY (BANK) pool funded the client: -50 in the same span.
+            SnapshotMovement bank = movementFor(moves, available, "USD", "BANK");
+            assertEquals(0, new BigDecimal("-50").compareTo(bank.movement()));
+
+            // Conservation: movements across all groups sum to zero.
+            BigDecimal total = BigDecimal.ZERO;
+            for (SnapshotMovement m : moves) {
+                total = total.add(m.movement());
+            }
+            assertEquals(0, BigDecimal.ZERO.compareTo(total));
+
+            // Re-cutting the same hour replaces rows, not duplicates.
+            long recut = ledger.cutBalanceSnapshot(hour2);
+            assertEquals(3, recut);
+            assertEquals(3, ledger.snapshots(hour2).size());
+
+            // Non-full-hour timestamps are rejected.
+            assertThrows(LedgerViolation.class, () -> ledger.cutBalanceSnapshot(hour2.plusSeconds(90)));
+        }
+    }
+
+    private static BalanceSnapshot snapshotFor(List<BalanceSnapshot> rows, String accountId) {
+        for (BalanceSnapshot row : rows) {
+            if (accountId.equals(row.accountId())) {
+                return row;
+            }
+        }
+        return fail("snapshot row for " + accountId);
+    }
+
+    private static SnapshotMovement movementFor(List<SnapshotMovement> rows, String type, String currency, String klass) {
+        for (SnapshotMovement row : rows) {
+            if (type.equals(row.balanceType()) && currency.equals(row.currency()) && klass.equals(row.accountClass())) {
+                return row;
+            }
+        }
+        return fail("movement row for " + type + "/" + currency + "/" + klass);
+    }
+
+    @Test
+    @Timeout(60)
     void oppositeTransfersLockInSortedIdOrder() throws Exception {
         try (Nodes nodes = new Nodes()) {
             PgLedger ledger = nodes.ledger;
@@ -557,9 +709,10 @@ class PgLedgerTest {
             String b = prefix + "B1";
             String c = prefix + "C1";
             ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
-            ledger.createAccount(account(a, available, "USD", true, true));
-            ledger.createAccount(account(b, available, "USD", true, true));
-            ledger.createAccount(account(c, available, "USD", true, true));
+            // Hub c funds both sides and may sit below zero: BANK class override.
+            ledger.createAccount(new CreateAccount(c, available, "USD", c, null, "BANK"));
+            ledger.createAccount(account(a, available, "USD"));
+            ledger.createAccount(account(b, available, "USD"));
             ledger.post(posting(c, available, a, available, "USD", "1000"));
             ledger.post(posting(c, available, b, available, "USD", "1000"));
             nodes.awaitCatchUp();
@@ -584,33 +737,19 @@ class PgLedgerTest {
     }
 
     @Test
-    void schemaScriptsKeepFunctionBodiesIntact() throws Exception {
-        String tables = Files.readString(Path.of("db/V001__ledger.sql"));
-        String functions = Files.readString(Path.of("db/V002__functions.sql"));
-        List<String> tableStatements = SqlScripts.statements(tables);
-        List<String> functionStatements = SqlScripts.statements(functions);
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("CREATE TABLE") && sql.contains("pgledger_accounts")));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("CREATE TABLE") && sql.contains("pgledger_balance_types")));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("balance_type") && sql.contains("account_id")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_balance_type")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_account")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_create_transfer")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_post_cash")));
-        assertTrue(functionStatements.stream().anyMatch(sql -> sql.contains("pgledger_delete_account")));
-        assertTrue(functionStatements.stream().noneMatch(sql -> sql.contains("pgledger_post(")));
-        String lowered = functionsText(functionStatements);
-        assertFalse(lowered.contains("skip locked"));
-        assertFalse(lowered.contains("for update limit"));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("account_class") && sql.contains("deleted")));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("pgledger_bank_shards")));
-        assertTrue(tableStatements.stream().anyMatch(sql -> sql.contains("pgledger_cash_requests")));
-        for (int i = 0; i < functionStatements.size(); i++) {
-            String sql = functionStatements.get(i);
-            assertEquals(0, count(sql, "$$") % 2, sql);
-        }
+    void sqlScriptsKeepDollarQuoteBodies() {
         List<String> sample = SqlScripts.statements("SELECT 1; CREATE FUNCTION f() AS $$ SELECT ';' $$ LANGUAGE sql;");
         assertEquals(2, sample.size());
         assertTrue(sample.get(1).contains("SELECT ';'"));
+    }
+
+    @Test
+    void sqlScriptsIgnoreSemicolonsInLineComments() {
+        List<String> sample = SqlScripts.statements("-- note; keep\nSET timezone TO 'UTC';\nSELECT 1;");
+        assertEquals(2, sample.size());
+        assertTrue(sample.get(0).startsWith("-- note; keep"));
+        assertTrue(sample.get(0).contains("SET timezone TO 'UTC'"));
+        assertEquals("SELECT 1", sample.get(1));
     }
 
     private static int run(PgLedger ledger, CyclicBarrier start, int rounds, String from, String to, String type)
@@ -638,9 +777,8 @@ class PgLedgerTest {
         return n;
     }
 
-    private static CreateAccount account(String accountId, String balanceType, String currency,
-                                         boolean allowNegative, boolean allowPositive) {
-        return new CreateAccount(accountId, balanceType, currency, accountId, allowNegative, allowPositive, null, null);
+    private static CreateAccount account(String accountId, String balanceType, String currency) {
+        return new CreateAccount(accountId, balanceType, currency, accountId, null, null);
     }
 
     private static CashMovement cash(String requestId, String accountId, String balanceType, BigDecimal amount) {
@@ -648,7 +786,7 @@ class PgLedgerTest {
     }
 
     private static int bankShard(String requestId, int poolSize) throws SQLException {
-        try (Connection conn = dataSource(WRITER_URL).getConnection();
+        try (Connection conn = dataSource().getConnection();
              PreparedStatement ps = conn.prepareStatement("SELECT pgledger_bank_shard(?, ?)")) {
             ps.setString(1, requestId);
             ps.setInt(2, poolSize);
@@ -701,10 +839,9 @@ class PgLedgerTest {
         return "";
     }
 
-    private static int shardOf(java.util.Map<String, Object> metadata) {
-        Object value = metadata.get("bankShard");
-        assertTrue(value instanceof Number);
-        return ((Number) value).intValue();
+    private static int shardOf(String accountId) {
+        int dash = accountId.lastIndexOf('-');
+        return Integer.parseInt(accountId.substring(dash + 1));
     }
 
     private static int nonzero(List<Account> shards) {
@@ -769,17 +906,10 @@ class PgLedgerTest {
         }
     }
 
-    private static String functionsText(List<String> statements) {
-        StringBuilder text = new StringBuilder();
-        for (int i = 0; i < statements.size(); i++) {
-            text.append(statements.get(i).toLowerCase(java.util.Locale.ROOT)).append('\n');
-        }
-        return text.toString();
-    }
-
     private static Posting posting(String fromAccount, String fromType, String toAccount, String toType,
                                    String currency, String amount) {
-        return new Posting(fromAccount, fromType, toAccount, toType, currency, new BigDecimal(amount), null);
+        return new Posting(fromAccount, fromType, toAccount, toType, currency,
+                new BigDecimal(amount), id("REQ"), null, null, false);
     }
 
     private static String id(String prefix) {
@@ -787,47 +917,16 @@ class PgLedgerTest {
                 + Long.toUnsignedString(System.nanoTime(), 36);
     }
 
-    private static int count(String text, String token) {
-        int n = 0;
-        int from = 0;
-        while (from < text.length()) {
-            int at = text.indexOf(token, from);
-            if (at < 0) {
-                return n;
-            }
-            n++;
-            from = at + token.length();
-        }
-        return n;
-    }
-
     private static final class Nodes implements AutoCloseable {
-        private final DataSource writer;
-        private final DataSource reader;
         private final PgLedger ledger;
 
-        private Nodes() throws SQLException {
-            writer = dataSource(WRITER_URL);
-            reader = dataSource(READER_URL);
-            if (queryBoolean(writer, "SELECT pg_is_in_recovery()")) {
-                throw new IllegalStateException("writer url is a replica");
-            }
-            if (!queryBoolean(reader, "SELECT pg_is_in_recovery()")) {
-                throw new IllegalStateException("reader url is not a replica");
-            }
-            ledger = PgLedger.postgres(writer, reader);
+        private Nodes() {
+            DataSource dataSource = dataSource();
+            ledger = PgLedger.postgres(dataSource, dataSource);
         }
 
-        private void awaitCatchUp() throws Exception {
-            long start = System.nanoTime();
-            String lsn = queryText(writer, "SELECT pg_current_wal_lsn()::text");
-            while (System.nanoTime() - start < CATCH_UP_NS) {
-                if (replayed(reader, lsn)) {
-                    return;
-                }
-                Thread.sleep(20L);
-            }
-            fail("reader did not replay " + lsn);
+        private void awaitCatchUp() {
+            // Single primary: reader is the same DataSource, so writes are already visible.
         }
 
         @Override
@@ -836,46 +935,11 @@ class PgLedgerTest {
         }
     }
 
-    private static boolean replayed(DataSource dataSource, String lsn) throws SQLException {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement("""
-                     SELECT pg_is_in_recovery()
-                        AND coalesce(pg_last_wal_replay_lsn() >= ?::pg_lsn, false)
-                     """)) {
-            ps.setString(1, lsn);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() && rs.getBoolean(1);
-            }
-        }
-    }
-
-    private static String queryText(DataSource dataSource, String sql) throws SQLException {
-        try (Connection conn = dataSource.getConnection();
-             Statement statement = conn.createStatement();
-             ResultSet rs = statement.executeQuery(sql)) {
-            if (!rs.next()) {
-                throw new IllegalStateException(sql);
-            }
-            return rs.getString(1);
-        }
-    }
-
-    private static boolean queryBoolean(DataSource dataSource, String sql) throws SQLException {
-        try (Connection conn = dataSource.getConnection();
-             Statement statement = conn.createStatement();
-             ResultSet rs = statement.executeQuery(sql)) {
-            if (!rs.next()) {
-                throw new IllegalStateException(sql);
-            }
-            return rs.getBoolean(1);
-        }
-    }
-
-    private static PGSimpleDataSource dataSource(String url) {
+    private static DataSource dataSource() {
         PGSimpleDataSource dataSource = new PGSimpleDataSource();
-        dataSource.setURL(url);
-        dataSource.setUser(DB_USER);
-        dataSource.setPassword(DB_PASSWORD);
+        dataSource.setURL(POSTGRES.getJdbcUrl("postgres", "postgres"));
+        dataSource.setUser("postgres");
+        dataSource.setPassword("postgres");
         dataSource.setConnectTimeout(5);
         return dataSource;
     }

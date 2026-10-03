@@ -8,6 +8,7 @@ import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.DeleteAccount;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.PostingBatch;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerJson;
 
@@ -34,7 +35,8 @@ public final class PgLedgerClient implements AutoCloseable {
     private final Duration readTimeout;
     private final int attempts;
     private final ThreadLocal<String> role = new ThreadLocal<>();
-    private final ThreadLocal<Integer> statusCode = new ThreadLocal<>();
+    /** Mutable holder avoids boxing an {@code Integer} per response. Unset is -1. */
+    private final ThreadLocal<int[]> statusCode = ThreadLocal.withInitial(() -> new int[]{-1});
 
     public PgLedgerClient(PgLedgerClientConfig config) {
         String base = config.baseUrl().toString();
@@ -57,8 +59,7 @@ public final class PgLedgerClient implements AutoCloseable {
 
     /** HTTP status from the latest response on this thread, or -1 when the call failed before a response. */
     public int status() {
-        Integer value = statusCode.get();
-        return value == null ? -1 : value.intValue();
+        return statusCode.get()[0];
     }
 
     public BalanceType createBalanceType(CreateBalanceType command) {
@@ -77,6 +78,10 @@ public final class PgLedgerClient implements AutoCloseable {
         return read(ok(exchange("POST", "/api/v1/postings", LedgerJson.writeBytes(posting))), Transfer.class);
     }
 
+    public List<Transfer> post(PostingBatch batch) {
+        return readList(ok(exchange("POST", "/api/v1/postings", LedgerJson.writeBytes(batch))), Transfer.class);
+    }
+
     public Transfer deposit(CashMovement movement) {
         return read(ok(exchange("POST", "/api/v1/deposits", LedgerJson.writeBytes(movement))), Transfer.class);
     }
@@ -92,6 +97,14 @@ public final class PgLedgerClient implements AutoCloseable {
 
     public List<Account> balances(String accountId) {
         return readList(ok(exchange("GET", "/api/v1/accounts/" + encode(accountId) + "/balances", null)), Account.class);
+    }
+
+    /** All balance rows for the account, optionally narrowed by type and/or currency. */
+    public List<Account> balances(String accountId, String balanceType, String currency) {
+        String path = "/api/v1/balances?" + query("accountId", accountId,
+                "balanceType", balanceType == null ? "" : balanceType,
+                "currency", currency == null ? "" : currency);
+        return readList(ok(exchange("GET", path, null)), Account.class);
     }
 
     public Account balance(String accountId, String balanceType, String currency) {
@@ -147,7 +160,7 @@ public final class PgLedgerClient implements AutoCloseable {
                 if (status >= 500 && status < 600 && attempt + 1 < attempts) {
                     continue;
                 }
-                statusCode.set(status);
+                statusCode.get()[0] = status;
                 String header = response.headers().firstValue(ROLE_HEADER).orElse(null);
                 if (header == null) {
                     role.remove();
@@ -204,7 +217,10 @@ public final class PgLedgerClient implements AutoCloseable {
     private static String query(String... pairs) {
         StringBuilder text = new StringBuilder(96);
         for (int i = 0; i < pairs.length; i += 2) {
-            if (i > 0) {
+            if (pairs[i + 1] == null || pairs[i + 1].isEmpty()) {
+                continue;
+            }
+            if (text.length() > 0) {
                 text.append('&');
             }
             text.append(encode(pairs[i])).append('=').append(encode(pairs[i + 1]));

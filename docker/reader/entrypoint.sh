@@ -62,4 +62,4 @@ EOF
   echo "pgledger reader: clone finished"
 fi
 
-exec postgres -c hot_standby=on -c hot_standby_feedback=on -c max_connections=400
+exec postgres -c hot_standby=on -c hot_standby_feedback=on -c max_connections=400 -c timezone=UTC

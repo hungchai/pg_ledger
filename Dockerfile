@@ -1,11 +1,15 @@
-FROM gradle:8.10-jdk21 AS build
+FROM eclipse-temurin:21-jdk AS build
 WORKDIR /src
 COPY settings.gradle.kts build.gradle.kts ./
+COPY gradlew ./
+COPY gradle/wrapper/ gradle/wrapper/
+RUN chmod +x gradlew
 COPY pgledger-core pgledger-core
 COPY pgledger-client-sdk pgledger-client-sdk
 COPY pgledger-restful pgledger-restful
 COPY db db
-RUN gradle :pgledger-restful:bootJar --no-daemon
+# Wrapper downloads Gradle 9.6 on first run; version is pinned by gradle-wrapper.properties.
+RUN ./gradlew :pgledger-restful:bootJar --no-daemon
 
 FROM eclipse-temurin:21-jre
 WORKDIR /opt/pgledger

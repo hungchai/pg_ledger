@@ -96,6 +96,6 @@ class PgLedgerClientRetryTest {
     }
 
     private static Posting posting() {
-        return new Posting("A", "AVAILABLE", "B", "AVAILABLE", "USD", BigDecimal.ONE, null);
+        return new Posting("A", "AVAILABLE", "B", "AVAILABLE", "USD", BigDecimal.ONE, "retry-req", null);
     }
 }
