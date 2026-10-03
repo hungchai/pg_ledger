@@ -44,6 +44,7 @@ services:
       - writer_data:/var/lib/postgresql/data
       - ./db/V001__ledger.sql:/docker-entrypoint-initdb.d/V001__ledger.sql:ro
       - ./db/V002__functions.sql:/docker-entrypoint-initdb.d/V002__functions.sql:ro
+      - ./db/V003__shedlock.sql:/docker-entrypoint-initdb.d/V003__shedlock.sql:ro
       - ./docker/writer/zz-enable-replication.sh:/docker-entrypoint-initdb.d/zz-enable-replication.sh:ro
     shm_size: 512mb
     healthcheck:

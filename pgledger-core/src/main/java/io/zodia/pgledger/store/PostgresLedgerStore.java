@@ -33,7 +33,7 @@ import java.util.concurrent.locks.LockSupport;
  * Locking stays inside those functions. Reads are plain selects.
  */
 public final class PostgresLedgerStore implements LedgerStore {
-    private static final String[] SCHEMA = {"/db/V001__ledger.sql", "/db/V002__functions.sql"};
+    private static final String[] SCHEMA = {"/db/V001__ledger.sql", "/db/V002__functions.sql", "/db/V003__shedlock.sql"};
     private static final String BALANCE_TYPE_COLUMNS = """
             id, code, name, description, allow_negative, allow_positive, created_at, updated_at
             """;
@@ -170,12 +170,6 @@ public final class PostgresLedgerStore implements LedgerStore {
                 executeIdempotent(dataSource, statements.get(i));
             }
         }
-        executeIdempotent(dataSource,
-                "CREATE TABLE IF NOT EXISTS shedlock ("
-                        + "name VARCHAR(64) NOT NULL PRIMARY KEY, "
-                        + "lock_until TIMESTAMP NOT NULL, "
-                        + "locked_at TIMESTAMP NOT NULL, "
-                        + "locked_by VARCHAR(255) NOT NULL)");
     }
 
     @Override
