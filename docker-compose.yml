@@ -1,0 +1,217 @@
+# Local dev only. Not for production.
+# user: pgledger  password: pgledger  database: pgledger
+# writer JDBC: jdbc:postgresql://localhost:5432/pgledger
+# reader JDBC: jdbc:postgresql://localhost:5433/pgledger
+# API:       http://localhost:8080
+# start: docker compose up -d
+# stop:  docker compose down
+# wipe volumes and re-run init: docker compose down -v
+# max_connections=400 so 200 concurrent API calls each keep one session.
+# Grafana: http://localhost:3000  admin / pgledger
+# One-shot cash stress (deposit + withdrawal + recon → 3 reports):
+#   ./scripts/k6-cash-stress.sh
+# k6 TPS → Prometheus remote write (dashboard testid dropdown)
+
+name: pgledger
+
+services:
+  writer:
+    image: postgres:18
+    container_name: pgledger-writer
+    environment:
+      POSTGRES_USER: pgledger
+      POSTGRES_PASSWORD: pgledger
+      POSTGRES_DB: pgledger
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - hot_standby=on
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - wal_keep_size=128MB
+      - -c
+      - max_connections=400
+      - -c
+      - timezone=UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - writer_data:/var/lib/postgresql
+      - ./db/V001__ledger.sql:/docker-entrypoint-initdb.d/V001__ledger.sql:ro
+      - ./db/V002__functions.sql:/docker-entrypoint-initdb.d/V002__functions.sql:ro
+      - ./db/V003__shedlock.sql:/docker-entrypoint-initdb.d/V003__shedlock.sql:ro
+      - ./docker/writer/zz-enable-replication.sh:/docker-entrypoint-initdb.d/zz-enable-replication.sh:ro
+    shm_size: 512mb
+    healthcheck:
+      # TCP, not the socket: the entrypoint's temporary server does not listen on TCP.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U pgledger -d pgledger && test -f \"$$PGDATA/.replication-enabled\""]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+  reader:
+    image: postgres:18
+    container_name: pgledger-reader
+    environment:
+      POSTGRES_USER: pgledger
+      POSTGRES_PASSWORD: pgledger
+      POSTGRES_DB: pgledger
+      PRIMARY_HOST: writer
+      PRIMARY_PORT: "5432"
+      PGDATA: /var/lib/postgresql/data
+    entrypoint: ["/bin/bash", "/reader-entrypoint.sh"]
+    ports:
+      - "5433:5432"
+    volumes:
+      - reader_data:/var/lib/postgresql
+      - ./docker/reader/entrypoint.sh:/reader-entrypoint.sh:ro
+    shm_size: 512mb
+    depends_on:
+      writer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U pgledger -d pgledger && test \"$$(psql -h 127.0.0.1 -p 5432 -U pgledger -d pgledger -tAc 'SELECT pg_is_in_recovery()')\" = t"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+  writer-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: pgledger-writer-exporter
+    environment:
+      DATA_SOURCE_NAME: postgresql://pgledger:pgledger@writer:5432/pgledger?sslmode=disable
+    command:
+      - --extend.query-path=/etc/postgres_exporter/queries.yaml
+      - --no-collector.stat_statements
+    volumes:
+      - ./grafana/postgres-queries.yaml:/etc/postgres_exporter/queries.yaml:ro
+    ports:
+      - "9187:9187"
+    depends_on:
+      writer:
+        condition: service_healthy
+
+  reader-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    container_name: pgledger-reader-exporter
+    environment:
+      DATA_SOURCE_NAME: postgresql://pgledger:pgledger@reader:5432/pgledger?sslmode=disable
+    command:
+      - --extend.query-path=/etc/postgres_exporter/queries.yaml
+      - --no-collector.stat_statements
+    volumes:
+      - ./grafana/postgres-queries.yaml:/etc/postgres_exporter/queries.yaml:ro
+    ports:
+      - "9188:9187"
+    depends_on:
+      reader:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: pgledger-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+      - --storage.tsdb.retention.time=6h
+    volumes:
+      - ./grafana/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - writer-exporter
+      - reader-exporter
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: pgledger-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: pgledger
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  api:
+    build: .
+    image: pgledger-api
+    container_name: pgledger-api
+    # Stateless. Same four variables on every instance. Both JDBC URLs are required.
+    environment:
+      PGLEDGER_WRITER_JDBC_URL: jdbc:postgresql://writer:5432/pgledger
+      PGLEDGER_READER_JDBC_URL: jdbc:postgresql://reader:5432/pgledger
+      PGLEDGER_JDBC_USER: pgledger
+      PGLEDGER_JDBC_PASSWORD: pgledger
+      PGLEDGER_BANK_POOL_SIZE: "80"
+      PGLEDGER_JDBC_POOL_SIZE: "100"
+      PGLEDGER_AUTO_MIGRATE: "true"
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      writer:
+        condition: service_healthy
+      reader:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8080'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  # Second stateless replica: proves multi-instance behaviour (ShedLock jobs
+  # elect one leader, both serve reads/writes). Scheduled jobs still run once.
+  api-2:
+    image: pgledger-api
+    container_name: pgledger-api-2
+    environment:
+      PGLEDGER_WRITER_JDBC_URL: jdbc:postgresql://writer:5432/pgledger
+      PGLEDGER_READER_JDBC_URL: jdbc:postgresql://reader:5432/pgledger
+      PGLEDGER_JDBC_USER: pgledger
+      PGLEDGER_JDBC_PASSWORD: pgledger
+      PGLEDGER_BANK_POOL_SIZE: "80"
+      PGLEDGER_JDBC_POOL_SIZE: "100"
+      PGLEDGER_AUTO_MIGRATE: "true"
+      PORT: "8080"
+    ports:
+      - "8082:8080"
+    depends_on:
+      writer:
+        condition: service_healthy
+      reader:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8080'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  # Load balancer in front of both API replicas. Entry point for clients: :80.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: pgledger-nginx
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8081:80"
+    depends_on:
+      - api
+      - api-2
+
+volumes:
+  writer_data:
+  reader_data:

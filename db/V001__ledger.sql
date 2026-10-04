@@ -1,0 +1,561 @@
+-- pgledger schema (https://github.com/pgr0ss/pgledger) plus registries.
+-- One balance row is unique (account_id, balance_type_id, currency_id).
+-- account_id is the caller business id. id is the internal key transfers store.
+-- Registries use a 4-byte id. Hot tables store that id. There are no foreign keys.
+-- Shard business ids stay text: BANK-{currency code}-{balance type code}-{n}.
+
+-- TIMESTAMPTZ is always stored as UTC - pin the database session timezone so
+-- clients (psql, DBeaver, JDBC) show and interpret wall times as UTC.
+DO $$
+BEGIN
+  EXECUTE format('ALTER DATABASE %I SET timezone TO %L', current_database(), 'UTC');
+END $$;
+SET timezone TO 'UTC';
+
+-- UUID to ULID text. Ids are stored as text, so the reverse (ULID to UUID) is not loaded.
+
+CREATE OR REPLACE FUNCTION format_ulid(bytes bytea) RETURNS text AS $$
+DECLARE
+  encoding   bytea = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+  output     text  = '';
+BEGIN
+
+  -- Encode the timestamp
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 0) & 224) >> 5));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 0) & 31)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 1) & 248) >> 3));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 1) & 7) << 2) | ((GET_BYTE(bytes, 2) & 192) >> 6)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 2) & 62) >> 1));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 2) & 1) << 4) | ((GET_BYTE(bytes, 3) & 240) >> 4)));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 3) & 15) << 1) | ((GET_BYTE(bytes, 4) & 128) >> 7)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 4) & 124) >> 2));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 4) & 3) << 3) | ((GET_BYTE(bytes, 5) & 224) >> 5)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 5) & 31)));
+
+  -- Encode the entropy
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 6) & 248) >> 3));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 6) & 7) << 2) | ((GET_BYTE(bytes, 7) & 192) >> 6)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 7) & 62) >> 1));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 7) & 1) << 4) | ((GET_BYTE(bytes, 8) & 240) >> 4)));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 8) & 15) << 1) | ((GET_BYTE(bytes, 9) & 128) >> 7)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 9) & 124) >> 2));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 9) & 3) << 3) | ((GET_BYTE(bytes, 10) & 224) >> 5)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 10) & 31)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 11) & 248) >> 3));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 11) & 7) << 2) | ((GET_BYTE(bytes, 12) & 192) >> 6)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 12) & 62) >> 1));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 12) & 1) << 4) | ((GET_BYTE(bytes, 13) & 240) >> 4)));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 13) & 15) << 1) | ((GET_BYTE(bytes, 14) & 128) >> 7)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 14) & 124) >> 2));
+  output = output || CHR(GET_BYTE(encoding, ((GET_BYTE(bytes, 14) & 3) << 3) | ((GET_BYTE(bytes, 15) & 224) >> 5)));
+  output = output || CHR(GET_BYTE(encoding, (GET_BYTE(bytes, 15) & 31)));
+
+  RETURN output;
+END
+$$
+LANGUAGE plpgsql
+IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION uuid_to_ulid(id uuid) RETURNS text AS $$
+BEGIN
+    RETURN format_ulid(uuid_send(id));
+END
+$$
+LANGUAGE plpgsql
+IMMUTABLE;
+
+
+CREATE OR REPLACE FUNCTION pgledger_uuidv7_exists() RETURNS BOOL
+AS $$
+    SELECT EXISTS(SELECT * FROM pg_proc WHERE proname = 'uuidv7');
+$$ LANGUAGE sql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION pgledger_uuidv7_microsecond() RETURNS UUID
+AS $$
+    select encode(
+        substring(int8send(floor(t_ms)::int8) from 3) ||
+        int2send((7<<12)::int2 | ((t_ms-floor(t_ms))*4096)::int2) ||
+        substring(uuid_send(gen_random_uuid()) from 9 for 8)
+        , 'hex')::uuid
+    from (select extract(epoch from clock_timestamp())*1000 as t_ms) s
+$$ LANGUAGE sql VOLATILE;
+
+CREATE OR REPLACE FUNCTION pgledger_uuidv7() RETURNS UUID
+AS $$
+DECLARE
+    result uuid;
+BEGIN
+    IF pgledger_uuidv7_exists() THEN
+        EXECUTE 'select uuidv7()' INTO result;
+        RETURN result;
+    ELSE
+        RETURN pgledger_uuidv7_microsecond();
+    END IF;
+END
+$$ LANGUAGE plpgsql VOLATILE;
+
+-- Internal ids are plain ULID text (uuidv7 -> 26-char Crockford base32):
+-- lexicographic order equals time order, so ORDER BY id is a time sort.
+-- The entity type is clear from the table / log context; no prefix needed.
+CREATE OR REPLACE FUNCTION pgledger_generate_id() RETURNS TEXT
+AS $$
+    SELECT uuid_to_ulid(pgledger_uuidv7())
+$$ LANGUAGE sql VOLATILE;
+
+
+CREATE TABLE IF NOT EXISTS pgledger_account_classes (
+    id INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE
+);
+
+INSERT INTO pgledger_account_classes (id, code)
+VALUES
+    (1, 'CLIENT'),
+    (2, 'COMPANY'),
+    (3, 'BANK'),
+    (4, 'NOSTRO'),
+    (5, 'SUSPENSE'),
+    (6, 'CONTROL')
+ON CONFLICT (code) DO NOTHING;
+
+SELECT setval(
+    pg_get_serial_sequence('pgledger_account_classes', 'id'),
+    (SELECT MAX(id) FROM pgledger_account_classes)
+);
+
+CREATE TABLE IF NOT EXISTS pgledger_balance_types (
+    id INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT,
+    allow_negative BOOLEAN NOT NULL DEFAULT FALSE,
+    allow_positive BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+-- A stale dev volume created before the flags moved here still has the old
+-- shape. Bring it up to date before anything selects the new columns.
+ALTER TABLE pgledger_balance_types ADD COLUMN IF NOT EXISTS allow_negative BOOLEAN;
+ALTER TABLE pgledger_balance_types ADD COLUMN IF NOT EXISTS allow_positive BOOLEAN;
+UPDATE pgledger_balance_types SET allow_negative = FALSE, allow_positive = TRUE
+WHERE allow_negative IS NULL OR allow_positive IS NULL;
+ALTER TABLE pgledger_balance_types ALTER COLUMN allow_negative SET DEFAULT FALSE;
+ALTER TABLE pgledger_balance_types ALTER COLUMN allow_positive SET DEFAULT TRUE;
+ALTER TABLE pgledger_balance_types ALTER COLUMN allow_negative SET NOT NULL;
+ALTER TABLE pgledger_balance_types ALTER COLUMN allow_positive SET NOT NULL;
+
+INSERT INTO pgledger_balance_types (id, code, name, allow_negative, allow_positive, created_at, updated_at)
+VALUES
+    (1, 'LIQUID', 'LIQUID', FALSE, TRUE, now(), now()),
+    (2, 'PENDING_INCOMING', 'PENDING_INCOMING', FALSE, TRUE, now(), now()),
+    (3, 'PENDING_OUTGOING', 'PENDING_OUTGOING', FALSE, TRUE, now(), now()),
+    (4, 'COMPLIANCE_HOLD', 'COMPLIANCE_HOLD', FALSE, TRUE, now(), now()),
+    (5, 'GAS_FEE', 'GAS_FEE', TRUE, TRUE, now(), now())
+ON CONFLICT (code) DO NOTHING;
+
+-- Keep the sign policy of the five seeded rows on volumes where they already
+-- existed before the flags moved to this table.
+UPDATE pgledger_balance_types SET allow_negative = TRUE, allow_positive = TRUE
+WHERE code = 'GAS_FEE';
+UPDATE pgledger_balance_types SET allow_negative = FALSE, allow_positive = TRUE
+WHERE code IN ('LIQUID', 'PENDING_INCOMING', 'PENDING_OUTGOING', 'COMPLIANCE_HOLD');
+
+SELECT setval(
+    pg_get_serial_sequence('pgledger_balance_types', 'id'),
+    (SELECT MAX(id) FROM pgledger_balance_types)
+);
+
+CREATE TABLE IF NOT EXISTS pgledger_biz_types (
+    id INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL
+);
+
+INSERT INTO pgledger_biz_types (id, code, name)
+VALUES
+    (1, 'TRANSFER', 'Transfer'),
+    (2, 'DEPOSIT', 'Deposit'),
+    (3, 'WITHDRAWAL', 'Withdrawal')
+ON CONFLICT (code) DO NOTHING;
+
+SELECT setval(
+    pg_get_serial_sequence('pgledger_biz_types', 'id'),
+    (SELECT MAX(id) FROM pgledger_biz_types)
+);
+
+CREATE TABLE IF NOT EXISTS pgledger_currencies (
+    id INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    scale INT NOT NULL
+);
+
+INSERT INTO pgledger_currencies (id, code, scale)
+VALUES
+    (1, 'USD', 2),
+    (2, 'EUR', 2),
+    (3, 'BTC', 8),
+    (4, 'ETH', 18),
+    (5, 'USDT', 6)
+ON CONFLICT (code) DO NOTHING;
+
+SELECT setval(
+    pg_get_serial_sequence('pgledger_currencies', 'id'),
+    (SELECT MAX(id) FROM pgledger_currencies)
+);
+
+CREATE TABLE IF NOT EXISTS pgledger_accounts (
+    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id(),
+    account_id TEXT NOT NULL,
+    balance_type_id INT NOT NULL,
+    name TEXT NOT NULL,
+    currency_id INT NOT NULL,
+    balance NUMERIC NOT NULL DEFAULT 0,
+    version BIGINT NOT NULL DEFAULT 0,
+    metadata JSONB,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    account_class_id INT NOT NULL DEFAULT 1,
+    deleted BOOLEAN NOT NULL DEFAULT false,
+    UNIQUE (account_id, balance_type_id, currency_id)
+);
+
+CREATE INDEX IF NOT EXISTS pgledger_accounts_account_id_idx ON pgledger_accounts (account_id);
+CREATE INDEX IF NOT EXISTS pgledger_accounts_balance_type_id_idx ON pgledger_accounts (balance_type_id);
+CREATE INDEX IF NOT EXISTS pgledger_accounts_currency_id_idx ON pgledger_accounts (currency_id);
+CREATE INDEX IF NOT EXISTS pgledger_accounts_account_class_id_idx ON pgledger_accounts (account_class_id);
+CREATE INDEX IF NOT EXISTS pgledger_accounts_balance_currency_idx ON pgledger_accounts (balance_type_id, currency_id);
+
+CREATE TABLE IF NOT EXISTS pgledger_transfers (
+    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id(),
+    seq BIGINT,
+    from_account_id TEXT NOT NULL,
+    to_account_id TEXT NOT NULL,
+    amount NUMERIC NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    event_at TIMESTAMPTZ NOT NULL,
+    request_id TEXT,
+    biz_type_id INT NOT NULL,
+    biz_reference TEXT,
+    CHECK (amount > 0 AND from_account_id != to_account_id)
+);
+
+-- Global ledger order. Holes are normal (CACHE), order is not. Written once at
+-- insert; never updated. Replay/reconciliation cursors key off this column.
+CREATE SEQUENCE IF NOT EXISTS pgledger_transfer_seq CACHE 64;
+
+-- Backfill rows written before the column existed, then make it NOT NULL and
+-- unique so seq doubles as a stable cursor. Idempotent for existing volumes.
+UPDATE pgledger_transfers
+SET seq = nextval('pgledger_transfer_seq')
+WHERE seq IS NULL
+  AND id IN (SELECT id FROM pgledger_transfers WHERE seq IS NULL ORDER BY created_at, id FOR UPDATE);
+
+CREATE UNIQUE INDEX IF NOT EXISTS pgledger_transfers_seq_key ON pgledger_transfers (seq);
+ALTER TABLE pgledger_transfers ALTER COLUMN seq SET DEFAULT nextval('pgledger_transfer_seq');
+
+-- Idempotency dedup uses a PARTIAL index over a rolling retention window.
+-- The cutoff is a frozen date constant captured when the index is created;
+-- V002's daily job (pgledger_roll_request_id_index) rebuilds it with a fresh
+-- cutoff. Full-history request_id lookups are not supported once data ages
+-- out of the window: a replay older than the cutoff books as a new transfer.
+-- This keeps the hot-path index small enough for a modest shared_buffers.
+DROP INDEX IF EXISTS pgledger_transfers_request_id_idx;
+DO $do$
+DECLARE
+    v_cutoff DATE := CURRENT_DATE - 45;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE indexname = 'pgledger_transfers_request_id_recent'
+    ) THEN
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_recent
+             ON pgledger_transfers (request_id)
+             WHERE created_at >= %L::timestamptz', v_cutoff);
+    END IF;
+END
+$do$;
+CREATE INDEX IF NOT EXISTS pgledger_transfers_biz_type_id_idx ON pgledger_transfers (biz_type_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_from_account_id_idx ON pgledger_transfers (from_account_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_to_account_id_idx ON pgledger_transfers (to_account_id);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_event_at_idx ON pgledger_transfers (event_at);
+CREATE INDEX IF NOT EXISTS pgledger_transfers_created_at_idx ON pgledger_transfers (created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS pgledger_entries (
+    id TEXT PRIMARY KEY DEFAULT pgledger_generate_id(),
+    account_id TEXT NOT NULL,
+    transfer_id TEXT NOT NULL,
+    amount NUMERIC NOT NULL,
+    account_previous_balance NUMERIC NOT NULL,
+    account_current_balance NUMERIC NOT NULL,
+    account_version BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS pgledger_entries_account_id_idx ON pgledger_entries (account_id);
+CREATE INDEX IF NOT EXISTS pgledger_entries_transfer_id_idx ON pgledger_entries (transfer_id);
+
+-- Hourly balance snapshots, always cut on UTC hour boundaries. One row per
+-- (snapshot_hour, account row). previous_balance is the closing balance of the
+-- prior snapshot for the same row (0 when none), so net movement over any
+-- span is SUM(balance - previous_balance) between the two boundary hours.
+CREATE TABLE IF NOT EXISTS pgledger_balance_snapshots (
+    snapshot_hour TIMESTAMPTZ NOT NULL,
+    account_pk TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    balance_type_id INT NOT NULL,
+    currency_id INT NOT NULL,
+    account_class_id INT NOT NULL,
+    year INT NOT NULL,
+    month INT NOT NULL,
+    day INT NOT NULL,
+    hour INT NOT NULL,
+    balance NUMERIC NOT NULL,
+    previous_balance NUMERIC NOT NULL,
+    version BIGINT NOT NULL,
+    deleted BOOLEAN NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (snapshot_hour, account_pk)
+) PARTITION BY RANGE (snapshot_hour);
+
+-- Creates the missing monthly partitions covering the month holding p_from
+-- plus p_months_ahead months (NULLs = now(), 12). Partition names stay
+-- stable: pgledger_balance_snapshots_yYYYYmMM, bounds on UTC month starts.
+-- pgledger_cut_balance_snapshot (V002) calls this before writing, so the job
+-- never fails at a month boundary. Concurrent callers serialize on the same
+-- advisory lock the migration block below uses; a lost create race from a
+-- foreign creator is swallowed. Returns partitions created by this call.
+CREATE OR REPLACE FUNCTION pgledger_ensure_snapshot_partitions(
+    p_from TIMESTAMPTZ DEFAULT NULL,
+    p_months_ahead INT DEFAULT NULL
+)
+RETURNS INT
+AS $$
+DECLARE
+    v_from TIMESTAMPTZ;
+    v_months INT;
+    v_created INT := 0;
+    v_month TIMESTAMPTZ;
+    v_end TIMESTAMPTZ;
+    v_name TEXT;
+BEGIN
+    v_from := COALESCE(p_from, now());
+    v_months := COALESCE(p_months_ahead, 12);
+    IF v_months < 0 OR v_months > 120 THEN
+        RAISE EXCEPTION 'months ahead (%) must be between 0 and 120', v_months;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('pgledger_balance_snapshots:partition', 0));
+
+    v_month := date_trunc('month', v_from, 'UTC');
+    v_end := v_month + make_interval(months => v_months + 1);
+    WHILE v_month < v_end LOOP
+        v_name := 'pgledger_balance_snapshots_y' || to_char(v_month AT TIME ZONE 'UTC', 'YYYY')
+                  || 'm' || to_char(v_month AT TIME ZONE 'UTC', 'MM');
+        IF to_regclass(v_name) IS NULL THEN
+            BEGIN
+                EXECUTE format(
+                    'CREATE TABLE IF NOT EXISTS %I PARTITION OF pgledger_balance_snapshots FOR VALUES FROM (%L) TO (%L)',
+                    v_name, v_month, v_month + make_interval(months => 1));
+                v_created := v_created + 1;
+            EXCEPTION
+                WHEN duplicate_table THEN
+                    NULL; -- another creator won the race
+            END;
+        END IF;
+        v_month := v_month + make_interval(months => 1);
+    END LOOP;
+    RETURN v_created;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Snapshots live in monthly partitions so retention can drop whole months.
+-- Older volumes hold a plain table: rename it, recreate partitioned, move the
+-- rows back. Every migrate call also tops up the rolling coverage (current
+-- month, every month holding legacy rows, plus 12 ahead) so a cut never hits
+-- a missing partition.
+DO $do$
+DECLARE
+    r RECORD;
+    v_data_min TIMESTAMPTZ;
+    v_data_max TIMESTAMPTZ;
+    v_migrate BOOLEAN := FALSE;
+    v_month TIMESTAMPTZ;
+    v_end TIMESTAMPTZ;
+BEGIN
+    -- Serialize concurrent migrators; IF NOT EXISTS alone can still race.
+    PERFORM pg_advisory_xact_lock(hashtextextended('pgledger_balance_snapshots:partition', 0));
+
+    IF to_regclass('pgledger_balance_snapshots') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM pg_partitioned_table
+           WHERE partrelid = 'pgledger_balance_snapshots'::regclass
+       ) THEN
+        v_migrate := TRUE;
+        SELECT MIN(snapshot_hour), MAX(snapshot_hour)
+        INTO v_data_min, v_data_max
+        FROM pgledger_balance_snapshots;
+
+        ALTER TABLE pgledger_balance_snapshots RENAME TO pgledger_balance_snapshots_legacy;
+        FOR r IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'pgledger_balance_snapshots_legacy'::regclass
+              AND contype = 'p'
+        LOOP
+            EXECUTE format('ALTER TABLE pgledger_balance_snapshots_legacy RENAME CONSTRAINT %I TO %I',
+                r.conname, r.conname || '_legacy');
+        END LOOP;
+        FOR r IN
+            SELECT indexname FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'pgledger_balance_snapshots_legacy'
+        LOOP
+            EXECUTE format('ALTER INDEX %I RENAME TO %I', r.indexname, r.indexname || '_legacy');
+        END LOOP;
+
+        CREATE TABLE pgledger_balance_snapshots (
+            snapshot_hour TIMESTAMPTZ NOT NULL,
+            account_pk TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            balance_type_id INT NOT NULL,
+            currency_id INT NOT NULL,
+            account_class_id INT NOT NULL,
+            year INT NOT NULL,
+            month INT NOT NULL,
+            day INT NOT NULL,
+            hour INT NOT NULL,
+            balance NUMERIC NOT NULL,
+            previous_balance NUMERIC NOT NULL,
+            version BIGINT NOT NULL,
+            deleted BOOLEAN NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (snapshot_hour, account_pk)
+        ) PARTITION BY RANGE (snapshot_hour);
+    END IF;
+
+    -- Rolling coverage: current month plus 12 ahead, widened to hold every
+    -- legacy data month when migrating. The three-arg date_trunc and the
+    -- explicit UTC casts keep partition bounds and names session-TZ proof.
+    v_month := date_trunc('month', now(), 'UTC');
+    v_end := v_month + make_interval(months => 13);
+    IF v_data_min IS NOT NULL THEN
+        v_month := LEAST(v_month, date_trunc('month', v_data_min, 'UTC'));
+    END IF;
+    IF v_data_max IS NOT NULL THEN
+        v_end := GREATEST(v_end, date_trunc('month', v_data_max, 'UTC') + make_interval(months => 1));
+    END IF;
+    WHILE v_month < v_end LOOP
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I PARTITION OF pgledger_balance_snapshots FOR VALUES FROM (%L) TO (%L)',
+            'pgledger_balance_snapshots_y' || to_char(v_month AT TIME ZONE 'UTC', 'YYYY')
+                || 'm' || to_char(v_month AT TIME ZONE 'UTC', 'MM'),
+            v_month, v_month + make_interval(months => 1));
+        v_month := v_month + make_interval(months => 1);
+    END LOOP;
+
+    -- Partitions exist; now move the legacy rows and drop the old table.
+    IF v_migrate THEN
+        INSERT INTO pgledger_balance_snapshots
+        SELECT * FROM pgledger_balance_snapshots_legacy;
+        DROP TABLE pgledger_balance_snapshots_legacy;
+    END IF;
+END
+$do$;
+
+CREATE INDEX IF NOT EXISTS pgledger_balance_snapshots_dims_idx
+    ON pgledger_balance_snapshots (snapshot_hour, balance_type_id, currency_id, account_class_id);
+CREATE INDEX IF NOT EXISTS pgledger_balance_snapshots_account_idx
+    ON pgledger_balance_snapshots (account_id, snapshot_hour DESC);
+
+-- The old view had no flag columns. Functions with the old
+-- pgledger_create_balance_type signature depend on that shape, so drop it with
+-- CASCADE only when it is outdated. V002 recreates those functions.
+DO $do$
+DECLARE
+    has_flags BOOLEAN := FALSE;
+BEGIN
+    IF to_regclass('pgledger_balance_types_view') IS NOT NULL THEN
+        SELECT TRUE INTO has_flags
+        FROM pg_attribute
+        WHERE attrelid = 'pgledger_balance_types_view'::regclass
+          AND attname = 'allow_negative'
+          AND NOT attisdropped;
+    END IF;
+    IF NOT COALESCE(has_flags, FALSE) THEN
+        DROP VIEW IF EXISTS pgledger_balance_types_view CASCADE;
+    END IF;
+END
+$do$;
+
+CREATE OR REPLACE VIEW pgledger_balance_types_view AS
+SELECT
+    id,
+    code,
+    name,
+    description,
+    allow_negative,
+    allow_positive,
+    created_at,
+    updated_at
+FROM pgledger_balance_types;
+
+-- Sign policy moved to the balance type. The two account columns stay on the
+-- view with the same names so downstream JSON is unchanged: the flags come from
+-- the balance type, and a BANK class account may sit on either side of zero.
+CREATE OR REPLACE VIEW pgledger_accounts_view AS
+SELECT
+    a.id,
+    a.account_id,
+    bt.code AS balance_type,
+    a.name,
+    c.code AS currency,
+    a.balance,
+    a.version,
+    bt.allow_negative OR ac.code = 'BANK' AS allow_negative_balance,
+    bt.allow_positive OR ac.code = 'BANK' AS allow_positive_balance,
+    a.metadata,
+    a.created_at,
+    a.updated_at,
+    ac.code AS account_class,
+    a.deleted
+FROM pgledger_accounts a
+JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+JOIN pgledger_currencies c ON c.id = a.currency_id
+JOIN pgledger_account_classes ac ON ac.id = a.account_class_id;
+
+-- A stale dev volume created before sign policy moved to pgledger_balance_types
+-- still has these columns. Dropping them here, after the views above were replaced
+-- without those columns, avoids a dependency error on migration.
+ALTER TABLE pgledger_accounts DROP COLUMN IF EXISTS allow_negative_balance;
+ALTER TABLE pgledger_accounts DROP COLUMN IF EXISTS allow_positive_balance;
+
+CREATE OR REPLACE VIEW pgledger_transfers_view AS
+SELECT
+    t.id,
+    t.seq,
+    t.from_account_id,
+    t.to_account_id,
+    t.amount,
+    t.created_at,
+    t.event_at,
+    t.request_id,
+    b.code AS biz_type,
+    t.biz_reference
+FROM pgledger_transfers t
+JOIN pgledger_biz_types b ON b.id = t.biz_type_id;
+
+CREATE OR REPLACE VIEW pgledger_entries_view AS
+SELECT
+    e.id,
+    e.account_id,
+    e.transfer_id,
+    e.amount,
+    e.account_previous_balance,
+    e.account_current_balance,
+    e.account_version,
+    e.created_at,
+    t.event_at,
+    t.biz_reference
+FROM pgledger_entries e
+INNER JOIN pgledger_transfers t ON e.transfer_id = t.id;

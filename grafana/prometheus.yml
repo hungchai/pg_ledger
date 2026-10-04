@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: pgledger-writer
+    static_configs:
+      - targets: ["writer-exporter:9187"]
+        labels:
+          role: writer
+  - job_name: pgledger-reader
+    static_configs:
+      - targets: ["reader-exporter:9187"]
+        labels:
+          role: reader
