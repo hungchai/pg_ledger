@@ -17,8 +17,12 @@ info:
     Amounts are unbounded `NUMERIC` serialized as JSON numbers/strings.
     Balance-type fields accept a registry code (`LIQUID`) or numeric id (`1`).
 servers:
+  - url: http://127.0.0.1:8081
+    description: Local Compose stack via nginx (load-balanced)
   - url: http://127.0.0.1:8080
-    description: Local Compose stack
+    description: Local API instance 1 (direct)
+  - url: http://127.0.0.1:8082
+    description: Local API instance 2 (direct)
 tags:
   - name: health
   - name: balance-types

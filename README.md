@@ -30,10 +30,10 @@ Writes go to the primary (**writer**). Balance and journal reads go to a streami
 
 ```text
             ┌─────────────┐
-Client ────►│ nginx :80   │ least_conn
+Client ────►│ nginx :8081 │ least_conn
             └──────┬──────┘
                    ├─► api-1 :8080 ─┐
-                   └─► api-2 :8080 ─┤  stateless (ShedLock elects one job leader)
+                   └─► api-2 :8082 ─┤  stateless (ShedLock elects one job leader)
                                      │
                    ├─ writes ──► writer (Postgres primary :5432)
                    └─ reads  ──► reader (streaming replica :5433)
@@ -61,15 +61,15 @@ curl -s http://127.0.0.1:8080/health
 
 | Service | URL |
 |---------|-----|
-| **nginx (entry point)** | **http://127.0.0.1:80** |
+| **nginx (entry point, Postman)** | **http://127.0.0.1:8081** |
 | API instance 1 (direct) | http://127.0.0.1:8080 |
-| API instance 2 (direct) | http://127.0.0.1:8081 |
+| API instance 2 (direct) | http://127.0.0.1:8082 |
 | Writer Postgres | `localhost:5432` / db `pgledger` / user+pass `pgledger` |
 | Reader Postgres | `localhost:5433` (same credentials) |
 | Prometheus | http://127.0.0.1:9090 |
 | Grafana | http://127.0.0.1:3000 (`admin` / `pgledger`) |
 
-Two stateless API replicas behind nginx (`least_conn`, Docker DNS re-resolved per request). nginx on :80 is the client entry point; the per-instance ports 8080/8081 are for direct debugging. ShedLock-scheduled jobs (snapshot cut, partition roll) elect one leader and run once across both, while both instances serve requests.
+Two stateless API replicas behind nginx (`least_conn`, Docker DNS re-resolved per request). nginx on **:8081** is the client entry point (Postman: set `baseUrl` = `http://localhost:8081`); 8080 / 8082 are direct-to-instance debug ports. ShedLock-scheduled jobs (snapshot cut, partition roll) elect one leader and run once across both, while both instances serve requests.
 
 ```bash
 # stop (keep data)
@@ -110,7 +110,7 @@ Writer = Postgres primary (writes, SQL functions). Reader = streaming replica (p
 
 Full request/response contract: [openapi.yaml](openapi.yaml). Rendered Swagger UI (GitHub Pages): https://hungchai.github.io/pg_ledger/ — auto-publishes on push to `main`/`dev` when the spec changes.
 
-Ready-to-run Postman collection covering every endpoint: [postman/pgledger.postman_collection.json](postman/pgledger.postman_collection.json) — import into Postman; collection variables `baseUrl` (default `http://localhost:8080`), `accountId`, `balanceType`, `currency` drive the requests.
+Ready-to-run Postman collection covering every endpoint: [postman/pgledger.postman_collection.json](postman/pgledger.postman_collection.json) — import into Postman; collection variables `baseUrl` (default `http://localhost:8081`, via nginx), `accountId`, `balanceType`, `currency` drive the requests.
 
 ---
 

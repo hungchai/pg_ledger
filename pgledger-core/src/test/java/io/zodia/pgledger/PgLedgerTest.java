@@ -100,12 +100,12 @@ class PgLedgerTest {
                     new CreateBalanceType(prefix + "NEG", "Neg", null, true, false));
             assertTrue(signed.allowNegative());
             assertFalse(signed.allowPositive());
-            LedgerViolation duplicateType = assertThrows(LedgerViolation.class,
+        LedgerViolation duplicateType = assertThrows(LedgerViolation.class,
                     () -> ledger.createBalanceType(new CreateBalanceType(available, "dup", null)));
-            assertEquals("balance type already exists", duplicateType.getMessage());
-            LedgerViolation missingType = assertThrows(LedgerViolation.class,
+        assertEquals("balance type already exists", duplicateType.getMessage());
+        LedgerViolation missingType = assertThrows(LedgerViolation.class,
                     () -> ledger.createAccount(account(accountId, prefix + "M", "USD")));
-            assertTrue(missingType.getMessage().contains("balance type not found"));
+        assertTrue(missingType.getMessage().contains("balance type not found"));
 
             Account availableRow = ledger.createAccount(account(accountId, available, "USD"));
             Account lockedRow = ledger.createAccount(account(accountId, locked, "USD"));
@@ -118,16 +118,16 @@ class PgLedgerTest {
 
             nodes.awaitCatchUp();
             List<Account> rows = ledger.balances(accountId);
-            assertEquals(3, rows.size());
+        assertEquals(3, rows.size());
             assertEquals(available, rows.get(0).balanceType());
-            assertEquals("EUR", rows.get(0).currency());
+        assertEquals("EUR", rows.get(0).currency());
             assertEquals(available, rows.get(1).balanceType());
-            assertEquals("USD", rows.get(1).currency());
+        assertEquals("USD", rows.get(1).currency());
             assertEquals(locked, rows.get(2).balanceType());
 
-            LedgerViolation duplicate = assertThrows(LedgerViolation.class,
+        LedgerViolation duplicate = assertThrows(LedgerViolation.class,
                     () -> ledger.createAccount(account(accountId, available, "USD")));
-            assertEquals("account already exists", duplicate.getMessage());
+        assertEquals("account already exists", duplicate.getMessage());
             assertNull(ledger.balance(prefix + "NONE", available, "USD"));
             List<BalanceType> types = ledger.balanceTypes();
             assertEquals(1, countCode(types, available));
@@ -203,17 +203,17 @@ class PgLedgerTest {
             long journalsBefore = ledger.journals(0, 1).total();
             ledger.post(posting(company, available, client, available, "USD", "10"));
 
-            LedgerViolation poor = assertThrows(LedgerViolation.class,
+        LedgerViolation poor = assertThrows(LedgerViolation.class,
                     () -> ledger.post(posting(client, available, company, available, "USD", "20")));
-            assertTrue(poor.getMessage().contains("does not allow negative balance"));
+        assertTrue(poor.getMessage().contains("does not allow negative balance"));
             nodes.awaitCatchUp();
             assertEquals(0, new BigDecimal("10").compareTo(ledger.balance(client, available, "USD").balance()));
             assertEquals(journalsBefore + 1L, ledger.journals(0, 1).total());
 
             // eurSink has no EUR row yet. autoCreate=false on plain postings
             // surfaces the missing row instead of silently creating it.
-            LedgerViolation currency = assertThrows(LedgerViolation.class,
-                    () -> ledger.post(new Posting(
+        LedgerViolation currency = assertThrows(LedgerViolation.class,
+                () -> ledger.post(new Posting(
                             client, available, eurSink, available, "EUR", BigDecimal.ONE, id("REQ"), null, null, false)));
             assertTrue(currency.getMessage().contains("Account not found"));
             // Fund the client EUR row first (company is a BANK and may go negative);
@@ -228,25 +228,25 @@ class PgLedgerTest {
             assertEquals(0, BigDecimal.ONE.compareTo(ledger.balance(eurSink, available, "EUR").balance()));
             assertNotNull(eurMove.id());
 
-            LedgerViolation missing = assertThrows(LedgerViolation.class,
+        LedgerViolation missing = assertThrows(LedgerViolation.class,
                     () -> ledger.post(posting(prefix + "NOPE", available, company, available, "USD", "1")));
-            assertTrue(missing.getMessage().contains("Account not found"));
+        assertTrue(missing.getMessage().contains("Account not found"));
 
-            LedgerViolation same = assertThrows(LedgerViolation.class,
+        LedgerViolation same = assertThrows(LedgerViolation.class,
                     () -> ledger.post(posting(client, available, client, available, "USD", "1")));
-            assertTrue(same.getMessage().contains("Cannot transfer to the same account"));
+        assertTrue(same.getMessage().contains("Cannot transfer to the same account"));
 
-            LedgerViolation positive = assertThrows(LedgerViolation.class,
+        LedgerViolation positive = assertThrows(LedgerViolation.class,
                     () -> ledger.post(posting(company, available, sink, sinkable, "USD", "1")));
-            assertTrue(positive.getMessage().contains("does not allow positive balance"));
+        assertTrue(positive.getMessage().contains("does not allow positive balance"));
             assertEquals(0, BigDecimal.ZERO.compareTo(ledger.balance(sink, sinkable, "USD").balance()));
 
-            LedgerViolation amount = assertThrows(LedgerViolation.class,
+        LedgerViolation amount = assertThrows(LedgerViolation.class,
                     () -> ledger.post(posting(company, available, client, available, "USD", "0")));
-            assertTrue(amount.getMessage().contains("must be positive"));
-            LedgerViolation blank = assertThrows(LedgerViolation.class,
+        assertTrue(amount.getMessage().contains("must be positive"));
+        LedgerViolation blank = assertThrows(LedgerViolation.class,
                     () -> ledger.createAccount(new CreateAccount("  ", available, "USD", null, null, null)));
-            assertEquals("account_id, balance_type, and currency are required", blank.getMessage());
+        assertEquals("account_id, balance_type, and currency are required", blank.getMessage());
         }
     }
 
@@ -267,13 +267,13 @@ class PgLedgerTest {
             ledger.post(posting(company, available, client, available, "USD", "30"));
             nodes.awaitCatchUp();
 
-            JournalPage first = ledger.journals(0, 2);
+        JournalPage first = ledger.journals(0, 2);
             assertTrue(first.total() >= 3L);
             assertEquals(2, first.transfers().size());
-            assertTrue(first.hasNext());
+        assertTrue(first.hasNext());
             assertNewerFirst(first.transfers().get(0), first.transfers().get(1));
 
-            JournalPage second = ledger.journals(1, 2);
+        JournalPage second = ledger.journals(1, 2);
             assertEquals(first.total(), second.total());
             assertFalse(second.transfers().isEmpty());
             assertNewerFirst(first.transfers().get(1), second.transfers().get(0));
@@ -302,11 +302,11 @@ class PgLedgerTest {
             long emptyPage = (first.total() + 1L) / 2L;
             assertTrue(emptyPage <= Integer.MAX_VALUE);
             JournalPage empty = ledger.journals((int) emptyPage, 2);
-            assertEquals(0, empty.transfers().size());
+        assertEquals(0, empty.transfers().size());
             assertEquals(first.total(), empty.total());
             assertFalse(empty.hasNext());
-            assertThrows(IllegalArgumentException.class, () -> ledger.journals(-1, 10));
-            assertThrows(IllegalArgumentException.class, () -> ledger.journals(0, 201));
+        assertThrows(IllegalArgumentException.class, () -> ledger.journals(-1, 10));
+        assertThrows(IllegalArgumentException.class, () -> ledger.journals(0, 201));
         }
     }
 
@@ -317,15 +317,15 @@ class PgLedgerTest {
             String accountId = id("META");
             String available = accountId + "A";
             ledger.createBalanceType(new CreateBalanceType(available, "Available", null));
-            Account created = ledger.createAccount(new CreateAccount(
+        Account created = ledger.createAccount(new CreateAccount(
                     accountId, available, "USD", "  ", Map.of("desk", "fx"), null));
             assertEquals(accountId, created.name());
             // Default policy on a fresh type: negative denied, positive allowed.
             assertFalse(created.allowNegativeBalance());
-            assertTrue(created.allowPositiveBalance());
+        assertTrue(created.allowPositiveBalance());
             assertEquals("CLIENT", created.accountClass());
             assertFalse(created.deleted());
-            assertEquals("fx", created.metadata().get("desk"));
+        assertEquals("fx", created.metadata().get("desk"));
 
             Account bank = ledger.createAccount(new CreateAccount(
                     accountId + "B", available, "USD", null, null, "bank"));
@@ -815,17 +815,17 @@ class PgLedgerTest {
             ledger.post(posting(c, available, b, available, "USD", "1000"));
             nodes.awaitCatchUp();
             long journalsBefore = ledger.journals(0, 1).total();
-            int rounds = 100;
-            CyclicBarrier start = new CyclicBarrier(2);
-            ExecutorService pool = Executors.newFixedThreadPool(2);
-            try {
+        int rounds = 100;
+        CyclicBarrier start = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
                 Future<Integer> left = pool.submit(() -> run(ledger, start, rounds, b, a, available));
                 Future<Integer> right = pool.submit(() -> run(ledger, start, rounds, a, b, available));
-                assertEquals(rounds, left.get());
-                assertEquals(rounds, right.get());
-            } finally {
-                pool.shutdownNow();
-            }
+            assertEquals(rounds, left.get());
+            assertEquals(rounds, right.get());
+        } finally {
+            pool.shutdownNow();
+        }
             nodes.awaitCatchUp();
             BigDecimal leftBalance = ledger.balance(a, available, "USD").balance();
             BigDecimal rightBalance = ledger.balance(b, available, "USD").balance();

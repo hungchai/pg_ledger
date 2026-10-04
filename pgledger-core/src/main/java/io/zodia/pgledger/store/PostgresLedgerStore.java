@@ -52,18 +52,7 @@ public final class PostgresLedgerStore implements LedgerStore {
     private static final String ENSURE_BANK_POOL = "SELECT pgledger_ensure_bank_pool(?, ?, ?, ?, ?)";
     private static final String CUT_SNAPSHOT = "SELECT pgledger_cut_balance_snapshot(?)";
     private static final String ENSURE_SNAPSHOT_PARTITIONS = "SELECT pgledger_ensure_snapshot_partitions(?, ?)";
-    private static final String SNAPSHOTS = """
-            SELECT s.snapshot_hour, a.account_id, bt.code AS balance_type, c.code AS currency,
-                   ac.code AS account_class, s.year, s.month, s.day, s.hour,
-                   s.balance, s.previous_balance, s.version, s.deleted
-            FROM pgledger_balance_snapshots s
-            JOIN pgledger_accounts a ON a.id = s.account_pk
-            JOIN pgledger_balance_types bt ON bt.id = s.balance_type_id
-            JOIN pgledger_currencies c ON c.id = s.currency_id
-            JOIN pgledger_account_classes ac ON ac.id = s.account_class_id
-            WHERE s.snapshot_hour = ?
-            ORDER BY a.account_id, bt.code, c.code
-            """;
+    private static final String SNAPSHOTS = "SELECT * FROM pgledger_snapshot_rows(?)";
     private static final String SNAPSHOT_MOVEMENTS = "SELECT * FROM pgledger_snapshot_movements(?, ?)";
     private static final String SNAPSHOT_ACCOUNT_MOVEMENTS = "SELECT * FROM pgledger_snapshot_account_movements(?, ?)";
     private static final String DELETE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS

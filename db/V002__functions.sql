@@ -879,6 +879,48 @@ $$ LANGUAGE plpgsql;
 
 -- ---------------------------------------------------------------- snapshots --
 
+-- Rows of one snapshot hour, codes resolved. Function wrapper keeps the query
+-- shape identical to the other snapshot calls (SELECT * FROM fn(?)) so
+-- ShardingSphere pass-down never binds the partitioned parent table.
+CREATE OR REPLACE FUNCTION pgledger_snapshot_rows(p_hour TIMESTAMPTZ)
+RETURNS TABLE (
+    snapshot_hour TIMESTAMPTZ,
+    account_id TEXT,
+    balance_type TEXT,
+    currency TEXT,
+    account_class TEXT,
+    year INT,
+    month INT,
+    day INT,
+    hour INT,
+    balance NUMERIC,
+    previous_balance NUMERIC,
+    version BIGINT,
+    deleted BOOLEAN
+)
+AS $$
+    SELECT s.snapshot_hour,
+           a.account_id,
+           bt.code,
+           c.code,
+           ac.code,
+           s.year,
+           s.month,
+           s.day,
+           s.hour,
+           s.balance,
+           s.previous_balance,
+           s.version,
+           s.deleted
+    FROM pgledger_balance_snapshots s
+    JOIN pgledger_accounts a ON a.id = s.account_pk
+    JOIN pgledger_balance_types bt ON bt.id = s.balance_type_id
+    JOIN pgledger_currencies c ON c.id = s.currency_id
+    JOIN pgledger_account_classes ac ON ac.id = s.account_class_id
+    WHERE s.snapshot_hour = p_hour
+    ORDER BY a.account_id, bt.code, c.code
+$$ LANGUAGE sql STABLE;
+
 -- Cuts an hourly snapshot for the given UTC hour (must be :00, seconds 0).
 -- One row per live account balance row; previous_balance comes from the last
 -- earlier snapshot of the same account_pk. Safe to re-run for the same hour:
