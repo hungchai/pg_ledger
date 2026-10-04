@@ -7,7 +7,7 @@ Writes go to the primary (**writer**). Balance and journal reads go to a streami
 | | |
 |---|---|
 | Stack | Java 21, Spring Boot, Postgres 18 |
-| Local demo | Docker Compose (writer + reader + API + Prometheus + Grafana) |
+| Local demo | Docker Compose (nginx LB + 2 stateless APIs + writer/reader Postgres + Prometheus + Grafana) |
 | Schema | `db/V001__ledger.sql`, `db/V002__functions.sql` (idempotent) |
 
 ## Table of contents
@@ -29,8 +29,12 @@ Writes go to the primary (**writer**). Balance and journal reads go to a streami
 ## Architecture
 
 ```text
-Client ──HTTP──► API (stateless)
-                   │
+            ┌─────────────┐
+Client ────►│ nginx :80   │ least_conn
+            └──────┬──────┘
+                   ├─► api-1 :8080 ─┐
+                   └─► api-2 :8080 ─┤  stateless (ShedLock elects one job leader)
+                                     │
                    ├─ writes ──► writer (Postgres primary :5432)
                    └─ reads  ──► reader (streaming replica :5433)
 ```
@@ -57,11 +61,15 @@ curl -s http://127.0.0.1:8080/health
 
 | Service | URL |
 |---------|-----|
-| API | http://127.0.0.1:8080 |
+| **nginx (entry point)** | **http://127.0.0.1:80** |
+| API instance 1 (direct) | http://127.0.0.1:8080 |
+| API instance 2 (direct) | http://127.0.0.1:8081 |
 | Writer Postgres | `localhost:5432` / db `pgledger` / user+pass `pgledger` |
 | Reader Postgres | `localhost:5433` (same credentials) |
 | Prometheus | http://127.0.0.1:9090 |
 | Grafana | http://127.0.0.1:3000 (`admin` / `pgledger`) |
+
+Two stateless API replicas behind nginx (`least_conn`, Docker DNS re-resolved per request). nginx on :80 is the client entry point; the per-instance ports 8080/8081 are for direct debugging. ShedLock-scheduled jobs (snapshot cut, partition roll) elect one leader and run once across both, while both instances serve requests.
 
 ```bash
 # stop (keep data)

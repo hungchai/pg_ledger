@@ -1,4 +1,4 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.config;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;

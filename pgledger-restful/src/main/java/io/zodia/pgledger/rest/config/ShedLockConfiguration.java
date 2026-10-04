@@ -1,4 +1,4 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.config;
 
 import net.javacrumbs.shedlock.core.LockProvider;
 import net.javacrumbs.shedlock.provider.jdbctemplate.JdbcTemplateLockProvider;

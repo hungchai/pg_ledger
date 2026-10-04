@@ -1,5 +1,6 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.web;
 
+import io.zodia.pgledger.rest.PgLedgerServer;
 import io.zodia.pgledger.store.LedgerJson;
 import io.zodia.pgledger.store.LedgerViolation;
 import jakarta.servlet.http.HttpServletRequest;

@@ -1,4 +1,4 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.web;
 
 import io.zodia.pgledger.PgLedger;
 import io.zodia.pgledger.api.LedgerApi.Account;
@@ -9,6 +9,7 @@ import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.DeleteAccount;
 import io.zodia.pgledger.api.LedgerApi.Posting;
 import io.zodia.pgledger.api.LedgerApi.PostingBatch;
+import io.zodia.pgledger.rest.PgLedgerServer;
 import io.zodia.pgledger.store.LedgerJson;
 import io.zodia.pgledger.store.read.LedgerReadService;
 import com.fasterxml.jackson.databind.JsonNode;

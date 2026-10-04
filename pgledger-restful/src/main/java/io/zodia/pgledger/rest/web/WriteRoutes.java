@@ -1,4 +1,4 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.web;
 
 import org.apache.shardingsphere.infra.hint.HintManager;
 

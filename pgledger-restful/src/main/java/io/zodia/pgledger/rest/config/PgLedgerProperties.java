@@ -1,4 +1,4 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 

@@ -1,4 +1,4 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.web;
 
 final class BadRequestException extends RuntimeException {
     BadRequestException() {
