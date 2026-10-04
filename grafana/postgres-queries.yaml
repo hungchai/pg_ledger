@@ -10,16 +10,19 @@ pgledger_replay:
         description: "Replica delay in seconds. Writer reports max replay_lag of connected standbys."
 
 pgledger_rows:
+  # reltuples (planner estimates) instead of count(*): exact counts require
+  # full scans of multi-GB tables on every scrape and starve the workload.
+  # autovacuum keeps the estimates fresh enough for monitoring.
   query: |
-    SELECT 'accounts'::text AS rel, count(*)::float8 AS n FROM pgledger_accounts
+    SELECT 'accounts'::text AS rel, GREATEST(reltuples, 0)::float8 AS n FROM pg_class WHERE relname = 'pgledger_accounts'
     UNION ALL
-    SELECT 'transfers'::text, count(*)::float8 FROM pgledger_transfers
+    SELECT 'transfers'::text, GREATEST(reltuples, 0)::float8 FROM pg_class WHERE relname = 'pgledger_transfers'
     UNION ALL
-    SELECT 'entries'::text, count(*)::float8 FROM pgledger_entries
+    SELECT 'entries'::text, GREATEST(reltuples, 0)::float8 FROM pg_class WHERE relname = 'pgledger_entries'
   metrics:
     - rel:
         usage: "LABEL"
         description: "Ledger table"
     - n:
         usage: "GAUGE"
-        description: "Row count"
+        description: "Estimated row count (reltuples)"

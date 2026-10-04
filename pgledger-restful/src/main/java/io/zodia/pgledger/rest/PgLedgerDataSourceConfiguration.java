@@ -51,7 +51,9 @@ class PgLedgerDataSourceConfiguration {
             @Qualifier("readerDataSource") DataSource reader,
             PgLedgerProperties properties) throws SQLException {
         requireRoles(writer, reader, properties);
-        PostgresLedgerStore.migrate(writer);
+        if (properties.autoMigrateOrDefault()) {
+            PostgresLedgerStore.migrate(writer);
+        }
         return readWriteSplitting(writer, reader);
     }
 

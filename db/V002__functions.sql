@@ -236,12 +236,70 @@ DROP FUNCTION IF EXISTS pgledger_post_cash(TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC
 DROP FUNCTION IF EXISTS pgledger_post_cash(TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC, TIMESTAMPTZ, TEXT, INT);
 DROP FUNCTION IF EXISTS pgledger_create_transfer(TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC, TIMESTAMPTZ, JSONB);
 DROP FUNCTION IF EXISTS pgledger_create_transfer(TEXT, TEXT, TEXT, TEXT, TEXT, NUMERIC, TIMESTAMPTZ, TEXT, TEXT, TEXT);
+DROP FUNCTION IF EXISTS pgledger_create_transfer(TEXT, INT, TEXT, INT, TEXT, NUMERIC, TIMESTAMPTZ, TEXT, TEXT, TEXT, BOOLEAN);
 DROP FUNCTION IF EXISTS pgledger_create_transfers(VARIADIC transfer_request[]);
+DROP FUNCTION IF EXISTS pgledger_create_transfers(TEXT, VARIADIC transfer_request[]);
 DROP FUNCTION IF EXISTS pgledger_create_transfers(transfer_request[], TIMESTAMPTZ, JSONB);
 DROP FUNCTION IF EXISTS pgledger_create_transfers(transfer_request[], TIMESTAMPTZ, TEXT, TEXT, TEXT);
+-- Return type changed to pgledger_posted_transfer; CREATE OR REPLACE cannot
+-- alter a return type, so drop the prior signatures (with and without
+-- auto_create) and the single-leg / variadic wrappers below.
 DROP FUNCTION IF EXISTS pgledger_create_transfers(transfer_request[], TIMESTAMPTZ, TEXT, TEXT, TEXT, BOOLEAN);
 
+-- Returns the retention cutoff (timestamptz) of the partial request_id index,
+-- parsed from the index predicate itself so function and index can never
+-- disagree after a roll.
+CREATE OR REPLACE FUNCTION pgledger_request_id_cutoff() RETURNS TIMESTAMPTZ
+AS $$
+    SELECT COALESCE(
+        (SELECT substring(pg_get_expr(i.indpred, i.indrelid)
+                          FROM '''([^'']+)''')::timestamptz
+         FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indrelid
+         JOIN pg_class ic ON ic.oid = i.indexrelid
+         WHERE c.relname = 'pgledger_transfers'
+           AND ic.relname = 'pgledger_transfers_request_id_recent'),
+        '-infinity'::timestamptz)
+$$ LANGUAGE sql STABLE;
+
+-- Rolls the partial request_id index forward to a fresh 45-day cutoff.
+-- Called by the daily ShedLock job. CONCURRENTLY: no write blocking; the
+-- two-index overlap window is safe (dedup may scan both, both are correct).
+CREATE OR REPLACE FUNCTION pgledger_roll_request_id_index(p_retention_days INT DEFAULT 45)
+RETURNS VOID
+AS $$
+DECLARE
+    v_cutoff DATE := CURRENT_DATE - GREATEST(COALESCE(p_retention_days, 45), 1);
+    v_old TEXT;
+BEGIN
+    EXECUTE format(
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS pgledger_transfers_request_id_recent_new
+         ON pgledger_transfers (request_id)
+         WHERE created_at >= %L::timestamptz', v_cutoff);
+    EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS pgledger_transfers_request_id_recent';
+    EXECUTE 'ALTER INDEX pgledger_transfers_request_id_recent_new RENAME TO pgledger_transfers_request_id_recent';
+END;
+$$ LANGUAGE plpgsql VOLATILE;
+
 -- Balance type arguments are ids. This function does not read pgledger_balance_types.
+-- Return rows are captured at INSERT time (business account ids + codes), so the
+-- hot path never re-reads the transfers/accounts tables after writing.
+CREATE TYPE pgledger_posted_transfer AS (
+    id TEXT,
+    seq BIGINT,
+    from_account TEXT,
+    from_balance_type INT,
+    to_account TEXT,
+    to_balance_type INT,
+    currency_id INT,
+    amount NUMERIC,
+    created_at TIMESTAMPTZ,
+    event_at TIMESTAMPTZ,
+    request_id TEXT,
+    biz_type TEXT,
+    biz_reference TEXT
+);
+
 CREATE OR REPLACE FUNCTION pgledger_create_transfers(
     p_transfer_requests transfer_request[],
     p_event_at TIMESTAMPTZ DEFAULT NULL,
@@ -250,7 +308,7 @@ CREATE OR REPLACE FUNCTION pgledger_create_transfers(
     p_biz_type TEXT DEFAULT 'TRANSFER',
     p_auto_create BOOLEAN DEFAULT TRUE
 )
-RETURNS SETOF pgledger_transfers_view
+RETURNS SETOF pgledger_posted_transfer
 AS $$
 DECLARE
     req transfer_request;
@@ -260,6 +318,10 @@ DECLARE
     locked_id TEXT;
     transfer_id TEXT;
     transfer_ids TEXT[] := '{}';
+    results pgledger_posted_transfer[] := '{}';
+    one_row pgledger_posted_transfer;
+    v_seq BIGINT;
+    v_created_at TIMESTAMPTZ;
     v_request_id TEXT;
     v_biz_type TEXT;
     v_biz_type_id INT;
@@ -312,10 +374,19 @@ BEGIN
             req.to_account_id, req.to_balance_type, btrim(req.currency), v_request_id);
         p_transfer_requests[v_ord] := req;
     END LOOP;
-    SELECT COALESCE(array_agg(id ORDER BY id), ARRAY[]::TEXT[])
+    -- Dedup window: the partial request_id index only covers the retention
+    -- window. The cutoff is inlined as a literal via EXECUTE so the planner
+    -- sees two constants and can prove the query implies the index predicate
+    -- (a STABLE function in the WHERE clause defeats that proof and forces
+    -- the PK scan).
+    EXECUTE format(
+        'SELECT COALESCE(array_agg(id ORDER BY id), ARRAY[]::TEXT[])
+         FROM pgledger_transfers
+         WHERE request_id = $1
+           AND created_at >= %L::timestamptz',
+        pgledger_request_id_cutoff())
     INTO v_existing_ids
-    FROM pgledger_transfers
-    WHERE request_id = v_request_id;
+    USING v_request_id;
     v_count := COALESCE(array_length(v_existing_ids, 1), 0);
     IF v_count > 0 THEN
         IF v_count <> array_length(p_transfer_requests, 1) THEN
@@ -345,9 +416,18 @@ BEGIN
             END IF;
         END LOOP;
         RETURN QUERY
-        SELECT * FROM pgledger_transfers_view
-        WHERE id = ANY(v_existing_ids)
-        ORDER BY id;
+        SELECT t.id, t.seq,
+               fa.account_id, fa.balance_type_id,
+               ta.account_id, ta.balance_type_id,
+               fa.currency_id,
+               t.amount, t.created_at, t.event_at, t.request_id,
+               bt.code, t.biz_reference
+        FROM pgledger_transfers t
+        JOIN pgledger_accounts fa ON fa.id = t.from_account_id
+        JOIN pgledger_accounts ta ON ta.id = t.to_account_id
+        JOIN pgledger_biz_types bt ON bt.id = t.biz_type_id
+        WHERE t.id = ANY(v_existing_ids)
+        ORDER BY t.id;
         RETURN;
     END IF;
 
@@ -449,9 +529,28 @@ BEGIN
             from_row.id, to_row.id, req.amount, now(), coalesce(p_event_at, now()),
             v_request_id, v_biz_type_id, v_biz_reference
         )
-        RETURNING pgledger_transfers.id INTO transfer_id;
+        RETURNING pgledger_transfers.id, pgledger_transfers.seq, pgledger_transfers.created_at
+        INTO transfer_id, v_seq, v_created_at;
 
         transfer_ids := array_append(transfer_ids, transfer_id);
+
+        -- Capture the posted row entirely from in-memory values: no re-read
+        -- JOIN against multi-GB tables on the hot path. Column order must
+        -- match pgledger_posted_transfer.
+        one_row := (
+            transfer_id,
+            v_seq,
+            btrim(req.from_account_id), req.from_balance_type,
+            btrim(req.to_account_id), req.to_balance_type,
+            v_currency_ids[v_ord],
+            req.amount,
+            v_created_at,
+            coalesce(p_event_at, v_created_at),
+            v_request_id,
+            v_biz_type,
+            v_biz_reference
+        )::pgledger_posted_transfer;
+        results := array_append(results, one_row);
 
         INSERT INTO pgledger_entries (
             account_id, transfer_id, amount, account_previous_balance, account_current_balance, account_version, created_at
@@ -470,11 +569,10 @@ BEGIN
         );
     END LOOP;
 
+    -- Serve the response from the captured array: zero table scans.
     RETURN QUERY
-    SELECT *
-    FROM pgledger_transfers_view
-    WHERE id = ANY(transfer_ids)
-    ORDER BY id;
+    SELECT * FROM unnest(results) AS r
+    ORDER BY r.id;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -493,7 +591,7 @@ CREATE OR REPLACE FUNCTION pgledger_create_transfer(
     p_biz_type TEXT DEFAULT 'TRANSFER',
     p_auto_create BOOLEAN DEFAULT TRUE
 )
-RETURNS SETOF pgledger_transfers_view
+RETURNS SETOF pgledger_posted_transfer
 AS $$
 BEGIN
     IF NULLIF(btrim(p_request_id), '') IS NULL THEN
@@ -522,7 +620,7 @@ CREATE OR REPLACE FUNCTION pgledger_create_transfers(
     p_request_id TEXT,
     VARIADIC transfer_requests transfer_request[]
 )
-RETURNS SETOF pgledger_transfers_view
+RETURNS SETOF pgledger_posted_transfer
 AS $$
 BEGIN
     RETURN QUERY
@@ -789,12 +887,16 @@ CREATE OR REPLACE FUNCTION pgledger_cut_balance_snapshot(p_hour TIMESTAMPTZ)
 RETURNS BIGINT
 AS $$
 DECLARE
-    v_hour TIMESTAMPTZ := date_trunc('hour', p_hour);
+    v_hour TIMESTAMPTZ := date_trunc('hour', p_hour, 'UTC');
     v_count BIGINT;
 BEGIN
-    IF date_trunc('hour', v_hour) <> v_hour THEN
+    IF date_trunc('hour', v_hour, 'UTC') <> v_hour THEN
         RAISE EXCEPTION 'snapshot hour must be a full hour';
     END IF;
+
+    -- Never fail at a month boundary: ensure the monthly partition for v_hour
+    -- (and next month's) exists before writing.
+    PERFORM pgledger_ensure_snapshot_partitions(v_hour, 1);
 
     CREATE TEMP TABLE pgledger_snapshot_cut ON COMMIT DROP AS
     SELECT a.id AS account_pk,
@@ -841,6 +943,130 @@ BEGIN
     RETURN v_count;
 END;
 $$ LANGUAGE plpgsql;
+
+-- pgledger_ensure_snapshot_partitions(TIMESTAMPTZ, INT) is defined in V001,
+-- next to the table it manages; the cut function below calls it.
+
+-- Retention housekeeping: drops every monthly snapshot partition that lies
+-- entirely before the UTC month holding p_older_than. Partitions are built
+-- only by pgledger_ensure_snapshot_partitions / the V001 migration, so the
+-- yYYYYmMM name always matches the partition's UTC month bounds. Rows are
+-- counted before the drop and reported; p_dry_run true skips the drop.
+-- Concurrent ensures serialize on the same advisory lock.
+CREATE OR REPLACE FUNCTION pgledger_drop_snapshots_before(
+    p_older_than TIMESTAMPTZ,
+    p_dry_run BOOLEAN DEFAULT TRUE
+)
+RETURNS TABLE (
+    partition_name TEXT,
+    rows_dropped BIGINT
+)
+AS $$
+DECLARE
+    v_cutoff TIMESTAMPTZ;
+    v_schema TEXT;
+    r RECORD;
+BEGIN
+    v_cutoff := date_trunc('month', p_older_than, 'UTC');
+    SELECT pn.nspname INTO v_schema
+    FROM pg_class c
+    JOIN pg_namespace pn ON pn.oid = c.relnamespace
+    WHERE c.oid = 'pgledger_balance_snapshots'::regclass;
+    IF v_schema IS NULL THEN
+        RETURN;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('pgledger_balance_snapshots:partition', 0));
+
+    FOR r IN
+        SELECT pt.relname AS part_name,
+               substring(pt.relname FROM 'y([0-9]{4})m[0-9]{2}$')::int AS part_year,
+               substring(pt.relname FROM 'y[0-9]{4}m([0-9]{2})$')::int AS part_month
+        FROM pg_inherits i
+        JOIN pg_class parent ON parent.oid = i.inhparent
+        JOIN pg_class pt ON pt.oid = i.inhrelid
+        WHERE parent.oid = 'pgledger_balance_snapshots'::regclass
+          AND pt.relispartition
+          AND pt.relkind = 'r'
+          AND pt.relname ~ '^pgledger_balance_snapshots_y[0-9]{4}m[0-9]{2}$'
+          AND make_timestamp(
+                  substring(pt.relname FROM 'y([0-9]{4})m[0-9]{2}$')::int,
+                  substring(pt.relname FROM 'y[0-9]{4}m([0-9]{2})$')::int,
+                  1, 0, 0, 0) AT TIME ZONE 'UTC' < v_cutoff
+    LOOP
+        EXECUTE format('SELECT count(*) FROM %I.%I', v_schema, r.part_name) INTO rows_dropped;
+        partition_name := r.part_name;
+        IF NOT COALESCE(p_dry_run, FALSE) THEN
+            EXECUTE format('DROP TABLE %I.%I', v_schema, r.part_name);
+        END IF;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Per-account movement between snapshot hours. For client statements: one row
+-- per (account_pk, balance type, currency) that was live anywhere in the span,
+-- with opening = balance at/before from_hour, closing = latest <= to_hour,
+-- movement = closing - opening. No grouping.
+CREATE OR REPLACE FUNCTION pgledger_snapshot_account_movements(
+    p_from_hour TIMESTAMPTZ,
+    p_to_hour TIMESTAMPTZ DEFAULT NULL
+)
+RETURNS TABLE (
+    account_id TEXT,
+    name TEXT,
+    balance_type TEXT,
+    currency TEXT,
+    opening_balance NUMERIC,
+    closing_balance NUMERIC,
+    movement NUMERIC
+)
+AS $$
+DECLARE
+    v_from TIMESTAMPTZ := date_trunc('hour', p_from_hour);
+    v_to TIMESTAMPTZ;
+BEGIN
+    IF p_to_hour IS NULL THEN
+        SELECT MAX(snapshot_hour) INTO v_to FROM pgledger_balance_snapshots;
+    ELSE
+        v_to := date_trunc('hour', p_to_hour);
+    END IF;
+    IF v_to IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    WITH open_hour AS (
+        SELECT MAX(snapshot_hour) AS h
+        FROM pgledger_balance_snapshots
+        WHERE snapshot_hour <= v_from
+    ),
+    opening AS (
+        SELECT s.account_pk, s.balance
+        FROM pgledger_balance_snapshots s, open_hour oh
+        WHERE oh.h IS NOT NULL AND s.snapshot_hour = oh.h
+    ),
+    closing AS (
+        SELECT DISTINCT ON (s.account_pk) s.account_pk, s.balance
+        FROM pgledger_balance_snapshots s
+        WHERE s.snapshot_hour <= v_to
+        ORDER BY s.account_pk, s.snapshot_hour DESC
+    )
+    SELECT a.account_id,
+           a.name,
+           bt.code,
+           c.code,
+           COALESCE(o.balance, 0),
+           cl.balance,
+           cl.balance - COALESCE(o.balance, 0)
+    FROM closing cl
+    JOIN pgledger_accounts a ON a.id = cl.account_pk
+    JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+    JOIN pgledger_currencies c ON c.id = a.currency_id
+    LEFT JOIN opening o ON o.account_pk = cl.account_pk
+    ORDER BY a.account_id, bt.code, c.code;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
 -- Net balance movement per (balance type, currency, account class) between two
 -- snapshot hours. from_hour is the opening boundary (exclusive base), to_hour

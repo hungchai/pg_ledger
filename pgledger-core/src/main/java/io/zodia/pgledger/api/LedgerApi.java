@@ -215,4 +215,15 @@ public final class LedgerApi {
             BigDecimal closingBalance,
             BigDecimal movement) {
     }
+
+    /** Per-account movement for client statements. No grouping. */
+    public record AccountMovement(
+            String accountId,
+            String name,
+            String balanceType,
+            String currency,
+            BigDecimal openingBalance,
+            BigDecimal closingBalance,
+            BigDecimal movement) {
+    }
 }

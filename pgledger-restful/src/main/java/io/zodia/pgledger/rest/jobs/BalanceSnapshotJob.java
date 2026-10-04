@@ -1,6 +1,7 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.jobs;
 
 import io.zodia.pgledger.PgLedger;
+import io.zodia.pgledger.rest.PgLedgerServer;
 import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -16,7 +17,7 @@ import java.time.temporal.ChronoUnit;
  * PGLEDGER_SNAPSHOT_CRON.
  */
 @Component
-class BalanceSnapshotJob {
+public class BalanceSnapshotJob {
     private final PgLedger ledger;
 
     BalanceSnapshotJob(PgLedger ledger) {
@@ -28,9 +29,7 @@ class BalanceSnapshotJob {
     public void cutHourly() {
         // Five past the hour: snapshot the hour that just closed (hh:00 UTC).
         Instant hour = Instant.now().truncatedTo(ChronoUnit.HOURS);
-        // pgledger_cut_balance_snapshot is a SELECT that writes; force the
-        // primary or ShardingSphere routes it to the read-only replica.
-        long rows = WriteRoutes.onWriter(() -> ledger.cutBalanceSnapshot(hour));
+        long rows = ledger.cutBalanceSnapshot(hour);
         PgLedgerServer.log.info("balance snapshot {} cut: {} rows", hour, rows);
     }
 }

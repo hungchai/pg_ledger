@@ -254,7 +254,28 @@ WHERE seq IS NULL
 CREATE UNIQUE INDEX IF NOT EXISTS pgledger_transfers_seq_key ON pgledger_transfers (seq);
 ALTER TABLE pgledger_transfers ALTER COLUMN seq SET DEFAULT nextval('pgledger_transfer_seq');
 
-CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_idx ON pgledger_transfers (request_id);
+-- Idempotency dedup uses a PARTIAL index over a rolling retention window.
+-- The cutoff is a frozen date constant captured when the index is created;
+-- V002's daily job (pgledger_roll_request_id_index) rebuilds it with a fresh
+-- cutoff. Full-history request_id lookups are not supported once data ages
+-- out of the window: a replay older than the cutoff books as a new transfer.
+-- This keeps the hot-path index small enough for a modest shared_buffers.
+DROP INDEX IF EXISTS pgledger_transfers_request_id_idx;
+DO $do$
+DECLARE
+    v_cutoff DATE := CURRENT_DATE - 45;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE indexname = 'pgledger_transfers_request_id_recent'
+    ) THEN
+        EXECUTE format(
+            'CREATE INDEX IF NOT EXISTS pgledger_transfers_request_id_recent
+             ON pgledger_transfers (request_id)
+             WHERE created_at >= %L::timestamptz', v_cutoff);
+    END IF;
+END
+$do$;
 CREATE INDEX IF NOT EXISTS pgledger_transfers_biz_type_id_idx ON pgledger_transfers (biz_type_id);
 CREATE INDEX IF NOT EXISTS pgledger_transfers_from_account_id_idx ON pgledger_transfers (from_account_id);
 CREATE INDEX IF NOT EXISTS pgledger_transfers_to_account_id_idx ON pgledger_transfers (to_account_id);
@@ -296,7 +317,151 @@ CREATE TABLE IF NOT EXISTS pgledger_balance_snapshots (
     deleted BOOLEAN NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (snapshot_hour, account_pk)
-);
+) PARTITION BY RANGE (snapshot_hour);
+
+-- Creates the missing monthly partitions covering the month holding p_from
+-- plus p_months_ahead months (NULLs = now(), 12). Partition names stay
+-- stable: pgledger_balance_snapshots_yYYYYmMM, bounds on UTC month starts.
+-- pgledger_cut_balance_snapshot (V002) calls this before writing, so the job
+-- never fails at a month boundary. Concurrent callers serialize on the same
+-- advisory lock the migration block below uses; a lost create race from a
+-- foreign creator is swallowed. Returns partitions created by this call.
+CREATE OR REPLACE FUNCTION pgledger_ensure_snapshot_partitions(
+    p_from TIMESTAMPTZ DEFAULT NULL,
+    p_months_ahead INT DEFAULT NULL
+)
+RETURNS INT
+AS $$
+DECLARE
+    v_from TIMESTAMPTZ;
+    v_months INT;
+    v_created INT := 0;
+    v_month TIMESTAMPTZ;
+    v_end TIMESTAMPTZ;
+    v_name TEXT;
+BEGIN
+    v_from := COALESCE(p_from, now());
+    v_months := COALESCE(p_months_ahead, 12);
+    IF v_months < 0 OR v_months > 120 THEN
+        RAISE EXCEPTION 'months ahead (%) must be between 0 and 120', v_months;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('pgledger_balance_snapshots:partition', 0));
+
+    v_month := date_trunc('month', v_from, 'UTC');
+    v_end := v_month + make_interval(months => v_months + 1);
+    WHILE v_month < v_end LOOP
+        v_name := 'pgledger_balance_snapshots_y' || to_char(v_month AT TIME ZONE 'UTC', 'YYYY')
+                  || 'm' || to_char(v_month AT TIME ZONE 'UTC', 'MM');
+        IF to_regclass(v_name) IS NULL THEN
+            BEGIN
+                EXECUTE format(
+                    'CREATE TABLE IF NOT EXISTS %I PARTITION OF pgledger_balance_snapshots FOR VALUES FROM (%L) TO (%L)',
+                    v_name, v_month, v_month + make_interval(months => 1));
+                v_created := v_created + 1;
+            EXCEPTION
+                WHEN duplicate_table THEN
+                    NULL; -- another creator won the race
+            END;
+        END IF;
+        v_month := v_month + make_interval(months => 1);
+    END LOOP;
+    RETURN v_created;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Snapshots live in monthly partitions so retention can drop whole months.
+-- Older volumes hold a plain table: rename it, recreate partitioned, move the
+-- rows back. Every migrate call also tops up the rolling coverage (current
+-- month, every month holding legacy rows, plus 12 ahead) so a cut never hits
+-- a missing partition.
+DO $do$
+DECLARE
+    r RECORD;
+    v_data_min TIMESTAMPTZ;
+    v_data_max TIMESTAMPTZ;
+    v_migrate BOOLEAN := FALSE;
+    v_month TIMESTAMPTZ;
+    v_end TIMESTAMPTZ;
+BEGIN
+    -- Serialize concurrent migrators; IF NOT EXISTS alone can still race.
+    PERFORM pg_advisory_xact_lock(hashtextextended('pgledger_balance_snapshots:partition', 0));
+
+    IF to_regclass('pgledger_balance_snapshots') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM pg_partitioned_table
+           WHERE partrelid = 'pgledger_balance_snapshots'::regclass
+       ) THEN
+        v_migrate := TRUE;
+        SELECT MIN(snapshot_hour), MAX(snapshot_hour)
+        INTO v_data_min, v_data_max
+        FROM pgledger_balance_snapshots;
+
+        ALTER TABLE pgledger_balance_snapshots RENAME TO pgledger_balance_snapshots_legacy;
+        FOR r IN
+            SELECT conname FROM pg_constraint
+            WHERE conrelid = 'pgledger_balance_snapshots_legacy'::regclass
+              AND contype = 'p'
+        LOOP
+            EXECUTE format('ALTER TABLE pgledger_balance_snapshots_legacy RENAME CONSTRAINT %I TO %I',
+                r.conname, r.conname || '_legacy');
+        END LOOP;
+        FOR r IN
+            SELECT indexname FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'pgledger_balance_snapshots_legacy'
+        LOOP
+            EXECUTE format('ALTER INDEX %I RENAME TO %I', r.indexname, r.indexname || '_legacy');
+        END LOOP;
+
+        CREATE TABLE pgledger_balance_snapshots (
+            snapshot_hour TIMESTAMPTZ NOT NULL,
+            account_pk TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            balance_type_id INT NOT NULL,
+            currency_id INT NOT NULL,
+            account_class_id INT NOT NULL,
+            year INT NOT NULL,
+            month INT NOT NULL,
+            day INT NOT NULL,
+            hour INT NOT NULL,
+            balance NUMERIC NOT NULL,
+            previous_balance NUMERIC NOT NULL,
+            version BIGINT NOT NULL,
+            deleted BOOLEAN NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (snapshot_hour, account_pk)
+        ) PARTITION BY RANGE (snapshot_hour);
+    END IF;
+
+    -- Rolling coverage: current month plus 12 ahead, widened to hold every
+    -- legacy data month when migrating. The three-arg date_trunc and the
+    -- explicit UTC casts keep partition bounds and names session-TZ proof.
+    v_month := date_trunc('month', now(), 'UTC');
+    v_end := v_month + make_interval(months => 13);
+    IF v_data_min IS NOT NULL THEN
+        v_month := LEAST(v_month, date_trunc('month', v_data_min, 'UTC'));
+    END IF;
+    IF v_data_max IS NOT NULL THEN
+        v_end := GREATEST(v_end, date_trunc('month', v_data_max, 'UTC') + make_interval(months => 1));
+    END IF;
+    WHILE v_month < v_end LOOP
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS %I PARTITION OF pgledger_balance_snapshots FOR VALUES FROM (%L) TO (%L)',
+            'pgledger_balance_snapshots_y' || to_char(v_month AT TIME ZONE 'UTC', 'YYYY')
+                || 'm' || to_char(v_month AT TIME ZONE 'UTC', 'MM'),
+            v_month, v_month + make_interval(months => 1));
+        v_month := v_month + make_interval(months => 1);
+    END LOOP;
+
+    -- Partitions exist; now move the legacy rows and drop the old table.
+    IF v_migrate THEN
+        INSERT INTO pgledger_balance_snapshots
+        SELECT * FROM pgledger_balance_snapshots_legacy;
+        DROP TABLE pgledger_balance_snapshots_legacy;
+    END IF;
+END
+$do$;
 
 CREATE INDEX IF NOT EXISTS pgledger_balance_snapshots_dims_idx
     ON pgledger_balance_snapshots (snapshot_hour, balance_type_id, currency_id, account_class_id);

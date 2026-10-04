@@ -26,6 +26,7 @@ tags:
   - name: postings
   - name: cash
   - name: reads
+  - name: snapshots
 security: []
 
 paths:
@@ -163,18 +164,14 @@ paths:
                 - $ref: '#/components/schemas/PostingBatch'
       responses:
         '200':
-          description: Single leg returns a Transfer; batch returns an array of Transfers
+          description: Minimal ack — read results back via /balances/query or /journals
           headers:
             X-Pgledger-Role:
               $ref: '#/components/headers/Role'
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: '#/components/schemas/Transfer'
-                  - type: array
-                    items:
-                      $ref: '#/components/schemas/Transfer'
+                $ref: '#/components/schemas/WriteAck'
         '400': { $ref: '#/components/responses/BadRequest' }
         '422': { $ref: '#/components/responses/Violation' }
 
@@ -195,14 +192,14 @@ paths:
               $ref: '#/components/schemas/CashMovement'
       responses:
         '200':
-          description: Posted deposit transfer
+          description: Minimal ack — read results back via /balances/query or /journals
           headers:
             X-Pgledger-Role:
               $ref: '#/components/headers/Role'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Transfer'
+                $ref: '#/components/schemas/WriteAck'
         '400': { $ref: '#/components/responses/BadRequest' }
         '422': { $ref: '#/components/responses/Violation' }
 
@@ -222,14 +219,14 @@ paths:
               $ref: '#/components/schemas/CashMovement'
       responses:
         '200':
-          description: Posted withdrawal transfer
+          description: Minimal ack — read results back via /balances/query or /journals
           headers:
             X-Pgledger-Role:
               $ref: '#/components/headers/Role'
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Transfer'
+                $ref: '#/components/schemas/WriteAck'
         '400': { $ref: '#/components/responses/BadRequest' }
         '422': { $ref: '#/components/responses/Violation' }
 
@@ -346,6 +343,114 @@ paths:
                 $ref: '#/components/schemas/JournalPage'
         '400': { $ref: '#/components/responses/BadRequest' }
 
+  /api/v1/snapshots/cut:
+    post:
+      tags: [snapshots]
+      operationId: cutSnapshot
+      summary: Cut an hourly balance snapshot (writer)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hour]
+              properties:
+                hour: { type: string, format: date-time, description: 'UTC hour start, e.g. 2026-10-03T09:00:00Z' }
+      responses:
+        '200':
+          description: Rows snapshotted
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hour: { type: string, format: date-time }
+                  rows: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/Violation' }
+
+  /api/v1/snapshots:
+    get:
+      tags: [snapshots]
+      operationId: snapshotRows
+      summary: Snapshot rows for one UTC hour (reader)
+      parameters:
+        - name: hour
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: One row per live balance at that hour
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BalanceSnapshot'
+
+  /api/v1/snapshots/movements:
+    get:
+      tags: [snapshots]
+      operationId: snapshotMovements
+      summary: Net movement between hours, grouped (reader)
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: false
+          schema: { type: string, format: date-time, description: 'Optional; defaults to latest snapshot' }
+      responses:
+        '200':
+          description: Movement per balance type / currency / account class; sums to zero (double entry)
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SnapshotMovement'
+
+  /api/v1/snapshots/account-movements:
+    get:
+      tags: [snapshots]
+      operationId: snapshotAccountMovements
+      summary: Per-account movement between hours, no grouping (reader)
+      description: For client statements — one row per balance row, filter client-side.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: false
+          schema: { type: string, format: date-time, description: 'Optional; defaults to latest snapshot' }
+      responses:
+        '200':
+          description: One movement row per balance row
+          headers:
+            X-Pgledger-Role:
+              $ref: '#/components/headers/Role'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AccountMovement'
+
 components:
   headers:
     Role:
@@ -380,6 +485,63 @@ components:
       properties:
         error:
           type: string
+
+    WriteAck:
+      type: object
+      description: Minimal success payload for write endpoints — the idempotency key echoed back
+      properties:
+        requestId:
+          type: string
+        status:
+          type: string
+          enum: [posted]
+
+    BalanceSnapshot:
+      type: object
+      properties:
+        hour: { type: string, format: date-time }
+        accountId: { type: string }
+        balanceType: { type: string }
+        currency: { type: string }
+        accountClass: { type: string }
+        year: { type: integer }
+        month: { type: integer }
+        day: { type: integer }
+        hourOfDay: { type: integer }
+        balance:
+          $ref: '#/components/schemas/Amount'
+        previousBalance:
+          $ref: '#/components/schemas/Amount'
+        version: { type: integer, format: int64 }
+        deleted: { type: boolean }
+
+    SnapshotMovement:
+      type: object
+      properties:
+        balanceType: { type: string }
+        currency: { type: string }
+        accountClass: { type: string }
+        openingBalance:
+          $ref: '#/components/schemas/Amount'
+        closingBalance:
+          $ref: '#/components/schemas/Amount'
+        movement:
+          $ref: '#/components/schemas/Amount'
+
+    AccountMovement:
+      type: object
+      description: Per-account movement for client statements
+      properties:
+        accountId: { type: string }
+        name: { type: string }
+        balanceType: { type: string }
+        currency: { type: string }
+        openingBalance:
+          $ref: '#/components/schemas/Amount'
+        closingBalance:
+          $ref: '#/components/schemas/Amount'
+        movement:
+          $ref: '#/components/schemas/Amount'
 
     CreateBalanceType:
       type: object

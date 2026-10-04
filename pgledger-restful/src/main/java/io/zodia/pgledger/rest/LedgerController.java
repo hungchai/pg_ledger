@@ -69,26 +69,38 @@ final class LedgerController {
         JsonNode root = tree(body);
         if (root.has("legs")) {
             PostingBatch batch = LedgerJson.convert(root, PostingBatch.class);
-            return HttpResponses.of(200, PgLedgerServer.WRITER,
-                    LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.post(batch))));
+            WriteRoutes.onWriter(() -> {
+                ledger.post(batch);
+                return null;
+            });
+            return accepted(batch.requestId());
         }
         Posting posting = LedgerJson.convert(root, Posting.class);
-        return HttpResponses.of(200, PgLedgerServer.WRITER,
-                LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.post(posting))));
+        WriteRoutes.onWriter(() -> {
+            ledger.post(posting);
+            return null;
+        });
+        return accepted(posting.requestId());
     }
 
     @PostMapping("/api/v1/deposits")
     ResponseEntity<byte[]> deposit(@RequestBody(required = false) byte[] body) {
         CashMovement movement = read(body, CashMovement.class);
-        return HttpResponses.of(200, PgLedgerServer.WRITER,
-                LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.deposit(movement))));
+        WriteRoutes.onWriter(() -> {
+            ledger.deposit(movement);
+            return null;
+        });
+        return accepted(movement.requestId());
     }
 
     @PostMapping("/api/v1/withdrawals")
     ResponseEntity<byte[]> withdraw(@RequestBody(required = false) byte[] body) {
         CashMovement movement = read(body, CashMovement.class);
-        return HttpResponses.of(200, PgLedgerServer.WRITER,
-                LedgerJson.writeBytes(WriteRoutes.onWriter(() -> ledger.withdraw(movement))));
+        WriteRoutes.onWriter(() -> {
+            ledger.withdraw(movement);
+            return null;
+        });
+        return accepted(movement.requestId());
     }
 
     @PostMapping("/api/v1/accounts/delete")
@@ -169,6 +181,19 @@ final class LedgerController {
                 LedgerJson.writeBytes(ledger.snapshotMovements(parseHour(from), toHour)));
     }
 
+    /**
+     * Per-account movement for client statements (reader).
+     * GET /api/v1/snapshots/account-movements?from=...&to=... (to optional = latest)
+     */
+    @GetMapping("/api/v1/snapshots/account-movements")
+    ResponseEntity<byte[]> snapshotAccountMovements(
+            @RequestParam(name = "from") String from,
+            @RequestParam(name = "to", required = false) String to) {
+        Instant toHour = to == null || to.isBlank() ? null : parseHour(to);
+        return HttpResponses.of(200, PgLedgerServer.READER,
+                LedgerJson.writeBytes(ledger.snapshotAccountMovements(parseHour(from), toHour)));
+    }
+
     @GetMapping("/api/v1/journals")
     ResponseEntity<byte[]> journals(
             @RequestParam(name = "page", required = false) String page,
@@ -210,6 +235,12 @@ final class LedgerController {
             throw new BadRequestException();
         }
         return value;
+    }
+
+    /** Minimal success payload for write endpoints: caller-supplied idempotency key echoed back. */
+    private static ResponseEntity<byte[]> accepted(String requestId) {
+        return HttpResponses.of(200, PgLedgerServer.WRITER, LedgerJson.writeBytes(
+                java.util.Map.of("requestId", requestId == null ? "" : requestId, "status", "posted")));
     }
 
     private static boolean blank(String value) {

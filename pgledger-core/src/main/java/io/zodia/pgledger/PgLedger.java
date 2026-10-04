@@ -10,6 +10,7 @@ import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
 import io.zodia.pgledger.api.LedgerApi.PostingBatch;
 import io.zodia.pgledger.api.LedgerApi.PostingLeg;
+import io.zodia.pgledger.api.LedgerApi.AccountMovement;
 import io.zodia.pgledger.api.LedgerApi.SnapshotMovement;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerStore;
@@ -287,6 +288,17 @@ public final class PgLedger implements AutoCloseable {
         return writer.cutBalanceSnapshot(hour);
     }
 
+    /**
+     * Ensures monthly snapshot partitions cover the month holding {@code from}
+     * plus {@code monthsAhead} months ahead. Returns partitions created.
+     */
+    public int ensureSnapshotPartitions(Instant from, int monthsAhead) {
+        if (from == null) {
+            throw new LedgerViolation("snapshot month is required");
+        }
+        return writer.ensureSnapshotPartitions(from, monthsAhead);
+    }
+
     /** Snapshot rows for one hour, read from the reader. */
     public List<BalanceSnapshot> snapshots(Instant hour) {
         if (hour == null) {
@@ -301,6 +313,14 @@ public final class PgLedger implements AutoCloseable {
             throw new LedgerViolation("from hour is required");
         }
         return reader.snapshotMovements(fromHour, toHour);
+    }
+
+    /** Per-account movement between snapshot hours; toHour null = latest. For client statements. */
+    public List<AccountMovement> snapshotAccountMovements(Instant fromHour, Instant toHour) {
+        if (fromHour == null) {
+            throw new LedgerViolation("from hour is required");
+        }
+        return reader.snapshotAccountMovements(fromHour, toHour);
     }
 
     @Override

@@ -164,11 +164,9 @@ class PgLedgerTest {
                     () -> ledger.post(new Posting(
                             company, available, client, available, "USD", new BigDecimal("101"), funded.requestId(), null)));
             assertTrue(reused.getMessage().contains("request id already used"));
-            assertEquals(2, funded.entries().size());
-            assertEquals(0, new BigDecimal("-100").compareTo(funded.entries().get(0).amount()));
-            assertEquals(0, new BigDecimal("100").compareTo(funded.entries().get(1).amount()));
-            assertEquals(0, new BigDecimal("100").compareTo(funded.entries().get(1).currentBalance()));
-            assertEquals(1L, funded.entries().get(1).version());
+            // Post responses no longer join entries (hot-path read-back cut);
+            // verify the two entries through the journal instead.
+            assertTrue(journalHas(ledger, funded.id()), "journal must show both entries");
 
             Transfer held = ledger.post(posting(client, available, client, locked, "USD", "40"));
             assertEquals(availableType.id(), held.fromBalanceType());
@@ -379,9 +377,8 @@ class PgLedgerTest {
             assertEquals(client, deposit.toAccountId());
             assertEquals("DEPOSIT", deposit.bizType());
             assertTrue(deposit.fromAccountId().startsWith("BANK-USD-" + type + "-"));
-            assertEquals(2, deposit.entries().size());
-            assertEquals(0, amount.negate().compareTo(deposit.entries().get(0).amount()));
-            assertEquals(0, amount.compareTo(deposit.entries().get(1).amount()));
+            // Entries verified via journal: post responses are transfer-only.
+            assertTrue(journalHas(ledger, deposit.id()), "journal must show both entries");
             assertEquals(shardOf(deposit.fromAccountId()), bankShard(deposit.requestId(), 8));
 
             nodes.awaitCatchUp();
@@ -677,6 +674,107 @@ class PgLedgerTest {
 
             // Non-full-hour timestamps are rejected.
             assertThrows(LedgerViolation.class, () -> ledger.cutBalanceSnapshot(hour2.plusSeconds(90)));
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void snapshotPartitionsCoverRollingTwelveMonthsAhead() throws Exception {
+        try (Nodes nodes = new Nodes()) {
+            PgLedger ledger = nodes.ledger;
+            // Migrate pre-created the current month plus 12 ahead (plus any data months).
+            assertTrue(partitionCount() >= 13);
+
+            // A far-future month has no partition yet; the ensure helper must
+            // create exactly it, then be a no-op on re-run.
+            Instant far = Instant.now().atZone(java.time.ZoneOffset.UTC).plusMonths(15).toInstant();
+            assertEquals(1, ledger.ensureSnapshotPartitions(far, 0));
+            assertEquals(0, ledger.ensureSnapshotPartitions(far, 0));
+
+            java.time.ZonedDateTime farMonth = far.atZone(java.time.ZoneOffset.UTC)
+                    .toLocalDate().withDayOfMonth(1).atStartOfDay(java.time.ZoneOffset.UTC);
+            String expected = String.format("pgledger_balance_snapshots_y%04dm%02d",
+                    farMonth.getYear(), farMonth.getMonthValue());
+            assertTrue(partitionExists(expected));
+
+            // Belt-and-braces hourly ensure for the current month is a no-op.
+            assertEquals(0, ledger.ensureSnapshotPartitions(
+                    Instant.now().truncatedTo(java.time.temporal.ChronoUnit.HOURS), 0));
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    void legacySnapshotTableMigratesToPartitionsWithData() throws Exception {
+        // Simulate a pre-partitioning volume: plain table holding rows from an
+        // older month. Migrate must convert it, keep the rows, and cover the
+        // data month plus the rolling 12 ahead.
+        Instant dataHour = Instant.now().atZone(java.time.ZoneOffset.UTC).minusMonths(4)
+                .toInstant().truncatedTo(java.time.temporal.ChronoUnit.HOURS);
+        try (Connection conn = dataSource().getConnection();
+             java.sql.Statement st = conn.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS pgledger_balance_snapshots CASCADE");
+            st.execute("""
+                    CREATE TABLE pgledger_balance_snapshots (
+                        snapshot_hour TIMESTAMPTZ NOT NULL,
+                        account_pk TEXT NOT NULL,
+                        account_id TEXT NOT NULL,
+                        balance_type_id INT NOT NULL,
+                        currency_id INT NOT NULL,
+                        account_class_id INT NOT NULL,
+                        year INT NOT NULL, month INT NOT NULL, day INT NOT NULL, hour INT NOT NULL,
+                        balance NUMERIC NOT NULL, previous_balance NUMERIC NOT NULL,
+                        version BIGINT NOT NULL, deleted BOOLEAN NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+                        PRIMARY KEY (snapshot_hour, account_pk)
+                    )""");
+            st.execute("INSERT INTO pgledger_balance_snapshots VALUES ('" + dataHour
+                    + "', 'PK1', 'ACC1', 1, 1, 1, 1, 1, 1, 0, 5, 0, 0, false, now())");
+        }
+        PostgresLedgerStore.migrate(dataSource());
+
+        try (Connection conn = dataSource().getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT count(*) FROM pg_partitioned_table WHERE partrelid = 'pgledger_balance_snapshots'::regclass");
+             ResultSet rs = ps.executeQuery()) {
+            rs.next();
+            assertEquals(1, rs.getInt(1), "snapshot table must be partitioned after migrate");
+        }
+        assertEquals(1, snapshotRowCount());
+        java.time.ZonedDateTime dataMonth = dataHour.atZone(java.time.ZoneOffset.UTC)
+                .toLocalDate().withDayOfMonth(1).atStartOfDay(java.time.ZoneOffset.UTC);
+        assertTrue(partitionExists(String.format("pgledger_balance_snapshots_y%04dm%02d",
+                dataMonth.getYear(), dataMonth.getMonthValue())));
+        // Data month (4 back) through current + 12 ahead.
+        assertTrue(partitionCount() >= 17);
+    }
+
+    private static int snapshotRowCount() throws SQLException {
+        try (Connection conn = dataSource().getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT count(*) FROM pgledger_balance_snapshots");
+             ResultSet rs = ps.executeQuery()) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+
+    private static int partitionCount() throws SQLException {
+        try (Connection conn = dataSource().getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT count(*) FROM pg_inherits WHERE inhparent = 'pgledger_balance_snapshots'::regclass");
+             ResultSet rs = ps.executeQuery()) {
+            rs.next();
+            return rs.getInt(1);
+        }
+    }
+
+    private static boolean partitionExists(String name) throws SQLException {
+        try (Connection conn = dataSource().getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT to_regclass(?) IS NOT NULL")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getBoolean(1);
+            }
         }
     }
 

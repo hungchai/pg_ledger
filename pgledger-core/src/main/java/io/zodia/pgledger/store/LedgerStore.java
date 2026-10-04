@@ -1,6 +1,7 @@
 package io.zodia.pgledger.store;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.AccountMovement;
 import io.zodia.pgledger.api.LedgerApi.BalanceSnapshot;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
@@ -43,11 +44,17 @@ public interface LedgerStore extends AutoCloseable {
     /** Cuts the hourly snapshot at the given UTC hour; returns rows written. */
     long cutBalanceSnapshot(Instant hour);
 
+    /** Ensures monthly snapshot partitions cover the month holding from plus monthsAhead; returns partitions created. */
+    int ensureSnapshotPartitions(Instant from, int monthsAhead);
+
     /** Snapshot rows for one hour (all dims), ordered by account id. */
     List<BalanceSnapshot> snapshots(Instant hour);
 
     /** Movement per (type, currency, class) between fromHour (exclusive) and toHour inclusive; null to = latest. */
     List<SnapshotMovement> snapshotMovements(Instant fromHour, Instant toHour);
+
+    /** Per-account movement between snapshot hours; null to = latest. For client statements. */
+    List<AccountMovement> snapshotAccountMovements(Instant fromHour, Instant toHour);
 
     @Override
     void close();

@@ -81,6 +81,8 @@ class PgLedgerRestTest {
         registry.add("pgledger.reader-jdbc-url", () -> JDBC_URL);
         registry.add("pgledger.jdbc-user", () -> "postgres");
         registry.add("pgledger.jdbc-password", () -> "postgres");
+        // Embedded Postgres has no initdb scripts; opt in to context-start migrate.
+        registry.add("pgledger.auto-migrate", () -> "true");
     }
 
     @AfterAll
@@ -139,7 +141,8 @@ class PgLedgerRestTest {
             client.createAccount(account(clientId, locked, "USD"));
 
             Transfer funded = client.post(posting(company, available, clientId, available, "USD", "10"));
-            assertEquals(clientId, funded.toAccountId());
+            // Write APIs now return {requestId, status} only; the funded
+            // amount is asserted through the balance read below.
             assertEquals(PgLedgerServer.WRITER, client.role());
             nodes.awaitCatchUp();
 
@@ -251,12 +254,9 @@ class PgLedgerRestTest {
             Transfer first = http.deposit(new CashMovement(prefix + "R1", clientId, type, "USD", amount));
             assertEquals(200, http.status());
             assertEquals(PgLedgerServer.WRITER, http.role());
-            assertEquals(clientId, first.toAccountId());
-            assertEquals("DEPOSIT", first.bizType());
-            assertEquals(prefix + "R1", first.requestId());
-            assertTrue(first.fromAccountId().startsWith("BANK-USD-" + type + "-"));
+            // Response is {requestId, status} only; effect verified via balance.
             Transfer again = http.deposit(new CashMovement(prefix + "R1", clientId, type, "USD", amount));
-            assertEquals(first.id(), again.id());
+            assertEquals(200, http.status());
             nodes.awaitCatchUp();
             assertEquals(0, amount.compareTo(http.balance(clientId, type, "USD").balance()));
 

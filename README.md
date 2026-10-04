@@ -6,7 +6,7 @@ Writes go to the primary (**writer**). Balance and journal reads go to a streami
 
 | | |
 |---|---|
-| Stack | Java 21, Spring Boot, Postgres 16 |
+| Stack | Java 21, Spring Boot, Postgres 18 |
 | Local demo | Docker Compose (writer + reader + API + Prometheus + Grafana) |
 | Schema | `db/V001__ledger.sql`, `db/V002__functions.sql` (idempotent) |
 
@@ -98,6 +98,7 @@ Writer = Postgres primary (writes, SQL functions). Reader = streaming replica (p
 | `POST` | `/api/v1/snapshots/cut` | writer | `pgledger_cut_balance_snapshot(hour)` |
 | `GET` | `/api/v1/snapshots?hour=` | reader | `SELECT … FROM pgledger_balance_snapshots` (joins accounts/registries) |
 | `GET` | `/api/v1/snapshots/movements?from=&to=` | reader | `pgledger_snapshot_movements(from, to)` |
+| `GET` | `/api/v1/snapshots/account-movements?from=&to=` | reader | `pgledger_snapshot_account_movements(from, to)` — per-account rows, no grouping |
 
 Full request/response contract: [openapi.yaml](openapi.yaml). Rendered Swagger UI (GitHub Pages): https://hungchai.github.io/pg_ledger/ — auto-publishes on push to `main`/`dev` when the spec changes.
 
@@ -176,6 +177,8 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/balances/query \
 ```
 
 Same `requestId` + same payload replays the original transfer (no double credit).
+
+Write endpoints (`/postings`, `/deposits`, `/withdrawals`) return a minimal ack — `{"requestId":"…","status":"posted"}` — not the transfer rows. Read results back via `/balances/query` or `/journals` (filter by `requestId` via SQL).
 
 ### 2. Withdrawal with gas fee
 
@@ -279,6 +282,10 @@ curl -s 'http://127.0.0.1:8080/api/v1/journals?page=0&size=50'
 
 Every API instance runs a scheduled job (ShedLock elects one replica) that cuts a balance snapshot at `0 5 * * * *` (5 past every hour, snapshotting the just-closed UTC hour). Rows land in `pgledger_balance_snapshots` — one per live account row with `year/month/day/hour` (UTC), `balance`, and `previous_balance` (prior snapshot's closing balance for that row). Re-cutting an hour replaces its rows.
 
+`pgledger_balance_snapshots` is a **range-partitioned table by month on `snapshot_hour`** (UTC). Monthly partitions are named `pgledger_balance_snapshots_yYYYYmMM`; a `default` partition catches stray hours only if their month's partition is missing. Migrate startup ensures coverage of the current month plus 12 ahead, and `pgledger_cut_balance_snapshot` calls `pgledger_ensure_snapshot_partitions(hour, 1)` before writing, so the job never fails at a month boundary. Volumes created before this change are migrated automatically on first startup: the plain table is renamed, the partitioned layout is rebuilt, all rows are copied into their month's partition, and the old table is dropped — no data loss, safe with concurrent API instances (advisory lock + atomic DO block).
+
+Retention: drop whole old months with `SELECT * FROM pgledger_drop_snapshots_before('2026-01-01', false)` — returns each dropped partition and its row count. Call with `p_dry_run => true` (the default) to list what would be dropped without touching anything.
+
 ```bash
 # Cut a snapshot on demand (normally automatic)
 curl -s -X POST http://127.0.0.1:8080/api/v1/snapshots/cut \
@@ -302,6 +309,19 @@ The movement response groups by balance type, currency, and account class:
 
 `opening` = closing balance at (or before) `from`; `closing` = balance at `to`; `movement` = closing − opening. Movements across all groups sum to zero (double entry).
 
+For client statements (daily/monthly), use the **per-account** variant — no grouping, one row per balance row:
+
+```bash
+curl -s 'http://127.0.0.1:8080/api/v1/snapshots/account-movements?from=2026-10-02T16:00:00Z&to=2026-10-03T16:00:00Z'
+```
+
+```json
+[{"accountId":"CASH-0001","name":"CASH-0001","balanceType":"LIQUID","currency":"USDT",
+  "openingBalance":"186.00","closingBalance":"181.00","movement":"-5.00"}]
+```
+
+Filter to one client in the statement generator, or use `POST /api/v1/balances/query` against the two boundary hours and diff. Rows with `movement = 0` were untouched during the span.
+
 Tunable: `PGLEDGER_SNAPSHOT_CRON` (default `0 5 * * * *`; set empty to disable the job).
 
 More SQL detail: [docs/schema-and-sql.md](docs/schema-and-sql.md).
@@ -321,6 +341,11 @@ Set the same variables on every API replica:
 | `PGLEDGER_JDBC_POOL_SIZE` | no | `40` | Hikari max pool size per role (writer and reader each) |
 | `PGLEDGER_BANK_POOL_SIZE` | no | `8` | BANK shard pool size when auto-created |
 | `PGLEDGER_SNAPSHOT_CRON` | no | `0 5 * * * *` | Hourly snapshot job cron; empty disables |
+| `PGLEDGER_SNAPSHOT_PARTITION_CRON` | no | `0 10 0 * * *` | Daily pre-create of snapshot partitions (12 months ahead); empty disables |
+| `PGLEDGER_ROLL_INDEX_CRON` | no | `0 47 4 * * *` | Daily roll of the partial `request_id` index (keeps the idempotency dedup window fresh); empty disables |
+| `PGLEDGER_REQUEST_ID_RETENTION_DAYS` | no | `45` | Dedup window for `request_id` replay — the partial index and dedup only cover the last N days |
+| `PGLEDGER_ARCHIVE_CRON` / `PGLEDGER_RETENTION_DAYS` | no | — / `90` | Archive job cron / retention days |
+| `PGLEDGER_AUTO_MIGRATE` | no | `false` | Run schema migration on the writer at API startup; opt in (`true`) when the schema is not pre-installed |
 | `PORT` | no | `8080` | HTTP listen port |
 
 Compose sets writer/reader to service hostnames `writer` / `reader`. Outside Compose, point them at your primary and standby, e.g. `jdbc:postgresql://db-primary:5432/pgledger`.
@@ -328,7 +353,7 @@ Compose sets writer/reader to service hostnames `writer` / `reader`. Outside Com
 ### Schema lifecycle
 
 - Empty Compose volumes: Postgres runs `db/V001__ledger.sql` and `db/V002__functions.sql` on first init.
-- Every API process also applies those scripts on the **writer** at startup (idempotent; safe with concurrent starts).
+- API startup migration is **off by default** (`PGLEDGER_AUTO_MIGRATE=false`): the schema is assumed already installed (compose initdb, k8s migration job, or a manual run). Set `PGLEDGER_AUTO_MIGRATE=true` to have every API process apply those scripts on the **writer** at startup (idempotent; safe with concurrent starts). Compose sets it to `true`, so a fresh local stack works out of the box.
 - Breaking change on an old volume: `docker compose down -v`, then bring the stack back up.
 - Timestamps are `TIMESTAMPTZ` (UTC). DB default timezone is `UTC`. Reconnect DBeaver after migrate/wipe so the session shows `+00` / `Z`.
 
@@ -338,7 +363,7 @@ Compose sets writer/reader to service hostnames `writer` / `reader`. Outside Com
 
 ### Jar against existing Postgres
 
-Requires JDK 21 (build) / JRE 21 (run), and a Postgres 16 primary (+ optional hot standby).
+Requires JDK 21 (build) / JRE 21 (run), and a Postgres 18 primary (+ optional hot standby).
 
 ```bash
 ./gradlew :pgledger-restful:bootJar
