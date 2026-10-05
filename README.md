@@ -347,7 +347,7 @@ Set the same variables on every API replica:
 | `PGLEDGER_JDBC_USER` | yes | — | DB user |
 | `PGLEDGER_JDBC_PASSWORD` | yes | — | DB password |
 | `PGLEDGER_JDBC_POOL_SIZE` | no | `40` | Hikari max pool size per role (writer and reader each) |
-| `PGLEDGER_BANK_POOL_SIZE` | no | `8` | BANK shard pool size when auto-created |
+| `PGLEDGER_BANK_POOL_SIZE` | no | `8` | BANK shard pool size when auto-created (max `400`) |
 | `PGLEDGER_SNAPSHOT_CRON` | no | `0 5 * * * *` | Hourly snapshot job cron; empty disables |
 | `PGLEDGER_SNAPSHOT_PARTITION_CRON` | no | `0 10 0 * * *` | Daily pre-create of snapshot partitions (12 months ahead); empty disables |
 | `PGLEDGER_ROLL_INDEX_CRON` | no | `0 47 4 * * *` | Daily roll of the partial `request_id` index (keeps the idempotency dedup window fresh); empty disables |
@@ -464,7 +464,7 @@ Knobs and code paths that actually move throughput or latency here. Measure with
 ### Contention (the real TPS ceiling)
 
 - `pgledger_create_transfers` locks every touched balance row **in sorted internal-id order** (`FOR UPDATE`), so multi-leg posts serialize per-account, not globally. Hotspot ceiling = one account pair.
-- The `BANK` sentinel fans out to `BANK-{currency}-{type}-{n}` shards (`n = hash(request_id) % poolSize`, locked `FOR UPDATE`, **no `SKIP LOCKED`**). If deposits/withdrawals queue behind each other, raise `PGLEDGER_BANK_POOL_SIZE` **before first use** — the pool is created once and keeps its size (`pgledger_ensure_bank_pool(..., keep_existing => false)` to force a resize).
+- The `BANK` sentinel fans out to `BANK-{currency}-{type}-{n}` shards (`n = hash(request_id) % poolSize`, locked `FOR UPDATE`, **no `SKIP LOCKED`**). Default pool size is **8** (max **400**). If deposits/withdrawals queue behind each other, raise `PGLEDGER_BANK_POOL_SIZE` **before first use** — the pool is created once and keeps its size (`pgledger_ensure_bank_pool(..., keep_existing => false)` to force a resize).
 - Same-account same-balance contention (RFQ hold + pay hitting one balance) serializes by design; keep hold/pay legs on **different balance types** (`LIQUID` vs `LOCKED`) where possible.
 
 ### Postgres writer

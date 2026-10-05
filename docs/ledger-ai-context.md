@@ -19,7 +19,7 @@ The API keeps an in-process cache of the four registries. Load at startup. Refet
 
 `request_id` is `TEXT`, indexed, not unique. One `pgledger_create_transfers` call writes the same `request_id` on every leg. A repeat returns those rows. `biz_reference` is an optional transfer reference and is not unique. Transfers have no metadata. Account `metadata` is `JSONB`.
 
-Account id `BANK` is the pool. Stored rows are class `BANK`. Shard business id is `BANK-{currency code}-{balance type code}-{n}`, where `n = hash(request_id) % poolSize`. The chosen shard is locked with `FOR UPDATE` and the call waits. No `SKIP LOCKED`.
+Account id `BANK` is the pool. Stored rows are class `BANK`. Shard business id is `BANK-{currency code}-{balance type code}-{n}`, where `n = hash(request_id) % poolSize`. Default pool size is **8**; max is **400**. First empty-pool create (SQL `pgledger_resolve_account` / Java `PGLEDGER_BANK_POOL_SIZE` / `pgledger_ensure_bank_pool`) uses 8. Existing pools stay sticky when `keep_existing` is true. The chosen shard is locked with `FOR UPDATE` and the call waits. No `SKIP LOCKED`.
 
 Amounts and balances are unbounded `NUMERIC`.
 

@@ -688,8 +688,8 @@ BEGIN
         RAISE EXCEPTION 'balance_type and currency are required';
     END IF;
     v_size := COALESCE(p_pool_size, 8);
-    IF v_size < 1 OR v_size > 1024 THEN
-        RAISE EXCEPTION 'bank pool size (%) must be between 1 and 1024', v_size;
+    IF v_size < 1 OR v_size > 400 THEN
+        RAISE EXCEPTION 'bank pool size (%) must be between 1 and 400', v_size;
     END IF;
     SELECT id INTO v_currency_id FROM pgledger_currencies WHERE code = v_currency;
     IF NOT FOUND THEN
@@ -797,7 +797,7 @@ BEGIN
         IF NOT FOUND THEN
             RETURN NULL;
         END IF;
-        v_size := pgledger_ensure_bank_pool(v_currency, v_code, p_balance_type_id, 400, TRUE);
+        v_size := pgledger_ensure_bank_pool(v_currency, v_code, p_balance_type_id, 8, TRUE);
     ELSE
         v_size := v_max + 1;
     END IF;

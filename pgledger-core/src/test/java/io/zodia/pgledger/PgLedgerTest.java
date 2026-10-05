@@ -432,6 +432,10 @@ class PgLedgerTest {
             LedgerViolation resized = assertThrows(LedgerViolation.class,
                     () -> ledger.ensureBankPool(type, "USD", 4));
             assertTrue(resized.getMessage().contains("bank pool size"));
+            LedgerViolation tooLarge = assertThrows(LedgerViolation.class,
+                    () -> ledger.ensureBankPool(type, "USD", PgLedger.MAX_BANK_POOL_SIZE + 1));
+            assertTrue(tooLarge.getMessage().contains("between 1 and " + PgLedger.MAX_BANK_POOL_SIZE));
+            assertEquals(PgLedger.MAX_BANK_POOL_SIZE, 400);
 
             String[] ids = requestPair(8, false);
             BigDecimal amount = new BigDecimal("10");

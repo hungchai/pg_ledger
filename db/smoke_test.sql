@@ -25,6 +25,7 @@ DECLARE
     withdrawal_biz TEXT;
     deposit_shard INT;
     deposit_from TEXT;
+    bank_pool_size INT;
     available_type INT;
     locked_type INT;
     liquid_type INT;
@@ -486,6 +487,26 @@ BEGIN
     IF deposit_from IS NULL THEN
         RAISE EXCEPTION 'deposit did not debit BANK-USD-SMOKE_AVAILABLE-%', deposit_shard;
     END IF;
+
+    SELECT COUNT(*) INTO bank_pool_size
+    FROM pgledger_accounts_view
+    WHERE account_class = 'BANK'
+      AND balance_type = 'SMOKE_AVAILABLE'
+      AND currency = 'USD'
+      AND deleted = FALSE;
+    IF bank_pool_size <> 8 THEN
+        RAISE EXCEPTION 'default BANK pool size is %, expected 8', bank_pool_size;
+    END IF;
+
+    BEGIN
+        PERFORM pgledger_ensure_bank_pool('USD', 'SMOKE_AVAILABLE', available_type, 401, FALSE);
+        RAISE EXCEPTION 'expected pool size 401 to be rejected';
+    EXCEPTION
+        WHEN OTHERS THEN
+            IF SQLERRM NOT LIKE '%must be between 1 and 400%' THEN
+                RAISE;
+            END IF;
+    END;
 
     SELECT id INTO replay_id
     FROM pgledger_create_transfer(

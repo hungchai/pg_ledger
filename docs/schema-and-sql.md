@@ -227,13 +227,13 @@ BANK-{currency}-{balanceType}-{n}
 
 where `currency` / `balanceType` are codes and `n = hash(request_id) % poolSize` (`0 .. poolSize-1`). The chosen shard is locked with `FOR UPDATE` (no `SKIP LOCKED`).
 
-If the pool does not exist, the transfer creates it at size **8** and keeps that size. Create a different size first with:
+If the pool does not exist, the transfer creates it at size **8** and keeps that size. Pool size must be between 1 and **400**. Create a different size first with:
 
 ```text
 pgledger_ensure_bank_pool(currency, balance_type_code, balance_type_id, pool_size, keep_existing)
 ```
 
-API env `PGLEDGER_BANK_POOL_SIZE` sets that size (default 8).
+API env `PGLEDGER_BANK_POOL_SIZE` sets that size (default 8, max 400). An existing pool stays sticky when `keep_existing` is true.
 
 - Deposit: debit shard, credit client, `biz_type = DEPOSIT`
 - Withdrawal: reverse, `biz_type = WITHDRAWAL`

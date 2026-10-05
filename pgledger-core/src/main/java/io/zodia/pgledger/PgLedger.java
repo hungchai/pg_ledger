@@ -40,7 +40,7 @@ public final class PgLedger implements AutoCloseable {
     public static final int MAX_PAGE_SIZE = 200;
     public static final int DEFAULT_PAGE_SIZE = 50;
     public static final int DEFAULT_BANK_POOL_SIZE = 8;
-    public static final int MAX_BANK_POOL_SIZE = 1024;
+    public static final int MAX_BANK_POOL_SIZE = 400;
 
     private final LedgerStore writer;
     private final LedgerStore reader;
@@ -369,7 +369,8 @@ public final class PgLedger implements AutoCloseable {
 
     private static int poolSize(int poolSize) {
         if (poolSize < 1 || poolSize > MAX_BANK_POOL_SIZE) {
-            throw new LedgerViolation("bank pool size (" + poolSize + ") must be between 1 and 1024");
+            throw new LedgerViolation(
+                    "bank pool size (" + poolSize + ") must be between 1 and " + MAX_BANK_POOL_SIZE);
         }
         return poolSize;
     }
