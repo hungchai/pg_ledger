@@ -4,11 +4,13 @@ Stateless double-entry ledger API backed by **Postgres only** — no Kafka, no R
 
 Writes go to the primary (**writer**). Balance and journal reads go to a streaming replica (**reader**).
 
-| | |
-|---|---|
-| Stack | Java 21, Spring Boot, Postgres 18 |
+
+|            |                                                                                              |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| Stack      | Java 21, Spring Boot, Postgres 18                                                            |
 | Local demo | Docker Compose (nginx LB + 2 stateless APIs + writer/reader Postgres + Prometheus + Grafana) |
-| Schema | `db/V001`–`V003` (idempotent); SIT/prod hotfixes in `db/increments/` |
+| Schema     | `db/V001`–`V003` (idempotent); SIT/prod hotfixes in `db/increments/`                         |
+
 
 ## Table of contents
 
@@ -25,6 +27,8 @@ Writes go to the primary (**writer**). Balance and journal reads go to a streami
 11. [Schema reference](#schema-reference)
 
 ---
+
+
 
 ## Architecture
 
@@ -49,6 +53,8 @@ Do **not** point the writer URL at a replica. Writer and reader URLs may be iden
 
 ---
 
+
+
 ## Quick start
 
 **Prerequisites:** Docker Engine + Compose v2.
@@ -59,15 +65,17 @@ docker compose ps   # wait until writer, reader, and api are healthy
 curl -s http://127.0.0.1:8080/health
 ```
 
-| Service | URL |
-|---------|-----|
-| **nginx (entry point, Postman)** | **http://127.0.0.1:8081** |
-| API instance 1 (direct) | http://127.0.0.1:8080 |
-| API instance 2 (direct) | http://127.0.0.1:8082 |
-| Writer Postgres | `localhost:5432` / db `pgledger` / user+pass `pgledger` |
-| Reader Postgres | `localhost:5433` (same credentials) |
-| Prometheus | http://127.0.0.1:9090 |
-| Grafana | http://127.0.0.1:3000 (`admin` / `pgledger`) |
+
+| Service                          | URL                                                                   |
+| -------------------------------- | --------------------------------------------------------------------- |
+| **nginx (entry point, Postman)** | **[http://127.0.0.1:8081](http://127.0.0.1:8081)**                    |
+| API instance 1 (direct)          | [http://127.0.0.1:8080](http://127.0.0.1:8080)                        |
+| API instance 2 (direct)          | [http://127.0.0.1:8082](http://127.0.0.1:8082)                        |
+| Writer Postgres                  | `localhost:5432` / db `pgledger` / user+pass `pgledger`               |
+| Reader Postgres                  | `localhost:5433` (same credentials)                                   |
+| Prometheus                       | [http://127.0.0.1:9090](http://127.0.0.1:9090)                        |
+| Grafana                          | [http://127.0.0.1:3000](http://127.0.0.1:3000) (`admin` / `pgledger`) |
+
 
 Two stateless API replicas behind nginx (`least_conn`, Docker DNS re-resolved per request). nginx on **:8081** is the client entry point (Postman: set `baseUrl` = `http://localhost:8081`); 8080 / 8082 are direct-to-instance debug ports. ShedLock-scheduled jobs (snapshot cut, partition roll) elect one leader and run once across both, while both instances serve requests.
 
@@ -83,36 +91,44 @@ Compose is a **local / demo** stack (default passwords, exposed Postgres ports) 
 
 ---
 
+
+
 ## HTTP API
+
+
 
 ### Endpoints
 
 Writer = Postgres primary (writes, SQL functions). Reader = streaming replica (plain SELECTs). `GET /balance-types` serves from the in-process registry cache (refreshed every 60s), no per-request query.
 
-| Method | Path | Role | DB source |
-|--------|------|------|-----------|
-| `GET` | `/health` | — | none |
-| `POST` | `/api/v1/balance-types` | writer | `pgledger_create_balance_type(…)` |
-| `GET` | `/api/v1/balance-types` | reader (cache) | registry snapshot — no per-request query |
-| `POST` | `/api/v1/accounts` | writer | `pgledger_create_account(…)` |
-| `POST` | `/api/v1/accounts/delete` | writer | `pgledger_delete_account(…)` |
-| `POST` | `/api/v1/postings` | writer | `pgledger_create_transfers(transfer_request[])` + reload by `request_id` |
-| `POST` | `/api/v1/deposits` | writer | `pgledger_create_transfers(…)` with `BANK` sentinel |
-| `POST` | `/api/v1/withdrawals` | writer | `pgledger_create_transfers(…)` with `BANK` sentinel |
-| `POST` | `/api/v1/balances/query` | reader | `SELECT … FROM pgledger_accounts` (joins registries for codes) |
-| `GET` | `/api/v1/accounts/{accountId}/balances` | reader | same SELECT, single account id |
-| `GET` | `/api/v1/balances` | reader | Single row when `balanceType` + `currency` given; otherwise list for `accountId` (filters optional) |
-| `GET` | `/api/v1/journals?page=&size=` | reader | `SELECT … FROM pgledger_transfers ⋈ pgledger_entries` (paged, newest first) |
-| `POST` | `/api/v1/snapshots/cut` | writer | `pgledger_cut_balance_snapshot(hour)` |
-| `GET` | `/api/v1/snapshots?hour=` | reader | `SELECT … FROM pgledger_balance_snapshots` (joins accounts/registries) |
-| `GET` | `/api/v1/snapshots/movements?from=&to=` | reader | `pgledger_snapshot_movements(from, to)` |
-| `GET` | `/api/v1/snapshots/account-movements?from=&to=` | reader | `pgledger_snapshot_account_movements(from, to)` — per-account rows, no grouping |
 
-Full request/response contract: [openapi.yaml](openapi.yaml). Rendered Swagger UI (GitHub Pages): https://hungchai.github.io/pg_ledger/ — auto-publishes on push to `main`/`dev` when the spec changes.
+| Method | Path                                            | Role           | DB source                                                                                           |
+| ------ | ----------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------- |
+| `GET`  | `/health`                                       | —              | none                                                                                                |
+| `POST` | `/api/v1/balance-types`                         | writer         | `pgledger_create_balance_type(…)`                                                                   |
+| `GET`  | `/api/v1/balance-types`                         | reader (cache) | registry snapshot — no per-request query                                                            |
+| `POST` | `/api/v1/accounts`                              | writer         | `pgledger_create_account(…)`                                                                        |
+| `POST` | `/api/v1/accounts/delete`                       | writer         | `pgledger_delete_account(…)`                                                                        |
+| `POST` | `/api/v1/postings`                              | writer         | `pgledger_create_transfers(transfer_request[])` + reload by `request_id`                            |
+| `POST` | `/api/v1/deposits`                              | writer         | `pgledger_create_transfers(…)` with `BANK` sentinel                                                 |
+| `POST` | `/api/v1/withdrawals`                           | writer         | `pgledger_create_transfers(…)` with `BANK` sentinel                                                 |
+| `POST` | `/api/v1/balances/query`                        | reader         | `SELECT … FROM pgledger_accounts` (joins registries for codes)                                      |
+| `GET`  | `/api/v1/accounts/{accountId}/balances`         | reader         | same SELECT, single account id                                                                      |
+| `GET`  | `/api/v1/balances`                              | reader         | Single row when `balanceType` + `currency` given; otherwise list for `accountId` (filters optional) |
+| `GET`  | `/api/v1/journals?page=&size=`                  | reader         | `SELECT … FROM pgledger_transfers ⋈ pgledger_entries` (paged, newest first)                         |
+| `POST` | `/api/v1/snapshots/cut`                         | writer         | `pgledger_cut_balance_snapshot(hour)`                                                               |
+| `GET`  | `/api/v1/snapshots?hour=`                       | reader         | `SELECT … FROM pgledger_balance_snapshots` (joins accounts/registries)                              |
+| `GET`  | `/api/v1/snapshots/movements?from=&to=`         | reader         | `pgledger_snapshot_movements(from, to)`                                                             |
+| `GET`  | `/api/v1/snapshots/account-movements?from=&to=` | reader         | `pgledger_snapshot_account_movements(from, to)` — per-account rows, no grouping                     |
+
+
+Full request/response contract: [openapi.yaml](openapi.yaml). Rendered Swagger UI (GitHub Pages): [https://hungchai.github.io/pg_ledger/](https://hungchai.github.io/pg_ledger/) — auto-publishes on push to `main`/`dev` when the spec changes.
 
 Ready-to-run Postman collection covering every endpoint: [postman/pgledger.postman_collection.json](postman/pgledger.postman_collection.json) — import into Postman; collection variables `baseUrl` (default `http://localhost:8081`, via nginx), `accountId`, `balanceType`, `currency` drive the requests.
 
 ---
+
+
 
 ## Business cases
 
@@ -286,11 +302,13 @@ Currency and balance type must already exist in the registries. There is no cros
 curl -s 'http://127.0.0.1:8080/api/v1/journals?page=0&size=50'
 ```
 
+
+
 ### 5. Hourly balance snapshots and net movement
 
 Every API instance runs a scheduled job (ShedLock elects one replica) that cuts a balance snapshot at `0 5 * * * *` (5 past every hour, snapshotting the just-closed UTC hour). Rows land in `pgledger_balance_snapshots` — one per live account row with `year/month/day/hour` (UTC), `balance`, and `previous_balance` (prior snapshot's closing balance for that row). Re-cutting an hour replaces its rows.
 
-`pgledger_balance_snapshots` is a **range-partitioned table by month on `snapshot_hour`** (UTC). Monthly partitions are named `pgledger_balance_snapshots_yYYYYmMM`; a `default` partition catches stray hours only if their month's partition is missing. Migrate startup ensures coverage of the current month plus 12 ahead, and `pgledger_cut_balance_snapshot` calls `pgledger_ensure_snapshot_partitions(hour, 1)` before writing, so the job never fails at a month boundary. Volumes created before this change are migrated automatically on first startup: the plain table is renamed, the partitioned layout is rebuilt, all rows are copied into their month's partition, and the old table is dropped — no data loss, safe with concurrent API instances (advisory lock + atomic DO block).
+`pgledger_balance_snapshots` is a **range-partitioned table by month on** `snapshot_hour` (UTC). Monthly partitions are named `pgledger_balance_snapshots_yYYYYmMM`; a `default` partition catches stray hours only if their month's partition is missing. Migrate startup ensures coverage of the current month plus 12 ahead, and `pgledger_cut_balance_snapshot` calls `pgledger_ensure_snapshot_partitions(hour, 1)` before writing, so the job never fails at a month boundary. Volumes created before this change are migrated automatically on first startup: the plain table is renamed, the partitioned layout is rebuilt, all rows are copied into their month's partition, and the old table is dropped — no data loss, safe with concurrent API instances (advisory lock + atomic DO block).
 
 Retention: drop whole old months with `SELECT * FROM pgledger_drop_snapshots_before('2026-01-01', false)` — returns each dropped partition and its row count. Call with `p_dry_run => true` (the default) to list what would be dropped without touching anything.
 
@@ -336,25 +354,29 @@ More SQL detail: [docs/schema-and-sql.md](docs/schema-and-sql.md).
 
 ---
 
+
+
 ## Configuration
 
 Set the same variables on every API replica:
 
-| Variable | Required | Default | Meaning |
-|----------|----------|---------|---------|
-| `PGLEDGER_WRITER_JDBC_URL` | yes | — | Primary JDBC URL |
-| `PGLEDGER_READER_JDBC_URL` | yes | — | Replica JDBC URL (may equal writer for single-node) |
-| `PGLEDGER_JDBC_USER` | yes | — | DB user |
-| `PGLEDGER_JDBC_PASSWORD` | yes | — | DB password |
-| `PGLEDGER_JDBC_POOL_SIZE` | no | `40` | Hikari max pool size per role (writer and reader each) |
-| `PGLEDGER_BANK_POOL_SIZE` | no | `8` | BANK shard pool size when auto-created (max `400`) |
-| `PGLEDGER_SNAPSHOT_CRON` | no | `0 5 * * * *` | Hourly snapshot job cron; empty disables |
-| `PGLEDGER_SNAPSHOT_PARTITION_CRON` | no | `0 10 0 * * *` | Daily pre-create of snapshot partitions (12 months ahead); empty disables |
-| `PGLEDGER_ROLL_INDEX_CRON` | no | `0 47 4 * * *` | Daily roll of the partial `request_id` index (keeps the idempotency dedup window fresh); empty disables |
-| `PGLEDGER_REQUEST_ID_RETENTION_DAYS` | no | `45` | Dedup window for `request_id` replay — the partial index and dedup only cover the last N days |
-| `PGLEDGER_ARCHIVE_CRON` / `PGLEDGER_RETENTION_DAYS` | no | — / `90` | Archive job cron / retention days |
-| `PGLEDGER_AUTO_MIGRATE` | no | `false` | Run schema migration on the writer at API startup; opt in (`true`) when the schema is not pre-installed |
-| `PORT` | no | `8080` | HTTP listen port |
+
+| Variable                                            | Required | Default        | Meaning                                                                                                 |
+| --------------------------------------------------- | -------- | -------------- | ------------------------------------------------------------------------------------------------------- |
+| `PGLEDGER_WRITER_JDBC_URL`                          | yes      | —              | Primary JDBC URL                                                                                        |
+| `PGLEDGER_READER_JDBC_URL`                          | yes      | —              | Replica JDBC URL (may equal writer for single-node)                                                     |
+| `PGLEDGER_JDBC_USER`                                | yes      | —              | DB user                                                                                                 |
+| `PGLEDGER_JDBC_PASSWORD`                            | yes      | —              | DB password                                                                                             |
+| `PGLEDGER_JDBC_POOL_SIZE`                           | no       | `40`           | Hikari max pool size per role (writer and reader each)                                                  |
+| `PGLEDGER_BANK_POOL_SIZE`                           | no       | `8`            | BANK shard pool size when auto-created (max `400`)                                                      |
+| `PGLEDGER_SNAPSHOT_CRON`                            | no       | `0 5 * * * *`  | Hourly snapshot job cron; empty disables                                                                |
+| `PGLEDGER_SNAPSHOT_PARTITION_CRON`                  | no       | `0 10 0 * * *` | Daily pre-create of snapshot partitions (12 months ahead); empty disables                               |
+| `PGLEDGER_ROLL_INDEX_CRON`                          | no       | `0 47 4 * * *` | Daily roll of the partial `request_id` index (keeps the idempotency dedup window fresh); empty disables |
+| `PGLEDGER_REQUEST_ID_RETENTION_DAYS`                | no       | `45`           | Dedup window for `request_id` replay — the partial index and dedup only cover the last N days           |
+| `PGLEDGER_ARCHIVE_CRON` / `PGLEDGER_RETENTION_DAYS` | no       | — / `90`       | Archive job cron / retention days                                                                       |
+| `PGLEDGER_AUTO_MIGRATE`                             | no       | `false`        | Run schema migration on the writer at API startup; opt in (`true`) when the schema is not pre-installed |
+| `PORT`                                              | no       | `8080`         | HTTP listen port                                                                                        |
+
 
 Compose sets writer/reader to service hostnames `writer` / `reader`. Outside Compose, point them at your primary and standby, e.g. `jdbc:postgresql://db-primary:5432/pgledger`.
 
@@ -362,13 +384,17 @@ Compose sets writer/reader to service hostnames `writer` / `reader`. Outside Com
 
 - Empty Compose volumes: Postgres runs `db/V001__ledger.sql` and `db/V002__functions.sql` on first init.
 - API startup migration is **off by default** (`PGLEDGER_AUTO_MIGRATE=false`): the schema is assumed already installed (compose initdb, k8s migration job, or a manual run). Set `PGLEDGER_AUTO_MIGRATE=true` to have every API process apply those scripts on the **writer** at startup (idempotent; safe with concurrent starts). Compose sets it to `true`, so a fresh local stack works out of the box.
-- SIT/prod hotfixes after V001–V003: apply numbered scripts in [`db/increments/`](db/increments/) on the writer (manual, ordered; do not re-run base migrations). See that folder’s README.
+- SIT/prod hotfixes after V001–V003: apply numbered scripts in `[db/increments/](db/increments/)` on the writer (manual, ordered; do not re-run base migrations). See that folder’s README.
 - Breaking change on an old volume: `docker compose down -v`, then bring the stack back up.
 - Timestamps are `TIMESTAMPTZ` (UTC). DB default timezone is `UTC`. Reconnect DBeaver after migrate/wipe so the session shows `+00` / `Z`.
 
 ---
 
+
+
 ## Deployment
+
+
 
 ### Jar against existing Postgres
 
@@ -382,6 +408,8 @@ export PGLEDGER_JDBC_USER=pgledger
 export PGLEDGER_JDBC_PASSWORD=pgledger
 java -jar pgledger-restful/build/libs/pgledger-restful-*.jar
 ```
+
+
 
 ### API image only
 
@@ -399,13 +427,17 @@ docker run --rm -p 8080:8080 \
 
 ---
 
+
+
 ## Tests
 
-| Suite | Postgres | Command |
-|-------|----------|---------|
-| Core (`PgLedgerTest`) | Embedded Postgres (zonky, no Docker) | `./gradlew :pgledger-core:test` |
-| REST (`PgLedgerRestTest`) | Embedded Postgres (single primary for writer+reader URLs) | `./gradlew :pgledger-restful:test` |
-| Stress (`PgLedgerStressTest`) | Compose on `5432` / `5433` | `docker compose up -d` then `./gradlew :pgledger-restful:stressTest` |
+
+| Suite                         | Postgres                                                  | Command                                                              |
+| ----------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------- |
+| Core (`PgLedgerTest`)         | Embedded Postgres (zonky, no Docker)                      | `./gradlew :pgledger-core:test`                                      |
+| REST (`PgLedgerRestTest`)     | Embedded Postgres (single primary for writer+reader URLs) | `./gradlew :pgledger-restful:test`                                   |
+| Stress (`PgLedgerStressTest`) | Compose on `5432` / `5433`                                | `docker compose up -d` then `./gradlew :pgledger-restful:stressTest` |
+
 
 Core and REST do not need Docker. `stressTest` is excluded from `:pgledger-restful:test`.
 
@@ -414,6 +446,8 @@ Stress prints a TPS summary to stdout and writes `pgledger-restful/build/reports
 Tunables: `-Dpgledger.stress.levels=50,100,200`, `-Dpgledger.stress.posts=20`, `-Dpgledger.stress.maxLagMs=15000`.
 
 ---
+
+
 
 ## Load / stress
 
@@ -429,15 +463,17 @@ One-shot wipe, start Compose (API + Prometheus + Grafana), run deposit → withd
 ./scripts/k6-cash-stress.sh --help
 ```
 
-| Flag | Default | Meaning |
-|------|---------|---------|
-| `--vus N` | `20` | Virtual users |
-| `--duration M` | `60s` | k6 duration **per scenario** (`60s`, `120m`, …) |
-| `--accounts N` | `100` | `CASH-000` / `RFQ-000` … × ETH/BTC/USDT |
-| `--base-url URL` | `http://127.0.0.1:8080` | API base |
-| `--no-wipe` | off | Skip `docker compose down -v` |
-| `--no-build` | off | `compose up` without `--build` |
-| `--fund-rounds N` | `30` | Seed deposits per CASH account/ccy before withdrawal |
+
+| Flag              | Default                 | Meaning                                              |
+| ----------------- | ----------------------- | ---------------------------------------------------- |
+| `--vus N`         | `20`                    | Virtual users                                        |
+| `--duration M`    | `60s`                   | k6 duration **per scenario** (`60s`, `120m`, …)      |
+| `--accounts N`    | `100`                   | `CASH-000` / `RFQ-000` … × ETH/BTC/USDT              |
+| `--base-url URL`  | `http://127.0.0.1:8080` | API base                                             |
+| `--no-wipe`       | off                     | Skip `docker compose down -v`                        |
+| `--no-build`      | off                     | `compose up` without `--build`                       |
+| `--fund-rounds N` | `30`                    | Seed deposits per CASH account/ccy before withdrawal |
+
 
 Reports under `reports/<run-id>/` (also mirrored to `reports/latest/`):
 
@@ -446,11 +482,13 @@ Reports under `reports/<run-id>/` (also mirrored to `reports/latest/`):
 3. `03-rfq.txt` — multi-leg RFQ vs one company dealer `CO_RFQ`
 4. `04-recon.txt` — money conservation / orphans / versions
 
-Grafana dashboard **pgledger**: pick testid `deposit-*`, `withdrawal-*`, or `rfq-*` for API TPS.
+Grafana dashboard **pgledger**: pick testid `deposit-`*, `withdrawal-*`, or `rfq-*` for API TPS.
 
 Recon alone (stack already up): `./scripts/recon.sh` or `./scripts/recon.sh reports/latest/04-recon.txt`.
 
 ---
+
+
 
 ## Performance tuning
 
@@ -462,20 +500,28 @@ Knobs and code paths that actually move throughput or latency here. Measure with
 - Reads are cheap and offloaded to the replica — the reader pool can usually be smaller than the writer pool.
 - Pool exhaustion shows up as latency spikes, not errors. Watch Hikari `pending` / connection wait in metrics.
 
+
+
 ### Contention (the real TPS ceiling)
 
 - `pgledger_create_transfers` locks every touched balance row **in sorted internal-id order** (`FOR UPDATE`), so multi-leg posts serialize per-account, not globally. Hotspot ceiling = one account pair.
-- The `BANK` sentinel fans out to `BANK-{currency}-{type}-{n}` shards (`n = hash(request_id) % poolSize`, locked `FOR UPDATE`, **no `SKIP LOCKED`**). Default pool size is **8** (max **400**). If deposits/withdrawals queue behind each other, raise `PGLEDGER_BANK_POOL_SIZE` **before first use** — the pool is created once and keeps its size (`pgledger_ensure_bank_pool(..., keep_existing => false)` to force a resize).
+- The `BANK` sentinel fans out to `BANK-{currency}-{type}-{n}` shards (`n = hash(request_id) % poolSize`, locked `FOR UPDATE`, **no** `SKIP LOCKED`). Default pool size is **8** (max **400**). If deposits/withdrawals queue behind each other, raise `PGLEDGER_BANK_POOL_SIZE` **before first use** — the pool is created once and keeps its size (`pgledger_ensure_bank_pool(..., keep_existing => false)` to force a resize).
 - Same-account same-balance contention (RFQ hold + pay hitting one balance) serializes by design; keep hold/pay legs on **different balance types** (`LIQUID` vs `LOCKED`) where possible.
+
+
 
 ### Postgres writer
 
-| Knob | Why |
-|------|-----|
-| `synchronous_commit = off` | Latency win on deposits/withdrawals if you can tolerate a small commit-loss window. Do **not** do this for a real ledger without understanding the tradeoff. |
-| `max_connections` | Size for `2 × JDBC pool × API instances` + exporters + admin. |
-| `shared_buffers`, `wal_keep_size` | Compose defaults are demo-sized; raise for real volume. |
-| `hot_standby` feedback / replication lag | Reader lag directly delays balance visibility — monitor `pg_stat_replication` on the writer (exporter panel). |
+
+| Knob                                     | Why                                                                                                                                                          |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `synchronous_commit = off`               | Latency win on deposits/withdrawals if you can tolerate a small commit-loss window. Do **not** do this for a real ledger without understanding the tradeoff. |
+| `max_connections`                        | Size for `2 × JDBC pool × API instances` + exporters + admin.                                                                                                |
+| `shared_buffers`, `wal_keep_size`        | Compose defaults are demo-sized; raise for real volume.                                                                                                      |
+| `hot_standby` feedback / replication lag | Reader lag directly delays balance visibility — monitor `pg_stat_replication` on the writer (exporter panel).                                                |
+
+
+
 
 ### Reads
 
@@ -483,19 +529,25 @@ Knobs and code paths that actually move throughput or latency here. Measure with
 - Registry lookups (balance type / currency / biz type / class) never hit the DB per-request; they come from the in-process cache refreshed every 60s. New registry rows are visible only after refresh — don't "fix" slow-looking lookups that aren't there.
 - Journal pages use `(created_at DESC, id DESC)` — deep pages (`page` high) get slow; prefer cursoring by time window if you page far back.
 
+
+
 ### JVM
 
 - The API is Spring Boot on JDK 21. Keep heaps small-to-moderate; the write path is JDBC-bound, not allocation-bound. Virtual threads (used by the stress client) help open-connection concurrency, not lock contention.
 
 ---
 
+
+
 ## Observability
 
-- Grafana dashboard **pgledger** (provisioned under `grafana/`) — http://127.0.0.1:3000, login `admin` / `pgledger`
+- Grafana dashboard **pgledger** (provisioned under `grafana/`) — [http://127.0.0.1:3000](http://127.0.0.1:3000), login `admin` / `pgledger`
 - Postgres exporters: writer `:9187`, reader `:9188`
 - Cash stress reports: `./scripts/k6-cash-stress.sh` → `reports/<run-id>/`
 
 ---
+
+
 
 ## Schema reference
 
@@ -505,14 +557,16 @@ Registries, hot tables, BANK pool, and SQL function examples live in:
 
 Short model:
 
-| Concept | Table / mechanism |
-|---------|-------------------|
-| Registries | `account_classes`, `balance_types`, `currencies`, `biz_types` (id + code) |
-| Balance | `pgledger_accounts` — one row per `(account_id, balance_type, currency)` |
-| Journal | `pgledger_transfers` + two `pgledger_entries` per transfer |
-| Idempotency | `request_id` on transfers |
-| Ledger order | `pgledger_transfers.seq` — global monotonic sequence (`CACHE 64`, holes normal). Replay/reconciliation cursor: `WHERE seq > :last_seen ORDER BY seq`; exposed as `seq` on the `Transfer` JSON |
-| External cash | Sentinel account `BANK` → hashed shard pool |
+
+| Concept         | Table / mechanism                                                                                                                                                                                 |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Registries      | `account_classes`, `balance_types`, `currencies`, `biz_types` (id + code)                                                                                                                         |
+| Balance         | `pgledger_accounts` — one row per `(account_id, balance_type, currency)`                                                                                                                          |
+| Journal         | `pgledger_transfers` + two `pgledger_entries` per transfer                                                                                                                                        |
+| Idempotency     | `request_id` on transfers                                                                                                                                                                         |
+| Ledger order    | `pgledger_transfers.seq` — global monotonic sequence (`CACHE 64`, holes normal). Replay/reconciliation cursor: `WHERE seq > :last_seen ORDER BY seq`; exposed as `seq` on the `Transfer` JSON     |
+| External cash   | Sentinel account `BANK` → hashed shard pool                                                                                                                                                       |
 | Hourly snapshot | `pgledger_balance_snapshots` — one row per live balance per UTC hour, with `previous_balance`; cut by `pgledger_cut_balance_snapshot(hour)`, movement via `pgledger_snapshot_movements(from, to)` |
+
 
 Design notes for agents/sessions: [docs/ledger-ai-context.md](docs/ledger-ai-context.md).
