@@ -177,13 +177,15 @@ export default function (data) {
   );
   check(res, {
     'rfq 200': (r) => r.status === 200,
-    'rfq two transfers': (r) => {
+    'rfq accepted': (r) => {
       if (r.status !== 200) {
         return false;
       }
       try {
         const body = JSON.parse(r.body);
-        return Array.isArray(body) && body.length === 2;
+        // Write APIs return {requestId, status:"posted"}; the two legs are
+        // verified by recon (entries net to zero), not by the response body.
+        return body.status === 'posted' && typeof body.requestId === 'string';
       } catch (e) {
         return false;
       }

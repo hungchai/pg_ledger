@@ -102,6 +102,9 @@ FAIL=0
     JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id AND bt.code = 'LIQUID'
     JOIN pgledger_currencies c ON c.id = a.currency_id
     WHERE a.balance < 0
+      -- BANK sentinel shards are the mint/burn side of deposits and
+      -- withdrawals; a negative shard balance is by design, not a breach.
+      AND a.account_id NOT LIKE 'BANK-%'
     LIMIT 20;
   " || true)"
   if [[ -n "${NEG}" ]]; then
