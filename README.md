@@ -8,7 +8,7 @@ Writes go to the primary (**writer**). Balance and journal reads go to a streami
 |---|---|
 | Stack | Java 21, Spring Boot, Postgres 18 |
 | Local demo | Docker Compose (nginx LB + 2 stateless APIs + writer/reader Postgres + Prometheus + Grafana) |
-| Schema | `db/V001__ledger.sql`, `db/V002__functions.sql` (idempotent) |
+| Schema | `db/V001`–`V003` (idempotent); SIT/prod hotfixes in `db/increments/` |
 
 ## Table of contents
 
@@ -362,6 +362,7 @@ Compose sets writer/reader to service hostnames `writer` / `reader`. Outside Com
 
 - Empty Compose volumes: Postgres runs `db/V001__ledger.sql` and `db/V002__functions.sql` on first init.
 - API startup migration is **off by default** (`PGLEDGER_AUTO_MIGRATE=false`): the schema is assumed already installed (compose initdb, k8s migration job, or a manual run). Set `PGLEDGER_AUTO_MIGRATE=true` to have every API process apply those scripts on the **writer** at startup (idempotent; safe with concurrent starts). Compose sets it to `true`, so a fresh local stack works out of the box.
+- SIT/prod hotfixes after V001–V003: apply numbered scripts in [`db/increments/`](db/increments/) on the writer (manual, ordered; do not re-run base migrations). See that folder’s README.
 - Breaking change on an old volume: `docker compose down -v`, then bring the stack back up.
 - Timestamps are `TIMESTAMPTZ` (UTC). DB default timezone is `UTC`. Reconnect DBeaver after migrate/wipe so the session shows `+00` / `Z`.
 
