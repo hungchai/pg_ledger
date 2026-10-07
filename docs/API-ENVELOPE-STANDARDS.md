@@ -247,40 +247,57 @@ POST /api/v1/balances/query
 
 Transport success is always `HTTP 200` — for business success AND business failure:
 
+**Success:**
+
 ```json
 HTTP 200
 {
-  "result": "OK",
-  "body": [ {}, {}, {} ]
+  "result": "SUCCESS",
+  "data": [ {}, {}, {} ],
+  "error": null
+}
+```
+
+**Business failure (still HTTP 200):**
+
+```json
+HTTP 200
+{
+  "result": "FAIL",
+  "data": null,
+  "error": [ { "errorCode": "..." } ]
 }
 ```
 
 | Field | Type | Rule |
 |---|---|---|
-| `result` | `enum` | `OK` or `FAIL`. Nothing else |
-| `body` | `array` | Always an array. Single item → one-element array. No result → `[]` |
+| `result` | `enum` | `SUCCESS` or `FAIL`. Nothing else |
+| `data` | `array` \| `null` | `null` when `result: FAIL`. Otherwise always an array — single item → one-element array, no result → `[]` |
+| `error` | `array` \| `null` | `null` when `result: SUCCESS`. Otherwise one or more error objects (see 1.6) |
 
-**`body` shape by outcome:**
+**Invariants:**
 
-| result | body content |
-|---|---|
-| `OK` | Result object(s); `[]` when the operation legitimately returns nothing |
-| `FAIL` | One or more error objects (see 1.6) |
+- Exactly one of `data` / `error` is non-null — never both, never neither
+- No partial success: ledger commands are atomic, either booked (`data`) or rejected (`error`)
+- Field names `data`/`error` and constant 3-key shape follow the GraphQL/JSON:API convention — clients get one predictable envelope across all services
+
+Why explicit `null` instead of omitting fields: the envelope shape is constant, so clients and codegen can bind one type. Strict languages (Kotlin/Swift/Rust) get a clean "branch on `result`, then the other field is typed non-null" pattern.
 
 **Success example:**
 
 ```json
 HTTP 200
 {
-  "result": "OK",
-  "body": [
+  "result": "SUCCESS",
+  "data": [
     {
       "accountId": "CLIENT_ACC_001",
       "balanceType": "AVAILABLE_BALANCE",
       "currency": "USD",
       "amount": "200000.00"
     }
-  ]
+  ],
+  "error": null
 }
 ```
 
@@ -290,7 +307,8 @@ HTTP 200
 HTTP 200
 {
   "result": "FAIL",
-  "body": [
+  "data": null,
+  "error": [
     {
       "errorCode": "INSUFFICIENT_BALANCE",
       "errorMessage": "DEBIT 800000.00 exceeds available balance 200000.00",
@@ -326,7 +344,7 @@ HTTP 200
 | `field` | No | Request field the error points to, JSON-path style |
 | `context` | No | Structured details (amounts, IDs) for programmatic handling |
 
-Multiple simultaneous violations → multiple error objects in `body`, order unspecified.
+Multiple simultaneous violations → multiple error objects in `error`, order unspecified.
 
 ---
 
@@ -365,7 +383,7 @@ Idempotency cache lifetime: minimum 24h.
 receive response
 ├─ HTTP != 200        → infra failure. Retry same requestId with backoff
 │                       (401 when auth on: fix key/signature, not a retry)
-├─ result == "OK"     → parse body
+├─ result == "SUCCESS" → parse data
 └─ result == "FAIL"   → map errorCode; do NOT blind-retry
                          (business rejection — a corrected request needs a NEW requestId)
 ```
@@ -379,6 +397,6 @@ receive response
 | `POST` for all business endpoints | `GET` with business params in query string |
 | Auth headers (`X-Api-Key`, `X-Signature`, `X-Timestamp`) at gateway level | Keys/secrets in URL, body, or business code |
 | `requestId` in every request body | Server-generated request IDs |
-| `result: OK/FAIL` carries business outcome | `400`/`422` for business rejections |
-| `body` always an array | Wrapping single results as bare objects |
+| `result: SUCCESS/FAIL` carries business outcome | `400`/`422` for business rejections |
+| `data` always an array when present | Wrapping single results as bare objects |
 | Clients switch on `errorCode` | Clients string-match `errorMessage` |
