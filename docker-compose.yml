@@ -8,14 +8,15 @@
 # wipe volumes and re-run init: docker compose down -v
 # max_connections=400 so 200 concurrent API calls each keep one session.
 # Grafana: http://localhost:3000  admin / pgledger
-# k6 TPS:  K6_PROMETHEUS_RW_TREND_STATS=p(50),p(95),p(99),avg \
-#          k6 run -o experimental-prometheus-rw --tag testid=$(date +%s) k6/postings.js
+# One-shot cash stress (deposit + withdrawal + recon → 3 reports):
+#   ./scripts/k6-cash-stress.sh
+# k6 TPS → Prometheus remote write (dashboard testid dropdown)
 
 name: pgledger
 
 services:
   writer:
-    image: postgres:16
+    image: postgres:18
     container_name: pgledger-writer
     environment:
       POSTGRES_USER: pgledger
@@ -35,24 +36,27 @@ services:
       - wal_keep_size=128MB
       - -c
       - max_connections=400
+      - -c
+      - timezone=UTC
     ports:
       - "5432:5432"
     volumes:
-      - writer_data:/var/lib/postgresql/data
+      - writer_data:/var/lib/postgresql
       - ./db/V001__ledger.sql:/docker-entrypoint-initdb.d/V001__ledger.sql:ro
       - ./db/V002__functions.sql:/docker-entrypoint-initdb.d/V002__functions.sql:ro
+      - ./db/V003__shedlock.sql:/docker-entrypoint-initdb.d/V003__shedlock.sql:ro
       - ./docker/writer/zz-enable-replication.sh:/docker-entrypoint-initdb.d/zz-enable-replication.sh:ro
     shm_size: 512mb
     healthcheck:
       # TCP, not the socket: the entrypoint's temporary server does not listen on TCP.
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U pgledger -d pgledger && test -f /var/lib/postgresql/data/.replication-enabled"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U pgledger -d pgledger && test -f \"$$PGDATA/.replication-enabled\""]
       interval: 3s
       timeout: 5s
       retries: 40
       start_period: 5s
 
   reader:
-    image: postgres:16
+    image: postgres:18
     container_name: pgledger-reader
     environment:
       POSTGRES_USER: pgledger
@@ -65,7 +69,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - reader_data:/var/lib/postgresql/data
+      - reader_data:/var/lib/postgresql
       - ./docker/reader/entrypoint.sh:/reader-entrypoint.sh:ro
     shm_size: 512mb
     depends_on:
@@ -150,7 +154,9 @@ services:
       PGLEDGER_READER_JDBC_URL: jdbc:postgresql://reader:5432/pgledger
       PGLEDGER_JDBC_USER: pgledger
       PGLEDGER_JDBC_PASSWORD: pgledger
-      PGLEDGER_BANK_POOL_SIZE: "8"
+      PGLEDGER_BANK_POOL_SIZE: "80"
+      PGLEDGER_JDBC_POOL_SIZE: "100"
+      PGLEDGER_AUTO_MIGRATE: "true"
       PORT: "8080"
     ports:
       - "8080:8080"
@@ -165,6 +171,46 @@ services:
       timeout: 3s
       retries: 20
       start_period: 20s
+
+  # Second stateless replica: proves multi-instance behaviour (ShedLock jobs
+  # elect one leader, both serve reads/writes). Scheduled jobs still run once.
+  api-2:
+    image: pgledger-api
+    container_name: pgledger-api-2
+    environment:
+      PGLEDGER_WRITER_JDBC_URL: jdbc:postgresql://writer:5432/pgledger
+      PGLEDGER_READER_JDBC_URL: jdbc:postgresql://reader:5432/pgledger
+      PGLEDGER_JDBC_USER: pgledger
+      PGLEDGER_JDBC_PASSWORD: pgledger
+      PGLEDGER_BANK_POOL_SIZE: "80"
+      PGLEDGER_JDBC_POOL_SIZE: "100"
+      PGLEDGER_AUTO_MIGRATE: "true"
+      PORT: "8080"
+    ports:
+      - "8082:8080"
+    depends_on:
+      writer:
+        condition: service_healthy
+      reader:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/8080'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  # Load balancer in front of both API replicas. Entry point for clients: :80.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: pgledger-nginx
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8081:80"
+    depends_on:
+      - api
+      - api-2
 
 volumes:
   writer_data:

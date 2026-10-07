@@ -1,23 +1,29 @@
 package io.zodia.pgledger;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.BalanceSnapshot;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
 import io.zodia.pgledger.api.LedgerApi.CashMovement;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.PostingBatch;
+import io.zodia.pgledger.api.LedgerApi.PostingLeg;
+import io.zodia.pgledger.api.LedgerApi.AccountMovement;
+import io.zodia.pgledger.api.LedgerApi.SnapshotMovement;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
 import io.zodia.pgledger.store.LedgerStore;
 import io.zodia.pgledger.store.LedgerViolation;
 import io.zodia.pgledger.store.PostgresLedgerStore;
+import io.zodia.pgledger.store.RegistryCache;
 import org.postgresql.ds.PGSimpleDataSource;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
-import java.util.Set;
 
 /**
  * One balance row is {@code (account_id, balance_type, currency)}.
@@ -34,21 +40,28 @@ public final class PgLedger implements AutoCloseable {
     public static final int MAX_PAGE_SIZE = 200;
     public static final int DEFAULT_PAGE_SIZE = 50;
     public static final int DEFAULT_BANK_POOL_SIZE = 8;
-    public static final int MAX_BANK_POOL_SIZE = 1024;
-    private static final Set<String> ACCOUNT_CLASSES = Set.of(
-            "CLIENT", "COMPANY", "BANK", "NOSTRO", "SUSPENSE", "CONTROL");
+    public static final int MAX_BANK_POOL_SIZE = 400;
 
     private final LedgerStore writer;
     private final LedgerStore reader;
+    private final RegistryCache registries;
     private final int bankPoolSize;
 
-    private PgLedger(LedgerStore writer, LedgerStore reader, int bankPoolSize) {
+    private PgLedger(LedgerStore writer, LedgerStore reader, RegistryCache registries, int bankPoolSize) {
         if (bankPoolSize < 1 || bankPoolSize > MAX_BANK_POOL_SIZE) {
             throw new IllegalArgumentException("bank pool size");
         }
         this.writer = writer;
         this.reader = reader;
+        this.registries = registries;
         this.bankPoolSize = bankPoolSize;
+    }
+
+    /**
+     * The registry snapshot backing id/code resolution. Shared, read-only view.
+     */
+    public RegistryCache registryCache() {
+        return registries;
     }
 
     /**
@@ -66,9 +79,11 @@ public final class PgLedger implements AutoCloseable {
         if (writer == null || reader == null) {
             throw new IllegalArgumentException("writer and reader are required");
         }
-        PostgresLedgerStore writerStore = new PostgresLedgerStore(writer, true);
-        PostgresLedgerStore readerStore = new PostgresLedgerStore(reader, false);
-        return new PgLedger(writerStore, readerStore, bankPoolSize);
+        PostgresLedgerStore.migrate(writer);
+        RegistryCache registries = new RegistryCache(reader);
+        PostgresLedgerStore writerStore = new PostgresLedgerStore(writer, false, registries);
+        PostgresLedgerStore readerStore = new PostgresLedgerStore(reader, false, registries);
+        return new PgLedger(writerStore, readerStore, registries, bankPoolSize);
     }
 
     /**
@@ -88,8 +103,9 @@ public final class PgLedger implements AutoCloseable {
         if (dataSource == null) {
             throw new IllegalArgumentException("dataSource is required");
         }
-        PostgresLedgerStore store = new PostgresLedgerStore(dataSource, false);
-        return new PgLedger(store, store, bankPoolSize);
+        RegistryCache registries = new RegistryCache(dataSource);
+        PostgresLedgerStore store = new PostgresLedgerStore(dataSource, false, registries);
+        return new PgLedger(store, store, registries, bankPoolSize);
     }
 
     public static PgLedger postgres(String writerUrl, String readerUrl, String user, String password) {
@@ -108,7 +124,14 @@ public final class PgLedger implements AutoCloseable {
         String description = command.description() == null || command.description().isBlank()
                 ? null
                 : command.description().strip();
-        return writer.createBalanceType(new CreateBalanceType(code, name, description));
+        BalanceType created = writer.createBalanceType(new CreateBalanceType(code, name, description,
+                command.allowNegative(), command.allowPositive()));
+        registries.remember(created);
+        return created;
+    }
+
+    public void refreshRegistries() {
+        registries.refresh();
     }
 
     public List<BalanceType> balanceTypes() {
@@ -122,28 +145,36 @@ public final class PgLedger implements AutoCloseable {
         String accountId = required(command.accountId());
         String balanceType = required(command.balanceType());
         String currency = required(command.currency());
+        if (registries.balanceTypeByCode(balanceType) == null) {
+            throw new LedgerViolation("balance type not found");
+        }
+        registries.requireCurrency(currency);
         String name = command.name() == null || command.name().isBlank() ? accountId : command.name().strip();
         return writer.createAccount(new CreateAccount(
                 accountId,
                 balanceType,
                 currency,
                 name,
-                flag(command.allowNegativeBalance()),
-                flag(command.allowPositiveBalance()),
                 command.metadata(),
-                accountClass(command.accountClass())));
+                registries.requireAccountClass(command.accountClass())));
     }
 
     public int ensureBankPool(String balanceType, String currency, int poolSize) {
-        return writer.ensureBankPool(required(balanceType), required(currency), poolSize(poolSize), false);
+        int typeId = registries.balanceTypeId(required(balanceType));
+        String typeCode = registries.balanceTypeCode(typeId);
+        if (typeCode == null) {
+            throw new LedgerViolation("balance type not found");
+        }
+        registries.requireCurrency(required(currency));
+        return writer.ensureBankPool(typeCode, typeId, required(currency), poolSize(poolSize), false);
     }
 
     public Transfer deposit(CashMovement movement) {
-        return cash("DEPOSIT", movement);
+        return moveViaBank(movement, "BANK", null, "DEPOSIT");
     }
 
     public Transfer withdraw(CashMovement movement) {
-        return cash("WITHDRAWAL", movement);
+        return moveViaBank(movement, null, "BANK", "WITHDRAWAL");
     }
 
     public Account deleteAccount(String accountId, String balanceType, String currency) {
@@ -160,26 +191,75 @@ public final class PgLedger implements AutoCloseable {
     }
 
     public Transfer post(Posting posting) {
-        if (posting == null
-                || blank(posting.fromAccountId())
-                || blank(posting.fromBalanceType())
-                || blank(posting.toAccountId())
-                || blank(posting.toBalanceType())
-                || blank(posting.currency())) {
+        if (posting == null) {
             throw new LedgerViolation("account_id, balance_type, and currency are required");
         }
-        BigDecimal amount = posting.amount();
-        if (amount == null || amount.signum() <= 0) {
-            throw new LedgerViolation("Amount (" + (amount == null ? "null" : amount.toPlainString()) + ") must be positive");
+        List<Transfer> transfers = post(new PostingBatch(
+                posting.requestId(),
+                posting.bizReference(),
+                posting.bizType(),
+                List.of(new PostingLeg(
+                        posting.fromAccountId(),
+                        posting.fromBalanceType(),
+                        posting.toAccountId(),
+                        posting.toBalanceType(),
+                        posting.currency(),
+                        posting.amount())),
+                posting.autoCreate()));
+        return transfers.get(0);
+    }
+
+    /**
+     * Atomic multi-leg posting (RFQ). One {@code requestId}, all legs commit or none.
+     */
+    public List<Transfer> post(PostingBatch batch) {
+        if (batch == null || batch.legs() == null || batch.legs().isEmpty()) {
+            throw new LedgerViolation("at least one posting leg is required");
         }
-        return writer.post(new Posting(
-                posting.fromAccountId().strip(),
-                posting.fromBalanceType().strip(),
-                posting.toAccountId().strip(),
-                posting.toBalanceType().strip(),
-                posting.currency().strip(),
-                amount,
-                posting.metadata()));
+        if (blank(batch.requestId())) {
+            throw new LedgerViolation("request_id is required");
+        }
+        String requestId = batch.requestId().strip();
+        String bizReference = batch.bizReference() == null || batch.bizReference().isBlank()
+                ? null
+                : batch.bizReference().strip();
+        String bizType = batch.bizType() == null || batch.bizType().isBlank()
+                ? null
+                : batch.bizType().strip();
+        if (bizType != null) {
+            registries.requireBizType(bizType);
+        }
+        ArrayList<Posting> resolved = new ArrayList<>(batch.legs().size());
+        for (int i = 0; i < batch.legs().size(); i++) {
+            PostingLeg leg = batch.legs().get(i);
+            if (leg == null
+                    || blank(leg.fromAccountId())
+                    || blank(leg.fromBalanceType())
+                    || blank(leg.toAccountId())
+                    || blank(leg.toBalanceType())
+                    || blank(leg.currency())) {
+                throw new LedgerViolation("account_id, balance_type, and currency are required");
+            }
+            BigDecimal amount = leg.amount();
+            if (amount == null || amount.signum() <= 0) {
+                throw new LedgerViolation("Amount (" + (amount == null ? "null" : amount.toPlainString()) + ") must be positive");
+            }
+            registries.requireCurrency(leg.currency());
+            int fromType = registries.balanceTypeId(leg.fromBalanceType());
+            int toType = registries.balanceTypeId(leg.toBalanceType());
+            resolved.add(new Posting(
+                    leg.fromAccountId().strip(),
+                    Integer.toString(fromType),
+                    leg.toAccountId().strip(),
+                    Integer.toString(toType),
+                    leg.currency().strip(),
+                    amount,
+                    requestId,
+                    bizReference,
+                    bizType,
+                    batch.autoCreate()));
+        }
+        return writer.post(List.copyOf(resolved));
     }
 
     public List<Account> balances(String accountId) {
@@ -197,8 +277,55 @@ public final class PgLedger implements AutoCloseable {
         return reader.journals(page, size);
     }
 
+    /** Cuts the hourly snapshot on the writer (must be a full UTC hour). */
+    public long cutBalanceSnapshot(Instant hour) {
+        if (hour == null) {
+            throw new LedgerViolation("snapshot hour is required");
+        }
+        if (hour.getEpochSecond() % 3600 != 0) {
+            throw new LedgerViolation("snapshot hour must be a full UTC hour (minute and second 0)");
+        }
+        return writer.cutBalanceSnapshot(hour);
+    }
+
+    /**
+     * Ensures monthly snapshot partitions cover the month holding {@code from}
+     * plus {@code monthsAhead} months ahead. Returns partitions created.
+     */
+    public int ensureSnapshotPartitions(Instant from, int monthsAhead) {
+        if (from == null) {
+            throw new LedgerViolation("snapshot month is required");
+        }
+        return writer.ensureSnapshotPartitions(from, monthsAhead);
+    }
+
+    /** Snapshot rows for one hour, read from the reader. */
+    public List<BalanceSnapshot> snapshots(Instant hour) {
+        if (hour == null) {
+            throw new LedgerViolation("snapshot hour is required");
+        }
+        return reader.snapshots(hour);
+    }
+
+    /** Movement between snapshot hours; toHour null = latest, from the reader. */
+    public List<SnapshotMovement> snapshotMovements(Instant fromHour, Instant toHour) {
+        if (fromHour == null) {
+            throw new LedgerViolation("from hour is required");
+        }
+        return reader.snapshotMovements(fromHour, toHour);
+    }
+
+    /** Per-account movement between snapshot hours; toHour null = latest. For client statements. */
+    public List<AccountMovement> snapshotAccountMovements(Instant fromHour, Instant toHour) {
+        if (fromHour == null) {
+            throw new LedgerViolation("from hour is required");
+        }
+        return reader.snapshotAccountMovements(fromHour, toHour);
+    }
+
     @Override
     public void close() {
+        registries.close();
         writer.close();
         if (reader != writer) {
             reader.close();
@@ -213,7 +340,11 @@ public final class PgLedger implements AutoCloseable {
         return dataSource;
     }
 
-    private Transfer cash(String direction, CashMovement movement) {
+    /**
+     * Moves value between an account and the bank shard pool. The asset can be fiat or
+     * crypto; only the direction differs. {@code bizType} says DEPOSIT or WITHDRAWAL.
+     */
+    private Transfer moveViaBank(CashMovement movement, String fromAccountId, String toAccountId, String bizType) {
         if (movement == null || blank(movement.requestId())) {
             throw new LedgerViolation("request_id is required");
         }
@@ -224,32 +355,24 @@ public final class PgLedger implements AutoCloseable {
         if (amount == null || amount.signum() <= 0) {
             throw new LedgerViolation("Amount (" + (amount == null ? "null" : amount.toPlainString()) + ") must be positive");
         }
-        return writer.postCash(
-                direction,
-                movement.requestId().strip(),
-                accountId,
-                balanceType,
-                currency,
-                amount,
-                bankPoolSize);
+        String from = fromAccountId == null ? accountId : fromAccountId;
+        String to = toAccountId == null ? accountId : toAccountId;
+        int typeId = registries.balanceTypeId(balanceType);
+        String typeCode = registries.balanceTypeCode(typeId);
+        if (typeCode != null) {
+            writer.ensureBankPool(typeCode, typeId, currency, bankPoolSize, true);
+        }
+        return post(new Posting(
+                from, Integer.toString(typeId), to, Integer.toString(typeId), currency, amount,
+                movement.requestId().strip(), null, bizType, true));
     }
 
     private static int poolSize(int poolSize) {
         if (poolSize < 1 || poolSize > MAX_BANK_POOL_SIZE) {
-            throw new LedgerViolation("bank pool size (" + poolSize + ") must be between 1 and 1024");
+            throw new LedgerViolation(
+                    "bank pool size (" + poolSize + ") must be between 1 and " + MAX_BANK_POOL_SIZE);
         }
         return poolSize;
-    }
-
-    private static String accountClass(String value) {
-        if (value == null || value.isBlank()) {
-            return "CLIENT";
-        }
-        String code = value.strip().toUpperCase(Locale.ROOT);
-        if (!ACCOUNT_CLASSES.contains(code)) {
-            throw new LedgerViolation("account_class must be CLIENT, COMPANY, BANK, NOSTRO, SUSPENSE, or CONTROL");
-        }
-        return code;
     }
 
     private static String required(String value) {
@@ -261,9 +384,5 @@ public final class PgLedger implements AutoCloseable {
 
     private static boolean blank(String value) {
         return value == null || value.isBlank();
-    }
-
-    private static boolean flag(Boolean value) {
-        return value == null || value.booleanValue();
     }
 }

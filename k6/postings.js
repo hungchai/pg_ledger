@@ -29,7 +29,9 @@ export const options = {
 export function setup() {
   const created = http.post(
     `${base}/api/v1/balance-types`,
-    JSON.stringify({ code: 'AVAILABLE', name: 'Available' }),
+    // Sign policy is a property of the balance type. These accounts are never
+    // funded, so the bucket must allow negative balances.
+    JSON.stringify({ code: 'AVAILABLE', name: 'Available', allowNegative: true, allowPositive: true }),
     { headers: headers },
   );
   if (created.status !== 200 && created.status !== 422) {
@@ -39,9 +41,9 @@ export function setup() {
   for (let i = 0; i < vus; i++) {
     ids.push(`K6_${i}`);
   }
-  create(account('K6_COMPANY', true));
+  create(account('K6_COMPANY'));
   for (let i = 0; i < ids.length; i++) {
-    create(account(ids[i], true));
+    create(account(ids[i]));
   }
   return { ids: ids };
 }
@@ -67,14 +69,12 @@ export default function (data) {
   check(res, { posted: (r) => r.status === 200 });
 }
 
-function account(id, allowNegative) {
+function account(id) {
   return {
     accountId: id,
     balanceType: 'AVAILABLE',
     currency: 'USD',
     name: id,
-    allowNegativeBalance: allowNegative,
-    allowPositiveBalance: true,
   };
 }
 

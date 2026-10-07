@@ -1,5 +1,6 @@
-package io.zodia.pgledger.rest;
+package io.zodia.pgledger.rest.web;
 
+import io.zodia.pgledger.rest.PgLedgerServer;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 

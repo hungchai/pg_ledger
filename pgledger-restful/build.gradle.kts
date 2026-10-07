@@ -21,11 +21,15 @@ dependencies {
     implementation(project(":pgledger-core"))
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.apache.shardingsphere:shardingsphere-jdbc:5.5.2")
+    implementation("org.mybatis.spring.boot:mybatis-spring-boot-starter:3.0.4")
     implementation("com.zaxxer:HikariCP")
+    implementation("net.javacrumbs.shedlock:shedlock-spring:5.16.0")
+    implementation("net.javacrumbs.shedlock:shedlock-provider-jdbc-template:5.16.0")
     runtimeOnly("org.postgresql:postgresql")
     testImplementation(project(":pgledger-client-sdk"))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("org.postgresql:postgresql")
+    testImplementation("io.zonky.test:embedded-postgres:2.2.0")
 }
 
 tasks.withType<JavaCompile> {
@@ -36,10 +40,11 @@ tasks.test {
     useJUnitPlatform {
         excludeTags("stress")
     }
+    workingDir = rootProject.projectDir
 }
 
 tasks.register<Test>("stressTest") {
-    description = "Writer/reader HTTP stress. Requires docker compose up."
+    description = "Writer/reader HTTP stress against docker compose :5432/:5433. Prints TPS report."
     group = "verification"
     testClassesDirs = sourceSets["test"].output.classesDirs
     classpath = sourceSets["test"].runtimeClasspath

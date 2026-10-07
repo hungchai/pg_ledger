@@ -1,13 +1,17 @@
 package io.zodia.pgledger.store;
 
 import io.zodia.pgledger.api.LedgerApi.Account;
+import io.zodia.pgledger.api.LedgerApi.AccountMovement;
+import io.zodia.pgledger.api.LedgerApi.BalanceSnapshot;
 import io.zodia.pgledger.api.LedgerApi.BalanceType;
 import io.zodia.pgledger.api.LedgerApi.CreateAccount;
 import io.zodia.pgledger.api.LedgerApi.CreateBalanceType;
 import io.zodia.pgledger.api.LedgerApi.Entry;
 import io.zodia.pgledger.api.LedgerApi.JournalPage;
 import io.zodia.pgledger.api.LedgerApi.Posting;
+import io.zodia.pgledger.api.LedgerApi.SnapshotMovement;
 import io.zodia.pgledger.api.LedgerApi.Transfer;
+import io.zodia.pgledger.store.read.LedgerReadSql;
 
 import javax.sql.DataSource;
 import java.io.IOException;
@@ -32,62 +36,69 @@ import java.util.concurrent.locks.LockSupport;
  * Locking stays inside those functions. Reads are plain selects.
  */
 public final class PostgresLedgerStore implements LedgerStore {
-    private static final String[] SCHEMA = {"/db/V001__ledger.sql", "/db/V002__functions.sql"};
+    private static final String[] SCHEMA = {"/db/V001__ledger.sql", "/db/V002__functions.sql", "/db/V003__shedlock.sql"};
     private static final String BALANCE_TYPE_COLUMNS = """
-            code, name, description, created_at, updated_at
+            id, code, name, description, allow_negative, allow_positive, created_at, updated_at
             """;
     private static final String CREATE_BALANCE_TYPE = "SELECT " + BALANCE_TYPE_COLUMNS
-            + " FROM pgledger_create_balance_type(?, ?, ?)";
-    private static final String LIST_BALANCE_TYPES = "SELECT " + BALANCE_TYPE_COLUMNS
-            + " FROM pgledger_balance_types ORDER BY code";
+            + " FROM pgledger_create_balance_type(?, ?, ?, ?, ?)";
     private static final String ACCOUNT_COLUMNS = """
             id, account_id, balance_type, name, currency, balance, version,
             allow_negative_balance, allow_positive_balance, metadata::text AS metadata,
             created_at, updated_at, account_class, deleted
             """;
     private static final String CREATE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
-            + " FROM pgledger_create_account(?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?)";
-    private static final String ENSURE_BANK_POOL = "SELECT pgledger_ensure_bank_pool(?, ?, ?, ?)";
-    private static final String POST_CASH = """
-            SELECT id FROM pgledger_post_cash(?, ?, ?, ?, ?, ?, NULL, NULL, ?)
-            """;
+            + " FROM pgledger_create_account(?, ?, ?, ?, CAST(? AS jsonb), ?)";
+    private static final String ENSURE_BANK_POOL = "SELECT pgledger_ensure_bank_pool(?, ?, ?, ?, ?)";
+    private static final String CUT_SNAPSHOT = "SELECT pgledger_cut_balance_snapshot(?)";
+    private static final String ENSURE_SNAPSHOT_PARTITIONS = "SELECT pgledger_ensure_snapshot_partitions(?, ?)";
+    private static final String SNAPSHOTS = "SELECT * FROM pgledger_snapshot_rows(?)";
+    private static final String SNAPSHOT_MOVEMENTS = "SELECT * FROM pgledger_snapshot_movements(?, ?)";
+    private static final String SNAPSHOT_ACCOUNT_MOVEMENTS = "SELECT * FROM pgledger_snapshot_account_movements(?, ?)";
     private static final String DELETE_ACCOUNT = "SELECT " + ACCOUNT_COLUMNS
             + " FROM pgledger_delete_account(?, ?, ?)";
-    private static final String BANK_POSITION = "SELECT pgledger_bank_position(?, ?)";
-    private static final String BANK_SHARDS = """
-            SELECT
-                a.id, a.account_id, a.balance_type, a.name, a.currency, a.balance, a.version,
-                a.allow_negative_balance, a.allow_positive_balance, a.metadata::text AS metadata,
-                a.created_at, a.updated_at, a.account_class, a.deleted
-            FROM pgledger_bank_shards s
-            JOIN pgledger_accounts a
-              ON a.account_id = s.account_id
-             AND a.balance_type = s.balance_type
-             AND a.currency = s.currency
-            WHERE s.balance_type = ? AND s.currency = ?
-            ORDER BY s.shard
+    private static final String ACCOUNT_ID_COLUMNS = """
+            a.id, a.account_id, a.balance_type_id, a.name, a.currency_id, a.balance, a.version,
+            bt.allow_negative OR ac.code = 'BANK' AS allow_negative_balance,
+            bt.allow_positive OR ac.code = 'BANK' AS allow_positive_balance,
+            a.metadata::text AS metadata,
+            a.created_at, a.updated_at, a.account_class_id, a.deleted
+            """;
+    private static final String BANK_SHARDS = "SELECT " + ACCOUNT_ID_COLUMNS + """
+             FROM pgledger_accounts a
+             JOIN pgledger_balance_types bt ON bt.id = a.balance_type_id
+             JOIN pgledger_account_classes ac ON ac.id = a.account_class_id
+             WHERE a.account_class_id = ?
+               AND a.balance_type_id = ?
+               AND a.currency_id = ?
+               AND left(a.account_id, char_length(?)) = ?
+               AND substring(a.account_id FROM char_length(?) + 1) ~ '^[0-9]+$'
+             ORDER BY substring(a.account_id FROM char_length(?) + 1)::int
             """;
     // The function insert is its own statement. Joining pgledger_entries in that
     // same statement sees a snapshot from before the insert and returns no row.
     private static final String CREATE_TRANSFER = """
-            SELECT id FROM pgledger_create_transfer(?, ?, ?, ?, ?, ?, NULL, CAST(? AS jsonb))
+            SELECT id FROM pgledger_create_transfer(?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
             """;
     private static final String LOAD_TRANSFER = """
             SELECT
                 t.id AS transfer_id,
+                t.seq AS transfer_seq,
                 fa.account_id AS from_account_id,
-                fa.balance_type AS from_balance_type,
+                fa.balance_type_id AS from_balance_type_id,
                 ta.account_id AS to_account_id,
-                ta.balance_type AS to_balance_type,
-                fa.currency AS currency,
+                ta.balance_type_id AS to_balance_type_id,
+                fa.currency_id AS currency_id,
                 t.amount AS transfer_amount,
                 t.created_at AS transfer_created_at,
                 t.event_at,
-                t.metadata::text AS transfer_metadata,
+                t.biz_reference,
+                t.request_id,
+                t.biz_type_id,
                 e.id AS entry_id,
                 ea.account_id AS entry_account_id,
-                ea.balance_type AS entry_balance_type,
-                ea.currency AS entry_currency,
+                ea.balance_type_id AS entry_balance_type_id,
+                ea.currency_id AS entry_currency_id,
                 e.amount AS entry_amount,
                 e.account_previous_balance,
                 e.account_current_balance,
@@ -101,32 +112,25 @@ public final class PostgresLedgerStore implements LedgerStore {
             WHERE t.id = ?
             ORDER BY e.id
             """;
-    private static final String ONE_BALANCE = "SELECT " + ACCOUNT_COLUMNS + """
-             FROM pgledger_accounts
-             WHERE account_id = ? AND balance_type = ? AND currency = ?
-            """;
-    private static final String BALANCES = "SELECT " + ACCOUNT_COLUMNS + """
-             FROM pgledger_accounts
-             WHERE account_id = ?
-             ORDER BY balance_type, currency
-            """;
-    private static final String JOURNAL_COUNT = "SELECT count(*) FROM pgledger_transfers";
-    private static final String JOURNALS = """
+    private static final String LOAD_TRANSFERS_BY_REQUEST = """
             SELECT
                 t.id AS transfer_id,
+                t.seq AS transfer_seq,
                 fa.account_id AS from_account_id,
-                fa.balance_type AS from_balance_type,
+                fa.balance_type_id AS from_balance_type_id,
                 ta.account_id AS to_account_id,
-                ta.balance_type AS to_balance_type,
-                fa.currency AS currency,
+                ta.balance_type_id AS to_balance_type_id,
+                fa.currency_id AS currency_id,
                 t.amount AS transfer_amount,
                 t.created_at AS transfer_created_at,
                 t.event_at,
-                t.metadata::text AS transfer_metadata,
+                t.biz_reference,
+                t.request_id,
+                t.biz_type_id,
                 e.id AS entry_id,
                 ea.account_id AS entry_account_id,
-                ea.balance_type AS entry_balance_type,
-                ea.currency AS entry_currency,
+                ea.balance_type_id AS entry_balance_type_id,
+                ea.currency_id AS entry_currency_id,
                 e.amount AS entry_amount,
                 e.account_previous_balance,
                 e.account_current_balance,
@@ -135,22 +139,27 @@ public final class PostgresLedgerStore implements LedgerStore {
             FROM pgledger_transfers t
             JOIN pgledger_accounts fa ON fa.id = t.from_account_id
             JOIN pgledger_accounts ta ON ta.id = t.to_account_id
-            LEFT JOIN pgledger_entries e ON e.transfer_id = t.id
-            LEFT JOIN pgledger_accounts ea ON ea.id = e.account_id
-            WHERE t.id IN (
-                SELECT id FROM pgledger_transfers
-                ORDER BY created_at DESC, id DESC
-                LIMIT ? OFFSET ?
-            )
-            ORDER BY t.created_at DESC, t.id DESC, e.id
+            JOIN pgledger_entries e ON e.transfer_id = t.id
+            JOIN pgledger_accounts ea ON ea.id = e.account_id
+            WHERE t.request_id = ?
+              AND t.created_at >= pgledger_request_id_cutoff()
+            ORDER BY t.id, e.id
             """;
-
     private static final int MIGRATION_ATTEMPTS = 30;
 
     private final DataSource dataSource;
+    private final RegistryCache registries;
+    private final LedgerReadSql.ReadQueryFactory reads;
 
-    public PostgresLedgerStore(DataSource dataSource, boolean migrate) {
+    public PostgresLedgerStore(DataSource dataSource, boolean migrate, RegistryCache registries) {
+        this(dataSource, migrate, registries, LedgerReadSql.queries(LedgerReadSql.factory(dataSource), registries));
+    }
+
+    PostgresLedgerStore(DataSource dataSource, boolean migrate, RegistryCache registries,
+                        LedgerReadSql.ReadQueryFactory reads) {
         this.dataSource = dataSource;
+        this.registries = registries;
+        this.reads = reads;
         if (migrate) {
             migrate(dataSource);
         }
@@ -185,6 +194,8 @@ public final class PostgresLedgerStore implements LedgerStore {
                 } else {
                     ps.setString(3, command.description());
                 }
+                ps.setBoolean(4, command.allowNegative() != null && command.allowNegative().booleanValue());
+                ps.setBoolean(5, command.allowPositive() == null || command.allowPositive().booleanValue());
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new LedgerException("pgledger_create_balance_type returned no row");
@@ -197,16 +208,7 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     @Override
     public List<BalanceType> balanceTypes() {
-        return read(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(LIST_BALANCE_TYPES);
-                 ResultSet rs = ps.executeQuery()) {
-                ArrayList<BalanceType> rows = new ArrayList<>();
-                while (rs.next()) {
-                    rows.add(balanceType(rs));
-                }
-                return List.copyOf(rows);
-            }
-        });
+        return registries.balanceTypes();
     }
 
     @Override
@@ -217,13 +219,11 @@ public final class PostgresLedgerStore implements LedgerStore {
                 ps.setString(2, command.balanceType());
                 ps.setString(3, command.name());
                 ps.setString(4, command.currency());
-                ps.setBoolean(5, flag(command.allowNegativeBalance()));
-                ps.setBoolean(6, flag(command.allowPositiveBalance()));
-                setJson(ps, 7, command.metadata());
+                setJson(ps, 5, command.metadata());
                 if (command.accountClass() == null) {
-                    ps.setNull(8, Types.VARCHAR);
+                    ps.setNull(6, Types.VARCHAR);
                 } else {
-                    ps.setString(8, command.accountClass());
+                    ps.setString(6, command.accountClass());
                 }
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
@@ -237,35 +237,79 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     @Override
     public Transfer post(Posting posting) {
+        List<Transfer> transfers = post(List.of(posting));
+        if (transfers.isEmpty()) {
+            throw new LedgerException("pgledger_create_transfer returned no row");
+        }
+        return transfers.get(0);
+    }
+
+    @Override
+    public List<Transfer> post(List<Posting> legs) {
+        if (legs == null || legs.isEmpty()) {
+            throw new LedgerException("at least one posting leg is required");
+        }
+        Posting first = legs.get(0);
+        String requestId = first.requestId();
         return write(conn -> {
-            String transferId;
-            try (PreparedStatement ps = conn.prepareStatement(CREATE_TRANSFER)) {
-                ps.setString(1, posting.fromAccountId());
-                ps.setString(2, posting.fromBalanceType());
-                ps.setString(3, posting.toAccountId());
-                ps.setString(4, posting.toBalanceType());
-                ps.setString(5, posting.currency());
-                ps.setBigDecimal(6, posting.amount());
-                setJson(ps, 7, posting.metadata());
+            StringBuilder sql = new StringBuilder(96 + legs.size() * 48);
+            sql.append("SELECT * FROM pgledger_create_transfers(ARRAY[");
+            for (int i = 0; i < legs.size(); i++) {
+                if (i > 0) {
+                    sql.append(',');
+                }
+                sql.append("ROW(?,?,?,?,?,?)::transfer_request");
+            }
+            sql.append("]::transfer_request[], NULL, ?, ?, ?, ?)");
+            try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+                int index = 1;
+                for (int i = 0; i < legs.size(); i++) {
+                    Posting leg = legs.get(i);
+                    ps.setString(index++, leg.fromAccountId());
+                    ps.setInt(index++, Integer.parseInt(leg.fromBalanceType()));
+                    ps.setString(index++, leg.toAccountId());
+                    ps.setInt(index++, Integer.parseInt(leg.toBalanceType()));
+                    ps.setString(index++, leg.currency());
+                    ps.setBigDecimal(index++, leg.amount());
+                }
+                ps.setString(index++, first.bizReference());
+                ps.setString(index++, requestId);
+                if (first.bizType() == null || first.bizType().isBlank()) {
+                    ps.setNull(index++, Types.VARCHAR);
+                } else {
+                    ps.setString(index++, first.bizType());
+                }
+                Boolean autoCreate = first.autoCreate();
+                if (autoCreate == null) {
+                    ps.setNull(index++, Types.BOOLEAN);
+                } else {
+                    ps.setBoolean(index++, autoCreate.booleanValue());
+                }
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        throw new LedgerException("pgledger_create_transfer returned no row");
+                    // The function returns complete transfers_view rows built
+                    // from in-memory values; no post-commit read-back JOIN.
+                    ArrayList<Transfer> posted = new ArrayList<>(legs.size());
+                    while (rs.next()) {
+                        posted.add(viewRow(rs));
                     }
-                    transferId = rs.getString(1);
+                    if (posted.isEmpty()) {
+                        throw new LedgerException("pgledger_create_transfers returned no row");
+                    }
+                    return List.copyOf(posted);
                 }
             }
-            return loadTransfer(conn, transferId);
         });
     }
 
     @Override
-    public int ensureBankPool(String balanceType, String currency, int poolSize, boolean keepExisting) {
+    public int ensureBankPool(String balanceTypeCode, int balanceTypeId, String currency, int poolSize, boolean keepExisting) {
         return write(conn -> {
             try (PreparedStatement ps = conn.prepareStatement(ENSURE_BANK_POOL)) {
                 ps.setString(1, currency);
-                ps.setString(2, balanceType);
-                ps.setInt(3, poolSize);
-                ps.setBoolean(4, keepExisting);
+                ps.setString(2, balanceTypeCode);
+                ps.setInt(3, balanceTypeId);
+                ps.setInt(4, poolSize);
+                ps.setBoolean(5, keepExisting);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
                         throw new LedgerException("pgledger_ensure_bank_pool returned no row");
@@ -273,30 +317,6 @@ public final class PostgresLedgerStore implements LedgerStore {
                     return rs.getInt(1);
                 }
             }
-        });
-    }
-
-    @Override
-    public Transfer postCash(String direction, String requestId, String accountId, String balanceType,
-                             String currency, java.math.BigDecimal amount, int poolSize) {
-        return write(conn -> {
-            String transferId;
-            try (PreparedStatement ps = conn.prepareStatement(POST_CASH)) {
-                ps.setString(1, requestId);
-                ps.setString(2, direction);
-                ps.setString(3, accountId);
-                ps.setString(4, balanceType);
-                ps.setString(5, currency);
-                ps.setBigDecimal(6, amount);
-                ps.setInt(7, poolSize);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        throw new LedgerException("pgledger_post_cash returned no row");
-                    }
-                    transferId = rs.getString(1);
-                }
-            }
-            return loadTransfer(conn, transferId);
         });
     }
 
@@ -319,30 +339,32 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     @Override
     public java.math.BigDecimal bankPosition(String balanceType, String currency) {
-        return read(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(BANK_POSITION)) {
-                ps.setString(1, balanceType);
-                ps.setString(2, currency);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        throw new LedgerException("pgledger_bank_position returned no row");
-                    }
-                    return rs.getBigDecimal(1);
-                }
-            }
-        });
+        return reads.query(reads -> reads.bankPosition(balanceType, currency));
     }
 
     @Override
     public List<Account> bankShards(String balanceType, String currency) {
+        Integer classId = registries.accountClassId("BANK");
+        Integer typeId = registries.findBalanceTypeId(balanceType);
+        Integer currencyId = registries.currencyId(currency);
+        String typeCode = typeId == null ? null : registries.balanceTypeCode(typeId);
+        if (classId == null || typeId == null || currencyId == null || typeCode == null || currency == null) {
+            return List.of();
+        }
+        String prefix = "BANK-" + currency.strip() + "-" + typeCode + "-";
         return read(conn -> {
             try (PreparedStatement ps = conn.prepareStatement(BANK_SHARDS)) {
-                ps.setString(1, balanceType);
-                ps.setString(2, currency);
+                ps.setInt(1, classId);
+                ps.setInt(2, typeId);
+                ps.setInt(3, currencyId);
+                ps.setString(4, prefix);
+                ps.setString(5, prefix);
+                ps.setString(6, prefix);
+                ps.setString(7, prefix);
                 try (ResultSet rs = ps.executeQuery()) {
                     ArrayList<Account> rows = new ArrayList<>();
                     while (rs.next()) {
-                        rows.add(account(rs));
+                        rows.add(accountIds(rs));
                     }
                     return List.copyOf(rows);
                 }
@@ -352,13 +374,81 @@ public final class PostgresLedgerStore implements LedgerStore {
 
     @Override
     public List<Account> balances(String accountId) {
-        return read(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(BALANCES)) {
-                ps.setString(1, accountId);
+        return reads.query(reads -> reads.balances(accountId));
+    }
+
+    @Override
+    public Account balance(String accountId, String balanceType, String currency) {
+        return reads.query(reads -> reads.balance(accountId, balanceType, currency));
+    }
+
+    @Override
+    public JournalPage journals(int page, int size) {
+        return reads.query(reads -> reads.journals(page, size));
+    }
+
+    @Override
+    public long cutBalanceSnapshot(Instant hour) {
+        if (hour == null) {
+            throw new LedgerViolation("snapshot hour is required");
+        }
+        return write(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(CUT_SNAPSHOT)) {
+                ps.setTimestamp(1, Timestamp.from(hour));
                 try (ResultSet rs = ps.executeQuery()) {
-                    ArrayList<Account> rows = new ArrayList<>();
+                    if (!rs.next()) {
+                        throw new LedgerException("pgledger_cut_balance_snapshot returned no row");
+                    }
+                    return rs.getLong(1);
+                }
+            }
+        });
+    }
+
+    @Override
+    public int ensureSnapshotPartitions(Instant from, int monthsAhead) {
+        if (from == null) {
+            throw new LedgerViolation("snapshot month is required");
+        }
+        return write(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(ENSURE_SNAPSHOT_PARTITIONS)) {
+                ps.setTimestamp(1, Timestamp.from(from));
+                ps.setInt(2, monthsAhead);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        throw new LedgerException("pgledger_ensure_snapshot_partitions returned no row");
+                    }
+                    return rs.getInt(1);
+                }
+            }
+        });
+    }
+
+    @Override
+    public List<BalanceSnapshot> snapshots(Instant hour) {
+        if (hour == null) {
+            throw new LedgerViolation("snapshot hour is required");
+        }
+        return read(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(SNAPSHOTS)) {
+                ps.setTimestamp(1, Timestamp.from(hour));
+                try (ResultSet rs = ps.executeQuery()) {
+                    ArrayList<BalanceSnapshot> rows = new ArrayList<>();
                     while (rs.next()) {
-                        rows.add(account(rs));
+                        rows.add(new BalanceSnapshot(
+                                instant(rs, "snapshot_hour"),
+                                rs.getString("account_id"),
+                                rs.getString("balance_type"),
+                                rs.getString("currency"),
+                                rs.getString("account_class"),
+                                rs.getInt("year"),
+                                rs.getInt("month"),
+                                rs.getInt("day"),
+                                rs.getInt("hour"),
+                                rs.getBigDecimal("balance"),
+                                rs.getBigDecimal("previous_balance"),
+                                rs.getLong("version"),
+                                rs.getBoolean("deleted")));
                     }
                     return List.copyOf(rows);
                 }
@@ -367,68 +457,64 @@ public final class PostgresLedgerStore implements LedgerStore {
     }
 
     @Override
-    public Account balance(String accountId, String balanceType, String currency) {
+    public List<SnapshotMovement> snapshotMovements(Instant fromHour, Instant toHour) {
+        if (fromHour == null) {
+            throw new LedgerViolation("from hour is required");
+        }
         return read(conn -> {
-            try (PreparedStatement ps = conn.prepareStatement(ONE_BALANCE)) {
-                ps.setString(1, accountId);
-                ps.setString(2, balanceType);
-                ps.setString(3, currency);
+            try (PreparedStatement ps = conn.prepareStatement(SNAPSHOT_MOVEMENTS)) {
+                ps.setTimestamp(1, Timestamp.from(fromHour));
+                if (toHour == null) {
+                    ps.setNull(2, Types.TIMESTAMP);
+                } else {
+                    ps.setTimestamp(2, Timestamp.from(toHour));
+                }
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) {
-                        return null;
+                    ArrayList<SnapshotMovement> rows = new ArrayList<>();
+                    while (rs.next()) {
+                        rows.add(new SnapshotMovement(
+                                rs.getString("balance_type"),
+                                rs.getString("currency"),
+                                rs.getString("account_class"),
+                                rs.getBigDecimal("opening_balance"),
+                                rs.getBigDecimal("closing_balance"),
+                                rs.getBigDecimal("movement")));
                     }
-                    return account(rs);
+                    return List.copyOf(rows);
                 }
             }
         });
     }
 
     @Override
-    public JournalPage journals(int page, int size) {
+    public List<AccountMovement> snapshotAccountMovements(Instant fromHour, Instant toHour) {
+        if (fromHour == null) {
+            throw new LedgerViolation("from hour is required");
+        }
         return read(conn -> {
-            long total = journalCount(conn);
-            long offset = (long) page * (long) size;
-            try (PreparedStatement ps = conn.prepareStatement(JOURNALS)) {
-                ps.setInt(1, size);
-                ps.setLong(2, offset);
+            try (PreparedStatement ps = conn.prepareStatement(SNAPSHOT_ACCOUNT_MOVEMENTS)) {
+                ps.setTimestamp(1, Timestamp.from(fromHour));
+                if (toHour == null) {
+                    ps.setNull(2, Types.TIMESTAMP);
+                } else {
+                    ps.setTimestamp(2, Timestamp.from(toHour));
+                }
                 try (ResultSet rs = ps.executeQuery()) {
-                    LinkedHashMap<String, ArrayList<Entry>> entries = new LinkedHashMap<>();
-                    LinkedHashMap<String, Transfer> transfers = new LinkedHashMap<>();
+                    ArrayList<AccountMovement> rows = new ArrayList<>();
                     while (rs.next()) {
-                        String transferId = rs.getString("transfer_id");
-                        if (!transfers.containsKey(transferId)) {
-                            transfers.put(transferId, transfer(rs, transferId));
-                        }
-                        String entryId = rs.getString("entry_id");
-                        if (entryId != null) {
-                            ArrayList<Entry> lines = entries.get(transferId);
-                            if (lines == null) {
-                                lines = new ArrayList<>(2);
-                                entries.put(transferId, lines);
-                            }
-                            lines.add(entry(rs));
-                        }
+                        rows.add(new AccountMovement(
+                                rs.getString("account_id"),
+                                rs.getString("name"),
+                                rs.getString("balance_type"),
+                                rs.getString("currency"),
+                                rs.getBigDecimal("opening_balance"),
+                                rs.getBigDecimal("closing_balance"),
+                                rs.getBigDecimal("movement")));
                     }
-                    ArrayList<Transfer> pageRows = new ArrayList<>(transfers.size());
-                    for (Transfer transfer : transfers.values()) {
-                        List<Entry> lines = entries.get(transfer.id());
-                        pageRows.add(withEntries(transfer, lines == null ? List.of() : List.copyOf(lines)));
-                    }
-                    boolean hasNext = offset + pageRows.size() < total;
-                    return new JournalPage(page, size, total, hasNext, List.copyOf(pageRows));
+                    return List.copyOf(rows);
                 }
             }
         });
-    }
-
-    private static long journalCount(Connection conn) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(JOURNAL_COUNT);
-             ResultSet rs = ps.executeQuery()) {
-            if (!rs.next()) {
-                throw new LedgerException("journal count returned no row");
-            }
-            return rs.getLong(1);
-        }
     }
 
     @Override
@@ -549,17 +635,33 @@ public final class PostgresLedgerStore implements LedgerStore {
         }
     }
 
-    private static boolean flag(Boolean value) {
-        return value == null || value.booleanValue();
+    private static BalanceType balanceType(ResultSet rs) throws SQLException {
+        return RegistryCache.balanceType(rs);
     }
 
-    private static BalanceType balanceType(ResultSet rs) throws SQLException {
-        return new BalanceType(
-                rs.getString("code"),
+    private Account accountIds(ResultSet rs) throws SQLException {
+        int balanceTypeId = rs.getInt("balance_type_id");
+        int currencyId = rs.getInt("currency_id");
+        int classId = rs.getInt("account_class_id");
+        return new Account(
+                rs.getString("id"),
+                rs.getString("account_id"),
+                codeOrId(registries.balanceTypeCode(balanceTypeId), balanceTypeId),
                 rs.getString("name"),
-                rs.getString("description"),
+                codeOrId(registries.currencyCode(currencyId), currencyId),
+                rs.getBigDecimal("balance"),
+                rs.getLong("version"),
+                rs.getBoolean("allow_negative_balance"),
+                rs.getBoolean("allow_positive_balance"),
+                LedgerJson.map(rs.getString("metadata")),
                 instant(rs, "created_at"),
-                instant(rs, "updated_at"));
+                instant(rs, "updated_at"),
+                codeOrId(registries.accountClassCode(classId), classId),
+                rs.getBoolean("deleted"));
+    }
+
+    private static String codeOrId(String code, int id) {
+        return code == null ? Integer.toString(id) : code;
     }
 
     private static Account account(ResultSet rs) throws SQLException {
@@ -580,7 +682,7 @@ public final class PostgresLedgerStore implements LedgerStore {
                 rs.getBoolean("deleted"));
     }
 
-    private static Transfer loadTransfer(Connection conn, String transferId) throws SQLException {
+    private Transfer loadTransfer(Connection conn, String transferId) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(LOAD_TRANSFER)) {
             ps.setString(1, transferId);
             try (ResultSet rs = ps.executeQuery()) {
@@ -593,7 +695,33 @@ public final class PostgresLedgerStore implements LedgerStore {
         }
     }
 
-    private static Transfer oneTransfer(ResultSet rs) throws SQLException {
+    private List<Transfer> loadTransfersByRequest(Connection conn, String requestId) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(LOAD_TRANSFERS_BY_REQUEST)) {
+            ps.setString(1, requestId);
+            try (ResultSet rs = ps.executeQuery()) {
+                LinkedHashMap<String, Transfer> transfers = new LinkedHashMap<>();
+                LinkedHashMap<String, ArrayList<Entry>> entries = new LinkedHashMap<>();
+                while (rs.next()) {
+                    String transferId = rs.getString("transfer_id");
+                    if (!transfers.containsKey(transferId)) {
+                        transfers.put(transferId, transfer(rs, transferId));
+                        entries.put(transferId, new ArrayList<>(2));
+                    }
+                    entries.get(transferId).add(entry(rs));
+                }
+                if (transfers.isEmpty()) {
+                    throw new LedgerException("pgledger_create_transfers returned no row");
+                }
+                ArrayList<Transfer> page = new ArrayList<>(transfers.size());
+                for (Transfer transfer : transfers.values()) {
+                    page.add(withEntries(transfer, List.copyOf(entries.get(transfer.id()))));
+                }
+                return List.copyOf(page);
+            }
+        }
+    }
+
+    private Transfer oneTransfer(ResultSet rs) throws SQLException {
         Transfer transfer = null;
         ArrayList<Entry> lines = new ArrayList<>(2);
         while (rs.next()) {
@@ -608,24 +736,49 @@ public final class PostgresLedgerStore implements LedgerStore {
         return withEntries(transfer, List.copyOf(lines));
     }
 
-    private static Transfer transfer(ResultSet rs, String id) throws SQLException {
+    private Transfer viewRow(ResultSet rs) throws SQLException {
+        int currencyId = rs.getInt("currency_id");
+        return new Transfer(
+                rs.getString("id"),
+                rs.getLong("seq"),
+                rs.getString("from_account"),
+                rs.getInt("from_balance_type"),
+                rs.getString("to_account"),
+                rs.getInt("to_balance_type"),
+                codeOrId(registries.currencyCode(currencyId), currencyId),
+                rs.getBigDecimal("amount"),
+                instant(rs, "created_at"),
+                instant(rs, "event_at"),
+                rs.getString("request_id"),
+                rs.getString("biz_type"),
+                rs.getString("biz_reference"),
+                List.of());
+    }
+
+    private Transfer transfer(ResultSet rs, String id) throws SQLException {
+        int currencyId = rs.getInt("currency_id");
+        int bizTypeId = rs.getInt("biz_type_id");
         return new Transfer(
                 id,
+                rs.getLong("transfer_seq"),
                 rs.getString("from_account_id"),
-                rs.getString("from_balance_type"),
+                rs.getInt("from_balance_type_id"),
                 rs.getString("to_account_id"),
-                rs.getString("to_balance_type"),
-                rs.getString("currency"),
+                rs.getInt("to_balance_type_id"),
+                codeOrId(registries.currencyCode(currencyId), currencyId),
                 rs.getBigDecimal("transfer_amount"),
                 instant(rs, "transfer_created_at"),
                 instant(rs, "event_at"),
-                LedgerJson.map(rs.getString("transfer_metadata")),
+                rs.getString("request_id"),
+                codeOrId(registries.bizTypeCode(bizTypeId), bizTypeId),
+                rs.getString("biz_reference"),
                 List.of());
     }
 
     private static Transfer withEntries(Transfer transfer, List<Entry> entries) {
         return new Transfer(
                 transfer.id(),
+                transfer.seq(),
                 transfer.fromAccountId(),
                 transfer.fromBalanceType(),
                 transfer.toAccountId(),
@@ -634,16 +787,19 @@ public final class PostgresLedgerStore implements LedgerStore {
                 transfer.amount(),
                 transfer.createdAt(),
                 transfer.eventAt(),
-                transfer.metadata(),
+                transfer.requestId(),
+                transfer.bizType(),
+                transfer.bizReference(),
                 entries);
     }
 
-    private static Entry entry(ResultSet rs) throws SQLException {
+    private Entry entry(ResultSet rs) throws SQLException {
+        int currencyId = rs.getInt("entry_currency_id");
         return new Entry(
                 rs.getString("entry_id"),
                 rs.getString("entry_account_id"),
-                rs.getString("entry_balance_type"),
-                rs.getString("entry_currency"),
+                rs.getInt("entry_balance_type_id"),
+                codeOrId(registries.currencyCode(currencyId), currencyId),
                 rs.getBigDecimal("entry_amount"),
                 rs.getBigDecimal("account_previous_balance"),
                 rs.getBigDecimal("account_current_balance"),
